@@ -16,10 +16,11 @@ type Line struct {
 
 // Change 是单个文件的变更。
 type Change struct {
-	File string // 新文件路径
-	Old  string // 旧文件路径
-	Adds []Line // 新增行
-	Dels []Line // 删除行
+	File    string   // 新文件路径
+	Old     string   // 旧文件路径
+	Adds    []Line   // 新增行
+	Dels    []Line   // 删除行
+	Symbols []Symbol // Annotate 填充
 }
 
 // Parse 把 unified diff 解析为变更列表。
