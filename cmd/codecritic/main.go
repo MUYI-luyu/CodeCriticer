@@ -1,6 +1,5 @@
 // CodeCriticer 是一个 Go 代码审查 agent。
-// 第 1 天：项目骨架 + 核心数据模型 + unified diff 解析。
-// 目前只支持把 diff 解析为结构化变更并打印，规则与 LLM 审查逻辑后续迭代补齐。
+// 第 3 天：接入静态规则引擎，`review --repo` 可离线跑出确定性 findings；LLM 客户端待后续流水线接入。
 package main
 
 import (
@@ -9,6 +8,7 @@ import (
 	"os"
 
 	"github.com/MUYI-luyu/codecritic/internal/diff"
+	"github.com/MUYI-luyu/codecritic/internal/review"
 )
 
 func main() {
@@ -27,15 +27,17 @@ func main() {
 
 func usage() {
 	fmt.Fprintln(os.Stderr, "用法:")
-	fmt.Fprintln(os.Stderr, "  codecritic review <diff文件>")
+	fmt.Fprintln(os.Stderr, "  codecritic review <diff文件> [--repo 仓库路径]")
 }
 
 func cmdReview(args []string) {
-	if len(args) == 0 {
+	repo, diffPath := parseArgs(args)
+	if diffPath == "" {
 		usage()
 		os.Exit(2)
 	}
-	raw, err := os.ReadFile(args[0])
+
+	raw, err := os.ReadFile(diffPath)
 	if err != nil {
 		log.Fatalf("读取 diff: %v", err)
 	}
@@ -54,4 +56,31 @@ func cmdReview(args []string) {
 			fmt.Printf("  +%s\n", l.Text)
 		}
 	}
+
+	if repo == "" {
+		return
+	}
+
+	fs, err := review.Rules(repo)
+	if err != nil {
+		log.Fatalf("静态规则失败: %v", err)
+	}
+	fmt.Printf("\n静态规则命中 %d 条:\n", len(fs))
+	for _, f := range fs {
+		fmt.Printf("  [%s] %s:%d @%s — %s\n", f.Severity, f.File, f.Line, f.Symbol, f.Msg)
+	}
+}
+
+func parseArgs(args []string) (repo, diff string) {
+	for i := 0; i < len(args); i++ {
+		switch {
+		case args[i] == "--repo" && i+1 < len(args):
+			repo, i = args[i+1], i+1
+		default:
+			if diff == "" {
+				diff = args[i]
+			}
+		}
+	}
+	return
 }
