@@ -1,5 +1,5 @@
 // CodeCriticer 是一个 Go 代码审查 agent。
-// 第 5 天：组装完整流水线（规则 + 符号定位 + 依赖图 + 召回 + Plan-and-Execute + Reflection）。
+// 第 6 天：评测数据集 + Recall/Precision 指标，支持 `codecritic eval` 命令。
 package main
 
 import (
@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/MUYI-luyu/codecritic/internal/eval"
 	"github.com/MUYI-luyu/codecritic/internal/review"
 )
 
@@ -21,6 +22,8 @@ func main() {
 	switch os.Args[1] {
 	case "review":
 		cmdReview(os.Args[2:])
+	case "eval":
+		cmdEval(os.Args[2:])
 	default:
 		usage()
 		os.Exit(2)
@@ -30,6 +33,7 @@ func main() {
 func usage() {
 	fmt.Fprintln(os.Stderr, "用法:")
 	fmt.Fprintln(os.Stderr, "  codecritic review <diff文件> [--repo 仓库路径] [--reflect]")
+	fmt.Fprintln(os.Stderr, "  codecritic eval [--dataset 数据集目录]")
 }
 
 func cmdReview(args []string) {
@@ -77,6 +81,29 @@ func cmdReview(args []string) {
 
 	findings := review.Dedup(append(append([]review.Finding{}, res.Rules...), llmFs...), 3)
 	printFindings(findings)
+}
+
+func cmdEval(args []string) {
+	dataset := "internal/eval/testdata/cases"
+	for i := 0; i < len(args); i++ {
+		switch {
+		case args[i] == "--dataset" && i+1 < len(args):
+			dataset, i = args[i+1], i+1
+		case strings.HasPrefix(args[i], "--dataset="):
+			dataset = strings.TrimPrefix(args[i], "--dataset=")
+		}
+	}
+
+	key := os.Getenv("DEEPSEEK_API_KEY")
+	if key == "" {
+		fmt.Fprintln(os.Stderr, "未设置 DEEPSEEK_API_KEY")
+		os.Exit(1)
+	}
+	llm := review.NewLLM(key, os.Getenv("DEEPSEEK_BASE_URL"), os.Getenv("DEEPSEEK_MODEL"))
+
+	if err := eval.Run(context.Background(), llm, dataset); err != nil {
+		log.Fatalf("评测失败: %v", err)
+	}
 }
 
 // parseArgs 提取 flag 与位置参数，flag 可出现在任意位置。
