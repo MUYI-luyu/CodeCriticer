@@ -20,6 +20,25 @@ const planPrompt = `你是代码审查规划者。读下面的 unified diff，�
 只输出 JSON：
 {"points":[{"desc":"要点描述","kw":["关键词"]}]}`
 
+const validatePrompt = `你是代码审查证据校验员。给出一个 finding 与召回的证据，评估该 finding 的可信度。
+
+Finding:
+文件: %s
+行号: %d
+严重程度: %s
+问题: %s
+声称证据: %s
+
+召回的证据:
+%s
+
+请输出 0-1 的置信度分数（0=完全不可信，1=证据确凿），并说明：
+1. 支持该 finding 的证据
+2. 缺失或矛盾的证据（gaps）
+
+只输出 JSON：
+{"confidence": 0.0-1.0, "evidence": "支持的证据摘要", "gaps": ["缺失的证据1", "缺失的证据2"]}`
+
 // LLM 是 OpenAI 兼容的聊天客户端。
 type LLM struct {
 	key    string
@@ -155,6 +174,32 @@ func (l *LLM) Check(ctx context.Context, f Finding, code string) (bool, error) {
 		return false, err
 	}
 	return out.Verdict == "keep", nil
+}
+
+// ValidationResult 是 ValidateFinding 的返回结果。
+type ValidationResult struct {
+	Confidence float64  `json:"confidence"`
+	Evidence   string   `json:"evidence"`
+	Gaps       []string `json:"gaps"`
+}
+
+// ValidateFinding 对单个 finding 进行证据校验，返回置信度评分。
+func (l *LLM) ValidateFinding(ctx context.Context, f Finding, evidence interface{}) (ValidationResult, error) {
+	// 将 evidence 格式化为字符串
+	evidenceText := fmt.Sprintf("%+v", evidence)
+
+	sys := fmt.Sprintf(validatePrompt, f.File, f.Line, f.Severity, f.Msg, f.Evidence, evidenceText)
+	text, err := l.chat(ctx, sys, "请评估上述 finding 的置信度。")
+	if err != nil {
+		return ValidationResult{}, err
+	}
+
+	var result ValidationResult
+	if err := json.Unmarshal([]byte(stripFence(text)), &result); err != nil {
+		return ValidationResult{}, fmt.Errorf("解析 validation 结果: %w", err)
+	}
+
+	return result, nil
 }
 
 func parseFindings(text string) ([]Finding, error) {

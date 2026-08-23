@@ -36,6 +36,11 @@ func New(root string, idx *graph.Index) *Store {
 	return &Store{root: abs, idx: idx}
 }
 
+// Root 返回仓库根目录（供 Validator 读取文件）。
+func (s *Store) Root() string {
+	return s.root
+}
+
 // Symbol 召回被改符号的直接调用方代码。
 func (s *Store) Symbol(name, file string) []Doc {
 	if s.idx == nil {
