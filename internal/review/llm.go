@@ -39,6 +39,47 @@ Finding:
 只输出 JSON：
 {"confidence": 0.0-1.0, "evidence": "支持的证据摘要", "gaps": ["缺失的证据1", "缺失的证据2"]}`
 
+const critiquePrompt = `你是代码审查反思器。给出一个低置信度的 finding 及其 validation 结果，生成具体的反驳理由和改进建议。
+
+Finding:
+文件: %s
+行号: %d
+严重程度: %s
+问题: %s
+声称证据: %s
+
+Validation 结果:
+置信度: %.2f
+证据: %s
+缺失项: %s
+
+请生成：
+1. Reason: 为什么这个 finding 置信度低？具体的反驳理由
+2. Evidence: 从 validation 证据中提取关键部分
+3. Suggestion: 下次审查时应该做什么？（具体的行动建议）
+
+只输出 JSON：
+{
+  "reason": "反驳理由（一句话说明为什么置信度低）",
+  "evidence": "反驳的证据（从 validation 的证据中提取关键部分）",
+  "suggestion": "下次审查时应该做什么（具体的行动建议）"
+}
+
+示例：
+Finding: "Variable x may be nil, potential panic"
+Validation Confidence: 0.3
+Validation Evidence: "Line 10: if x != nil { x.Method() }"
+Validation Gaps: ["未检查所有 x 的使用点", "未追踪 x 的定义"]
+
+输出：
+{
+  "reason": "声称 nil panic，但第 10 行已有 if x != nil 检查保护",
+  "evidence": "if x != nil { x.Method() }",
+  "suggestion": "下次审查前，先检索变量的所有赋值语句和 nil 检查，确认是否有未保护的使用点"
+}
+
+只输出 JSON，不要其他文字。`
+
 // LLM 是 OpenAI 兼容的聊天客户端。
 type LLM struct {
 	key    string
@@ -197,6 +238,39 @@ func (l *LLM) ValidateFinding(ctx context.Context, f Finding, evidence interface
 	var result ValidationResult
 	if err := json.Unmarshal([]byte(stripFence(text)), &result); err != nil {
 		return ValidationResult{}, fmt.Errorf("解析 validation 结果: %w", err)
+	}
+
+	return result, nil
+}
+
+// CritiqueResult 是 GenerateCritique 的返回结果。
+type CritiqueResult struct {
+	Reason     string `json:"reason"`
+	Evidence   string `json:"evidence"`
+	Suggestion string `json:"suggestion"`
+}
+
+// ValidationInput 是传给 GenerateCritique 的 Validation 信息。
+type ValidationInput struct {
+	Confidence float64
+	Evidence   string
+	Gaps       []string
+}
+
+// GenerateCritique 为低置信度的 finding 生成反驳理由 + 改进建议。
+func (l *LLM) GenerateCritique(ctx context.Context, f Finding, val ValidationInput) (CritiqueResult, error) {
+	gapsText := strings.Join(val.Gaps, "; ")
+	sys := fmt.Sprintf(critiquePrompt, f.File, f.Line, f.Severity, f.Msg, f.Evidence,
+		val.Confidence, val.Evidence, gapsText)
+
+	text, err := l.chat(ctx, sys, "请生成 Critique。")
+	if err != nil {
+		return CritiqueResult{}, err
+	}
+
+	var result CritiqueResult
+	if err := json.Unmarshal([]byte(stripFence(text)), &result); err != nil {
+		return CritiqueResult{}, fmt.Errorf("解析 critique 结果: %w", err)
 	}
 
 	return result, nil
