@@ -101,7 +101,7 @@ func (v *Validator) collectEvidence(f review.Finding) Evidence {
 	// 3. 相关符号（通过关键词召回）
 	if v.store != nil {
 		// 从 finding msg 提取关键词
-		keywords := extractKeywords(f.Msg)
+		keywords := messageKeywords(f.Msg)
 		for _, kw := range keywords {
 			syms := v.store.Keyword(kw)
 			if len(syms) > 0 {
@@ -157,7 +157,7 @@ func formatCallChain(callers []recall.Doc) string {
 	return strings.Join(parts, "\n")
 }
 
-func extractKeywords(msg string) []string {
+func messageKeywords(msg string) []string {
 	// 简单提取：分词 + 过滤停用词
 	words := strings.Fields(strings.ToLower(msg))
 	stopWords := map[string]bool{

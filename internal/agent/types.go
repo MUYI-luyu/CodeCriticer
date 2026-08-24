@@ -1,54 +1,108 @@
 package agent
 
-import "github.com/MUYI-luyu/codecritic/internal/review"
+import (
+	"fmt"
+	"strings"
+	"time"
 
-// ConfidenceThreshold 是判定 finding 可信的置信度阈值。
+	"github.com/MUYI-luyu/codecritic/internal/graph"
+	"github.com/MUYI-luyu/codecritic/internal/recall"
+	"github.com/MUYI-luyu/codecritic/internal/review"
+)
+
+// Action 是编排器的一次决策结果。
+type Action struct {
+	Tool   string         `json:"tool"`
+	Args   map[string]any `json:"args,omitempty"`
+	Reason string         `json:"reason,omitempty"`
+}
+
+// ToolSpec 是给决策器展示的工具摘要。
+type ToolSpec struct {
+	Name        string
+	Description string
+}
+
+// ToolCall 记录一次工具执行。
+type ToolCall struct {
+	Tool     string         `json:"tool"`
+	Args     map[string]any `json:"args,omitempty"`
+	Result   string         `json:"result,omitempty"`
+	Error    string         `json:"error,omitempty"`
+	Duration time.Duration  `json:"duration"`
+}
+
+// Attempt 记录一轮编排过程。
+type Attempt struct {
+	Round     int              `json:"round"`
+	ToolCalls []ToolCall       `json:"tool_calls"`
+	Evidence  string           `json:"evidence,omitempty"`
+	Findings  []review.Finding `json:"findings,omitempty"`
+}
+
+// Result 是编排器的最终结果。
+type Result struct {
+	Findings      []review.Finding `json:"findings"`
+	Attempts      []Attempt        `json:"attempts"`
+	Converged     bool             `json:"converged"`
+	Reason        string           `json:"reason,omitempty"`
+	TotalDuration time.Duration    `json:"total_duration"`
+}
+
+// Validation 是证据校验结果。
+type Validation struct {
+	FindingID  int
+	Confidence float64
+	Evidence   string
+	Gaps       []string
+}
+
+// Critique 是反思阶段产出的批评建议。
+type Critique struct {
+	FindingID  int
+	Reason     string
+	Evidence   string
+	Suggestion string
+}
+
+// ConfidenceThreshold 是生成批评时的默认置信度阈值。
 const ConfidenceThreshold = 0.7
 
-// MaxAttempts 是 Reflexion Loop 的最大尝试轮数。
-const MaxAttempts = 3
-
-// Validation 是一个 finding 的证据验证结果。
-type Validation struct {
-	FindingID  int      `json:"finding_id"`
-	Confidence float64  `json:"confidence"` // 0.0-1.0
-	Evidence   string   `json:"evidence"`   // 支持证据
-	Gaps       []string `json:"gaps"`       // 证据缺口
+// State 保存编排过程中的共享上下文。
+type State struct {
+	Repo     string
+	RawDiff  string
+	Evidence []string
+	Symbols  []review.Sym
+	Index    *graph.Index
+	Store    *recall.Store
+	Findings []review.Finding
 }
 
-// Critique 是对低置信度 finding 的结构化批评。
-type Critique struct {
-	FindingID  int    `json:"finding_id"`
-	Reason     string `json:"reason"`     // 为什么置信度低
-	Evidence   string `json:"evidence"`   // 反驳的证据
-	Suggestion string `json:"suggestion"` // 下次审查时应该做什么
+// NewState 初始化编排状态。
+func NewState(repo, raw string) *State {
+	return &State{Repo: repo, RawDiff: raw}
 }
 
-// Attempt 是一次审查尝试的完整记录。
-type Attempt struct {
-	Round       int                `json:"round"`
-	Findings    []review.Finding   `json:"findings"`
-	Validations []Validation       `json:"validations,omitempty"`
-	Critiques   []Critique         `json:"critiques,omitempty"`
-	ToolCalls   []ToolCall         `json:"tool_calls,omitempty"`
-	StartedAt   string             `json:"started_at"` // RFC3339
-	Duration    string             `json:"duration"`   // "1.234s"
-	Error       string             `json:"error,omitempty"`
+// EvidenceText 拼接全部证据文本。
+func (s *State) EvidenceText() string {
+	return strings.Join(s.Evidence, "\n\n")
 }
 
-// ToolCall 是工具调用记录。
-type ToolCall struct {
-	Tool   string                 `json:"tool"`
-	Args   map[string]interface{} `json:"args"`
-	Result interface{}            `json:"result,omitempty"`
-	Error  string                 `json:"error,omitempty"`
+// AppendEvidence 追加一段证据摘要。
+func (s *State) AppendEvidence(label, text string) {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return
+	}
+	if label != "" {
+		s.Evidence = append(s.Evidence, fmt.Sprintf("[%s]\n%s", label, text))
+		return
+	}
+	s.Evidence = append(s.Evidence, text)
 }
 
-// Result 是完整的审查结果。
-type Result struct {
-	Attempts      []Attempt        `json:"attempts"`
-	FinalFindings []review.Finding `json:"final_findings"`
-	Converged     bool             `json:"converged"`
-	Reason        string           `json:"reason"`        // 收敛原因
-	TotalDuration string           `json:"total_duration"` // "5.678s"
+// AddFindings 追加审查意见。
+func (s *State) AddFindings(fs ...review.Finding) {
+	s.Findings = append(s.Findings, fs...)
 }

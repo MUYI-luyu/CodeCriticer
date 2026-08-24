@@ -160,6 +160,11 @@ func (l *LLM) chat(ctx context.Context, system, user string) (string, error) {
 	return out.Choices[0].Message.Content, nil
 }
 
+// CompleteJSON 执行一次 JSON 约束的对话，供编排器复用。
+func (l *LLM) CompleteJSON(ctx context.Context, system, user string) (string, error) {
+	return l.chat(ctx, system, user)
+}
+
 // Review 一次性审查 diff，返回 findings。
 func (l *LLM) Review(ctx context.Context, diffText string) ([]Finding, error) {
 	text, err := l.chat(ctx, reviewPrompt, diffText)

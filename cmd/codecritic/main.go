@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	codeagent "github.com/MUYI-luyu/codecritic/internal/agent"
 	"github.com/MUYI-luyu/codecritic/internal/eval"
 	"github.com/MUYI-luyu/codecritic/internal/review"
 )
@@ -32,12 +33,12 @@ func main() {
 
 func usage() {
 	fmt.Fprintln(os.Stderr, "用法:")
-	fmt.Fprintln(os.Stderr, "  codecritic review <diff文件> [--repo 仓库路径] [--reflect]")
+	fmt.Fprintln(os.Stderr, "  codecritic review <diff文件> [--repo 仓库路径] [--reflect] [--orchestration] [--trace 路径]")
 	fmt.Fprintln(os.Stderr, "  codecritic eval [--dataset 数据集目录]")
 }
 
 func cmdReview(args []string) {
-	repo, diffPath, reflect := parseArgs(args)
+	repo, diffPath, reflect, orchestration := parseArgs(args)
 	if diffPath == "" {
 		usage()
 		os.Exit(2)
@@ -56,6 +57,16 @@ func cmdReview(args []string) {
 
 	ctx := context.Background()
 	llm := review.NewLLM(key, os.Getenv("DEEPSEEK_BASE_URL"), os.Getenv("DEEPSEEK_MODEL"))
+
+	if orchestration && repo != "" {
+		state := codeagent.NewState(repo, string(raw))
+		res, err := codeagent.NewWithDefaults(llm).Review(ctx, state)
+		if err != nil {
+			log.Fatalf("编排审查失败: %v", err)
+		}
+		printFindings(review.Dedup(res.Findings, 3))
+		return
+	}
 
 	res, err := review.Analyze(ctx, llm, repo, raw)
 	if err != nil {
@@ -107,7 +118,7 @@ func cmdEval(args []string) {
 }
 
 // parseArgs 提取 flag 与位置参数，flag 可出现在任意位置。
-func parseArgs(args []string) (repo, diff string, reflect bool) {
+func parseArgs(args []string) (repo, diff string, reflect, orchestration bool) {
 	for i := 0; i < len(args); i++ {
 		a := args[i]
 		switch {
@@ -117,6 +128,8 @@ func parseArgs(args []string) (repo, diff string, reflect bool) {
 			repo = strings.TrimPrefix(a, "--repo=")
 		case a == "--reflect":
 			reflect = true
+		case a == "--orchestration":
+			orchestration = true
 		default:
 			if diff == "" {
 				diff = a
