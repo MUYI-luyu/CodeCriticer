@@ -3,6 +3,8 @@ package diff
 
 import (
 	"bytes"
+	"os"
+	"path/filepath"
 	"strings"
 
 	sgd "github.com/sourcegraph/go-diff/diff"
@@ -36,6 +38,26 @@ func Parse(data []byte) ([]Change, error) {
 			c.fill(h)
 		}
 		cs = append(cs, c)
+	}
+	return cs, nil
+}
+
+// ParseWithRepo 解析 diff 后自动读取文件并标注符号信息。
+func ParseWithRepo(data []byte, repoPath string) ([]Change, error) {
+	cs, err := Parse(data)
+	if err != nil {
+		return nil, err
+	}
+	for i := range cs {
+		c := &cs[i]
+		if c.File == "/dev/null" {
+			continue
+		}
+		src, err := os.ReadFile(filepath.Join(repoPath, c.File))
+		if err != nil {
+			continue
+		}
+		c.Annotate(src)
 	}
 	return cs, nil
 }
