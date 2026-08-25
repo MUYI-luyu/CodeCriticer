@@ -42,10 +42,11 @@ func (a *Agent) Review(ctx context.Context, st *State) (*Result, error) {
 	return a.orchestrator.Execute(ctx, st)
 }
 
-// BuildDefaultRegistry 注册第一天需要的工具。
+// BuildDefaultRegistry 注册默认审查工具。
 func BuildDefaultRegistry(llm *review.LLM) *ToolRegistry {
 	registry := NewToolRegistry()
 	registry.Register(LocateSymbolsTool{})
+	registry.Register(StaticRulesTool{})
 	registry.Register(AnalyzeImpactTool{})
 	registry.Register(SearchCodeTool{})
 	if llm != nil {

@@ -27,9 +27,10 @@ const decisionPrompt = `你是一个代码审查编排器。根据当前证据�
 %s
 
 规则：
-1. 优先先定位符号，再分析影响，再搜索相关代码，最后审查。
-2. 如果证据已经足够，返回 done。
-3. 只输出 JSON：{"tool":"工具名或done","args":{},"reason":"简短原因"}`
+1. 先定位符号，再运行静态规则，再分析影响、搜索相关代码，最后审查。
+2. 尽早调用 static_rules：go vet 系列确定性问题误报率低，是审查结果的最低保障。
+3. 如果证据已经足够，返回 done。
+4. 只输出 JSON：{"tool":"工具名或done","args":{},"reason":"简短原因"}`
 
 // DecisionClient 提供生成下一步动作的能力。
 type DecisionClient interface {
@@ -97,7 +98,7 @@ func formatAttempts(history []Attempt) string {
 }
 
 func heuristicAction(st *State, history []Attempt) Action {
-	steps := []string{"locate_symbols", "analyze_impact", "search_code", "review_point"}
+	steps := []string{"locate_symbols", "static_rules", "analyze_impact", "search_code", "review_point"}
 	used := map[string]bool{}
 	for _, a := range history {
 		for _, c := range a.ToolCalls {
