@@ -2,55 +2,326 @@ package agent
 
 import (
 	"context"
+	"fmt"
+	"strings"
+	"time"
 
+	"github.com/MUYI-luyu/codecritic/internal/graph"
+	"github.com/MUYI-luyu/codecritic/internal/recall"
 	"github.com/MUYI-luyu/codecritic/internal/review"
 )
 
-// Reviewer 是编排器需要的最小执行面。
-type Reviewer interface {
-	CompleteJSON(context.Context, string, string) (string, error)
-}
-
-// Agent 组合工具注册表与编排器，供 CLI 使用。
+// Agent 是基于 Reflexion 的代码审查 Agent。
+// 核心循环：Execute → Validate → Reflect → Retry（带 Memory）。
 type Agent struct {
-	orchestrator *Orchestrator
+	planAgent        *review.PlanAgent // Plan-and-Execute 模式（固定 pipeline）
+	validator        *Validator
+	reflector        *Reflector
+	memory           []memoryEntry // 历史批评（短期记忆，按 symbol 去重）
+	maxAttempts      int
+	useOrchestration bool // 是否启用动态工具编排
+	repo             string
+	llm              *review.LLM // 保存 llm 用于创建 Orchestrator
+	store            *recall.Store
 }
 
-func New(llm Reviewer, registry *ToolRegistry) *Agent {
-	if registry == nil {
-		registry = NewToolRegistry()
+// memoryEntry 是一条历史批评记录。
+type memoryEntry struct {
+	Symbol     string // 符号名（用于去重）
+	File       string
+	Line       int
+	Msg        string
+	Reason     string
+	Suggestion string
+}
+
+// New 创建 Reflexion Agent。
+func New(llm *review.LLM, repo string, opts ...Option) (*Agent, error) {
+	// 构建调用图和召回存储
+	idx, err := graph.Build(repo)
+	if err != nil {
+		// 调用图构建失败时降级（不影响主流程）
+		idx = nil
 	}
-	return &Agent{orchestrator: NewOrchestrator(llm, registry)}
-}
 
-func NewWithDefaults(llm *review.LLM) *Agent {
-	return New(llm, BuildDefaultRegistry(llm))
-}
+	store := recall.New(repo, idx)
 
-func (a *Agent) WithMaxSteps(n int) *Agent {
-	if a != nil && a.orchestrator != nil {
-		a.orchestrator.SetMaxSteps(n)
+	agent := &Agent{
+		planAgent:        review.NewPlanAgent(llm, store),
+		validator:        NewValidator(llm, store),
+		reflector:        NewReflector(llm),
+		maxAttempts:      MaxAttempts,
+		useOrchestration: false, // 默认关闭，通过 Option 启用
+		repo:             repo,
+		llm:              llm,
+		store:            store,
 	}
-	return a
+
+	// 应用配置选项
+	for _, opt := range opts {
+		opt(agent)
+	}
+
+	return agent, nil
 }
 
-// Review 执行一次编排审查。
-func (a *Agent) Review(ctx context.Context, st *State) (*Result, error) {
-	if a == nil || a.orchestrator == nil {
-		return nil, nil
+// Option 是配置选项。
+type Option func(*Agent)
+
+// WithMaxAttempts 设置最大尝试轮数。
+func WithMaxAttempts(n int) Option {
+	return func(a *Agent) {
+		a.maxAttempts = n
 	}
-	return a.orchestrator.Execute(ctx, st)
 }
 
-// BuildDefaultRegistry 注册默认审查工具。
-func BuildDefaultRegistry(llm *review.LLM) *ToolRegistry {
-	registry := NewToolRegistry()
-	registry.Register(LocateSymbolsTool{})
-	registry.Register(StaticRulesTool{})
-	registry.Register(AnalyzeImpactTool{})
-	registry.Register(SearchCodeTool{})
-	if llm != nil {
-		registry.Register(NewReviewPointTool(llm))
+// WithOrchestration 启用动态工具编排。
+func WithOrchestration(enable bool) Option {
+	return func(a *Agent) {
+		a.useOrchestration = enable
 	}
-	return registry
+}
+
+// Review 执行 Reflexion Loop 审查。
+// 返回完整的审查结果（包含所有轮次的轨迹）。
+func (a *Agent) Review(ctx context.Context, diff []byte, syms []review.Sym) (*Result, error) {
+	startTime := time.Now()
+	result := &Result{
+		Attempts: make([]Attempt, 0, a.maxAttempts),
+	}
+
+	var prevFindings []review.Finding
+
+	for round := 1; round <= a.maxAttempts; round++ {
+		attempt, err := a.executeRound(ctx, round, diff, syms, prevFindings)
+		if err != nil {
+			// 单轮失败时记录错误但继续
+			attempt.Error = err.Error()
+		}
+
+		result.Attempts = append(result.Attempts, attempt)
+
+		// 收敛检查
+		if converged, reason := a.checkConvergence(result.Attempts, prevFindings); converged {
+			result.Converged = true
+			result.Reason = reason
+			result.FinalFindings = filterValidFindings(attempt.Findings, attempt.Validations)
+			result.TotalDuration = time.Since(startTime)
+			return result, nil
+		}
+
+		prevFindings = attempt.Findings
+	}
+
+	// 达到 max_attempts 仍未收敛
+	lastAttempt := result.Attempts[len(result.Attempts)-1]
+	result.Converged = false
+	result.Reason = "max_attempts"
+	result.FinalFindings = filterValidFindings(lastAttempt.Findings, lastAttempt.Validations)
+	result.TotalDuration = time.Since(startTime)
+
+	return result, nil
+}
+
+// executeRound 执行单轮审查。
+func (a *Agent) executeRound(ctx context.Context, round int, diff []byte, syms []review.Sym, prevFindings []review.Finding) (Attempt, error) {
+	startTime := time.Now()
+	attempt := Attempt{
+		Round:     round,
+		StartedAt: startTime,
+	}
+
+	// 1. Execute: 根据模式选择执行方式
+	var findings []review.Finding
+	var toolCalls []ToolCall
+	var err error
+
+	if a.useOrchestration {
+		// 动态工具编排模式
+		orchestrator := NewOrchestrator(a.llm, a.store, a.repo, string(diff))
+		orchResult, orchErr := orchestrator.Execute(ctx)
+		if orchErr != nil {
+			attempt.Duration = time.Since(startTime)
+			return attempt, fmt.Errorf("orchestration: %w", orchErr)
+		}
+		findings = orchResult.Findings
+		toolCalls = orchResult.ToolCalls
+	} else {
+		// Plan-and-Execute 固定 pipeline 模式
+		memoryText := a.formatMemory()
+		findings, err = a.planAgent.ReviewWithMemory(ctx, string(diff), syms, memoryText)
+		if err != nil {
+			attempt.Duration = time.Since(startTime)
+			return attempt, fmt.Errorf("execute: %w", err)
+		}
+	}
+	attempt.Findings = findings
+	attempt.ToolCalls = toolCalls
+
+	// 2. Validate: 证据校验
+	validations, err := a.validator.Validate(ctx, findings)
+	if err != nil {
+		attempt.Duration = time.Since(startTime)
+		return attempt, fmt.Errorf("validate: %w", err)
+	}
+	attempt.Validations = validations
+
+	// 3. Reflect: 生成批评（只对低可信度的）
+	critiques, err := a.reflector.Reflect(ctx, findings, validations)
+	if err != nil {
+		// reflect 失败不影响主流程
+		critiques = []Critique{}
+	}
+	attempt.Critiques = critiques
+
+	// 4. 更新 memory
+	a.updateMemory(findings, critiques)
+
+	attempt.Duration = time.Since(startTime)
+	return attempt, nil
+}
+
+// checkConvergence 检查是否收敛。
+func (a *Agent) checkConvergence(attempts []Attempt, prevFindings []review.Finding) (bool, string) {
+	if len(attempts) == 0 {
+		return false, ""
+	}
+
+	latest := attempts[len(attempts)-1]
+
+	// 条件1: 平均置信度 >= 0.75 且低置信度 findings <= 2
+	if avgConfidence(latest.Validations) >= 0.75 && fewLowConfidence(latest.Validations, 2) {
+		return true, "high_avg_with_bounded_low"
+	}
+
+	// 条件2: findings 集合稳定（与上一轮相比，Jaccard >= 0.8）
+	if len(prevFindings) > 0 && findingsStable(prevFindings, latest.Findings, 0.8) {
+		return true, "findings_stable"
+	}
+
+	return false, ""
+}
+
+// formatMemory 将批评转为文本形式（注入到下一轮 prompt）。
+func (a *Agent) formatMemory() string {
+	if len(a.memory) == 0 {
+		return ""
+	}
+	var lines []string
+	for i, m := range a.memory {
+		entry := fmt.Sprintf(
+			"[历史批评 #%d]\n位置: %s:%d\n问题: %s\n原因: %s\n建议: %s",
+			i+1, m.File, m.Line, m.Msg, m.Reason, m.Suggestion,
+		)
+		lines = append(lines, entry)
+	}
+	return strings.Join(lines, "\n\n")
+}
+
+// updateMemory 更新短期记忆（按 symbol 去重）。
+func (a *Agent) updateMemory(findings []review.Finding, critiques []Critique) {
+	for _, c := range critiques {
+		if c.FindingID >= len(findings) {
+			continue
+		}
+		f := findings[c.FindingID]
+
+		// 构造新条目
+		entry := memoryEntry{
+			Symbol:     f.Symbol,
+			File:       f.File,
+			Line:       f.Line,
+			Msg:        f.Msg,
+			Reason:     c.Reason,
+			Suggestion: c.Suggestion,
+		}
+
+		// 按 symbol 去重：相同 symbol 的覆盖旧的
+		updated := false
+		for i, m := range a.memory {
+			if m.Symbol != "" && m.Symbol == entry.Symbol {
+				a.memory[i] = entry // 覆盖
+				updated = true
+				break
+			}
+		}
+
+		// 新 symbol
+		if !updated {
+			a.memory = append(a.memory, entry)
+		}
+	}
+
+	// 限制 memory 大小（避免 context 过长）
+	const maxMemoryEntries = 10
+	if len(a.memory) > maxMemoryEntries {
+		a.memory = a.memory[len(a.memory)-maxMemoryEntries:]
+	}
+}
+
+// avgConfidence 计算所有 validations 的平均置信度。
+func avgConfidence(validations []Validation) float64 {
+	if len(validations) == 0 {
+		return 0
+	}
+	sum := 0.0
+	for _, v := range validations {
+		sum += v.Confidence
+	}
+	return sum / float64(len(validations))
+}
+
+// fewLowConfidence 检查低置信度 findings 的数量是否在限制内。
+func fewLowConfidence(validations []Validation, maxLow int) bool {
+	lowCount := 0
+	for _, v := range validations {
+		if v.Confidence < ConfidenceThreshold {
+			lowCount++
+		}
+	}
+	return lowCount <= maxLow
+}
+
+// findingsStable 检查两轮 findings 是否稳定（Jaccard 相似度）。
+func findingsStable(prev, curr []review.Finding, threshold float64) bool {
+	if len(prev) == 0 && len(curr) == 0 {
+		return true
+	}
+
+	// 构建 finding 的唯一键（file:line:msg）
+	prevSet := make(map[string]bool)
+	for _, f := range prev {
+		key := fmt.Sprintf("%s:%d:%s", f.File, f.Line, f.Msg)
+		prevSet[key] = true
+	}
+
+	currSet := make(map[string]bool)
+	intersection := 0
+	for _, f := range curr {
+		key := fmt.Sprintf("%s:%d:%s", f.File, f.Line, f.Msg)
+		currSet[key] = true
+		if prevSet[key] {
+			intersection++
+		}
+	}
+
+	// Jaccard = |A ∩ B| / |A ∪ B|
+	union := len(prevSet) + len(currSet) - intersection
+	if union == 0 {
+		return true
+	}
+
+	similarity := float64(intersection) / float64(union)
+	return similarity >= threshold
+}
+
+// filterValidFindings 过滤出高可信度的 findings。
+func filterValidFindings(findings []review.Finding, validations []Validation) []review.Finding {
+	var result []review.Finding
+	for _, v := range validations {
+		if v.Confidence >= ConfidenceThreshold && v.FindingID < len(findings) {
+			result = append(result, findings[v.FindingID])
+		}
+	}
+	return result
 }

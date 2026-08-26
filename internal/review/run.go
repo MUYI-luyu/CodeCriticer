@@ -49,8 +49,8 @@ func Analyze(ctx context.Context, llm *LLM, repo string, raw []byte) (*Result, e
 	if idx != nil {
 		store = recall.New(repo, idx)
 	}
-	agent := NewAgent(llm, store)
-	fs, err := agent.Review(ctx, string(raw), syms)
+	planAgent := NewPlanAgent(llm, store)
+	fs, err := planAgent.Review(ctx, string(raw), syms)
 	if err != nil {
 		return nil, err
 	}

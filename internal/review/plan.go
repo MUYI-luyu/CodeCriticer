@@ -20,18 +20,25 @@ type Sym struct {
 	File string
 }
 
-// Agent 是 Plan-and-Execute 审查器。
-type Agent struct {
+// PlanAgent 是 Plan-and-Execute 审查器。
+// 先规划审查要点，再逐点召回代码并审查。
+type PlanAgent struct {
 	llm   *LLM
 	store *recall.Store
 }
 
-func NewAgent(llm *LLM, store *recall.Store) *Agent {
-	return &Agent{llm: llm, store: store}
+func NewPlanAgent(llm *LLM, store *recall.Store) *PlanAgent {
+	return &PlanAgent{llm: llm, store: store}
 }
 
 // Review 先规划要点，再逐点召回 + 审查。
-func (a *Agent) Review(ctx context.Context, diffText string, syms []Sym) ([]Finding, error) {
+func (a *PlanAgent) Review(ctx context.Context, diffText string, syms []Sym) ([]Finding, error) {
+	return a.ReviewWithMemory(ctx, diffText, syms, "")
+}
+
+// ReviewWithMemory 支持注入历史批评（Reflexion 的 memory）。
+// memory 是历史批评的文本形式，会注入到每个 ReviewPoint 的 prompt 中。
+func (a *PlanAgent) ReviewWithMemory(ctx context.Context, diffText string, syms []Sym, memory string) ([]Finding, error) {
 	if a.store == nil {
 		return a.llm.Review(ctx, diffText)
 	}
@@ -54,7 +61,14 @@ func (a *Agent) Review(ctx context.Context, diffText string, syms []Sym) ([]Find
 		for _, w := range p.Kw {
 			docs = append(docs, a.store.Keyword(w)...)
 		}
-		fs, err := a.llm.ReviewPoint(ctx, diffText, p.Desc, formatDocs(docs))
+
+		// 将 memory 注入到召回上下文中
+		ctxText := formatDocs(docs)
+		if memory != "" {
+			ctxText = fmt.Sprintf("历史批评（避免重犯）：\n%s\n\n召回代码：\n%s", memory, ctxText)
+		}
+
+		fs, err := a.llm.ReviewPoint(ctx, diffText, p.Desc, ctxText)
 		if err != nil {
 			continue
 		}

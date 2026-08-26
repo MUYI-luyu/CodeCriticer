@@ -1,7 +1,7 @@
 package main
 
-import "os"
+import "fmt"
 
 func main() {
-	os.Chdir("/tmp") // BUG: 忽略 Chdir 返回的错误
+	fmt.Errorf("write failed: %s", "disk") // BUG: error 返回值被丢弃未处理
 }

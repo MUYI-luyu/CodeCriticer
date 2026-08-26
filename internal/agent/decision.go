@@ -5,114 +5,113 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+
+	"github.com/MUYI-luyu/codecritic/internal/review"
 )
 
+// NextAction 是 LLM 决策的下一步工具调用。
+type NextAction struct {
+	Tool   string                 `json:"tool"`
+	Args   map[string]interface{} `json:"args"`
+	Reason string                 `json:"reason"`
+}
+
+const decisionPrompt = `你是代码审查 Agent。根据当前证据，决定下一步应该调用哪个工具。
+
+可用工具：
+1. locate_symbols: 定位 diff 中的符号变更（函数/方法/类型）
+   参数：无
+
+2. static_rules: 运行静态分析规则（go vet、copylock、printf 等）
+   参数：无
+
+3. analyze_impact: 分析符号的影响范围（调用方）
+   参数：{"symbol": "函数名", "file": "文件路径"}
+
+4. search_code: 全文搜索关键词
+   参数：{"keyword": "关键词"}
+
+5. review_point: 针对审查要点执行审查
+   参数：{"description": "审查要点描述", "context": "召回的代码上下文"}
+
+6. done: 完成审查
+   参数：无
+
+决策原则：
+- 先用 locate_symbols 定位变更
+- 尽早调用 static_rules 获取确定性问题（go vet 系列）
+- 对关键符号用 analyze_impact 分析调用方
+- 用 search_code 召回相关代码
+- 用 review_point 执行审查
+- 所有必要工具都调用后，返回 done
+
+历史调用：
+%s
+
+当前证据：
+%s
+
+只输出 JSON：
+{
+  "tool": "工具名",
+  "args": {"参数": "值"},
+  "reason": "为什么选择这个工具（一句话）"
+}`
+
+// DecideNextAction 让 LLM 决策下一步工具调用。
+func DecideNextAction(ctx context.Context, llm *review.LLM, registry *ToolRegistry, evidence string, history []ToolCall) (*NextAction, error) {
+	// 格式化历史调用
+	historyText := formatHistory(history)
+
+	// 调用 LLM 决策
+	prompt := fmt.Sprintf(decisionPrompt, historyText, evidence)
+	text, err := llm.Chat(ctx, "", prompt, llm.Config().PlanModel)
+	if err != nil {
+		return nil, fmt.Errorf("LLM 决策失败: %w", err)
+	}
+
+	// 解析决策
+	var action NextAction
+	if err := json.Unmarshal([]byte(stripFence(text)), &action); err != nil {
+		return nil, fmt.Errorf("解析决策: %w", err)
+	}
+
+	return &action, nil
+}
+
+// formatHistory 格式化历史工具调用（包含结果摘要）。
+func formatHistory(history []ToolCall) string {
+	if len(history) == 0 {
+		return "无"
+	}
+
+	var lines []string
+	for i, call := range history {
+		if call.Error != "" {
+			lines = append(lines, fmt.Sprintf("%d. %s (失败: %s)", i+1, call.Tool, call.Error))
+		} else {
+			// 加入结果摘要（前 200 字符）
+			resultSummary := truncateResult(call.Result, 200)
+			lines = append(lines, fmt.Sprintf("%d. %s → %s", i+1, call.Tool, resultSummary))
+		}
+	}
+	return strings.Join(lines, "\n")
+}
+
+// truncateResult 截断结果为摘要（前 maxLen 字符）。
+func truncateResult(result interface{}, maxLen int) string {
+	str := fmt.Sprintf("%v", result)
+	if len(str) <= maxLen {
+		return str
+	}
+	return str[:maxLen] + "..."
+}
+
+// stripFence 去掉 markdown 围栏。
 func stripFence(s string) string {
 	s = strings.TrimSpace(s)
 	s = strings.TrimPrefix(s, "```json")
 	s = strings.TrimPrefix(s, "```")
 	s = strings.TrimSuffix(s, "```")
 	return strings.TrimSpace(s)
-}
-
-const decisionPrompt = `你是一个代码审查编排器。根据当前证据，选择下一步工具。
-
-可用工具：
-%s
-
-历史记录：
-%s
-
-当前证据：
-%s
-
-规则：
-1. 先定位符号，再运行静态规则，再分析影响、搜索相关代码，最后审查。
-2. 尽早调用 static_rules：go vet 系列确定性问题误报率低，是审查结果的最低保障。
-3. 如果证据已经足够，返回 done。
-4. 只输出 JSON：{"tool":"工具名或done","args":{},"reason":"简短原因"}`
-
-// DecisionClient 提供生成下一步动作的能力。
-type DecisionClient interface {
-	CompleteJSON(context.Context, string, string) (string, error)
-}
-
-// DecideNextAction 根据当前状态决定下一步动作。
-func DecideNextAction(ctx context.Context, llm DecisionClient, tools []ToolSpec, st *State, history []Attempt) (Action, error) {
-	if llm == nil {
-		return heuristicAction(st, history), nil
-	}
-
-	toolText := formatToolSpecs(tools)
-	historyText := formatAttempts(history)
-	prompt := fmt.Sprintf(decisionPrompt, toolText, historyText, st.EvidenceText())
-	text, err := llm.CompleteJSON(ctx, prompt, "请决定下一步工具。")
-	if err != nil {
-		return Action{}, err
-	}
-	return parseAction(text)
-}
-
-func parseAction(text string) (Action, error) {
-	var out Action
-	if err := json.Unmarshal([]byte(stripFence(text)), &out); err != nil {
-		return Action{}, err
-	}
-	out.Tool = strings.TrimSpace(out.Tool)
-	if out.Args == nil {
-		out.Args = map[string]any{}
-	}
-	if out.Tool == "" {
-		return Action{}, fmt.Errorf("empty tool")
-	}
-	return out, nil
-}
-
-func formatToolSpecs(tools []ToolSpec) string {
-	if len(tools) == 0 {
-		return "(无)"
-	}
-	var b strings.Builder
-	for i, t := range tools {
-		fmt.Fprintf(&b, "%d. %s - %s\n", i+1, t.Name, t.Description)
-	}
-	return strings.TrimSpace(b.String())
-}
-
-func formatAttempts(history []Attempt) string {
-	if len(history) == 0 {
-		return "(无)"
-	}
-	var b strings.Builder
-	for _, a := range history {
-		fmt.Fprintf(&b, "Round %d:\n", a.Round)
-		for _, c := range a.ToolCalls {
-			fmt.Fprintf(&b, "- %s => %s", c.Tool, strings.TrimSpace(c.Result))
-			if c.Error != "" {
-				fmt.Fprintf(&b, " (err=%s)", c.Error)
-			}
-			b.WriteString("\n")
-		}
-	}
-	return strings.TrimSpace(b.String())
-}
-
-func heuristicAction(st *State, history []Attempt) Action {
-	steps := []string{"locate_symbols", "static_rules", "analyze_impact", "search_code", "review_point"}
-	used := map[string]bool{}
-	for _, a := range history {
-		for _, c := range a.ToolCalls {
-			used[c.Tool] = true
-		}
-	}
-	for _, name := range steps {
-		if !used[name] {
-			args := map[string]any{}
-			if name == "search_code" {
-				args["keywords"] = symbolNames(st.Symbols)
-			}
-			return Action{Tool: name, Args: args, Reason: "按固定编排推进下一步"}
-		}
-	}
-	return Action{Tool: "done", Args: map[string]any{}, Reason: "已完成基础编排"}
 }

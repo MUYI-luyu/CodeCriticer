@@ -3,8 +3,6 @@ package diff
 
 import (
 	"bytes"
-	"os"
-	"path/filepath"
 	"strings"
 
 	sgd "github.com/sourcegraph/go-diff/diff"
@@ -25,7 +23,7 @@ type Change struct {
 	Symbols []Symbol // Annotate 填充
 }
 
-// Parse 把 unified diff 解析为变更列表。
+// Parse 把 unified diff 解析为变更列表。符号信息需要调用方用文件内容 Annotate。
 func Parse(data []byte) ([]Change, error) {
 	fds, err := sgd.ParseMultiFileDiff(data)
 	if err != nil {
@@ -38,26 +36,6 @@ func Parse(data []byte) ([]Change, error) {
 			c.fill(h)
 		}
 		cs = append(cs, c)
-	}
-	return cs, nil
-}
-
-// ParseWithRepo 解析 diff 后自动读取文件并标注符号信息。
-func ParseWithRepo(data []byte, repoPath string) ([]Change, error) {
-	cs, err := Parse(data)
-	if err != nil {
-		return nil, err
-	}
-	for i := range cs {
-		c := &cs[i]
-		if c.File == "/dev/null" {
-			continue
-		}
-		src, err := os.ReadFile(filepath.Join(repoPath, c.File))
-		if err != nil {
-			continue
-		}
-		c.Annotate(src)
 	}
 	return cs, nil
 }

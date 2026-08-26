@@ -6,43 +6,50 @@ import (
 	"github.com/MUYI-luyu/codecritic/internal/review"
 )
 
-func TestComputeExact(t *testing.T) {
-	bugs := []Bug{{File: "a.go", Line: 10}}
-	fs := []review.Finding{{File: "a.go", Line: 10}}
+func TestComputeExactMatch(t *testing.T) {
+	bugs := []Bug{{File: "main.go", Line: 7}}
+	fs := []review.Finding{{File: "main.go", Line: 7}}
 	m := Compute(bugs, fs, 3)
-	if m.Bugs != 1 || m.Found != 1 || m.Findings != 1 || m.True != 1 || m.False != 0 {
-		t.Fatalf("精确命中计数错误: %+v", m)
+	if m.True != 1 || m.False != 0 || m.Found != 1 {
+		t.Fatalf("应精确命中: %+v", m)
 	}
-	if m.Recall() != 1.0 || m.Precision() != 1.0 || m.FPRate() != 0.0 {
-		t.Fatalf("精确命中指标错误: R=%.2f P=%.2f FP=%.2f", m.Recall(), m.Precision(), m.FPRate())
+	if m.Recall() != 1 || m.Precision() != 1 || m.FPRate() != 0 {
+		t.Fatalf("指标异常: %+v", m)
 	}
 }
 
-func TestComputeTolerance(t *testing.T) {
-	bugs := []Bug{{File: "a.go", Line: 10}}
-	fs := []review.Finding{{File: "a.go", Line: 12}}
-	m := Compute(bugs, fs, 3)
-	if m.Found != 1 || m.True != 1 {
-		t.Fatalf("容差内应命中: %+v", m)
-	}
-
-	m2 := Compute(bugs, []review.Finding{{File: "a.go", Line: 14}}, 3)
-	if m2.Found != 0 || m2.False != 1 {
-		t.Fatalf("容差外应误报: %+v", m2)
-	}
-}
-
-func TestComputeFalsePositive(t *testing.T) {
-	bugs := []Bug{{File: "a.go", Line: 10}}
+func TestComputeToleranceAndFP(t *testing.T) {
+	bugs := []Bug{{File: "main.go", Line: 7}}
 	fs := []review.Finding{
-		{File: "a.go", Line: 10},
-		{File: "b.go", Line: 5},
+		{File: "main.go", Line: 9},  // 容差内命中
+		{File: "main.go", Line: 20}, // 误报
 	}
 	m := Compute(bugs, fs, 3)
 	if m.True != 1 || m.False != 1 {
-		t.Fatalf("应有 1 真 1 假: %+v", m)
+		t.Fatalf("应 1 命中 1 误报: %+v", m)
 	}
-	if m.Precision() != 0.5 {
-		t.Fatalf("Precision 应为 0.5，得到 %.2f", m.Precision())
+	if m.Precision() != 0.5 || m.FPRate() != 0.5 {
+		t.Fatalf("指标异常: %+v", m)
+	}
+}
+
+func TestComputeGreedyOnePerBug(t *testing.T) {
+	bugs := []Bug{{File: "main.go", Line: 7}}
+	fs := []review.Finding{
+		{File: "main.go", Line: 7},
+		{File: "main.go", Line: 8},
+	}
+	m := Compute(bugs, fs, 3)
+	if m.True != 1 || m.False != 1 || m.Found != 1 {
+		t.Fatalf("同一 bug 只应命中一次: %+v", m)
+	}
+}
+
+func TestComputeWrongFile(t *testing.T) {
+	bugs := []Bug{{File: "main.go", Line: 7}}
+	fs := []review.Finding{{File: "other.go", Line: 7}}
+	m := Compute(bugs, fs, 3)
+	if m.True != 0 || m.False != 1 {
+		t.Fatalf("文件不符应判误报: %+v", m)
 	}
 }

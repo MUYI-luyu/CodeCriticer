@@ -1,1 +1,1 @@
-{"name": "copylock", "source": "拷贝含锁的结构体", "rule": "copylock"}
+{"name": "copylock", "source": "按值复制互斥锁", "rule": "copylocks"}

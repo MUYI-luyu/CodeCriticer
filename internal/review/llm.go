@@ -29,38 +29,44 @@ Finding:
 问题: %s
 声称证据: %s
 
-召回的证据:
+召回的证据：
+函数体上下文:
 %s
 
-请输出 0-1 的置信度分数（0=完全不可信，1=证据确凿），并说明：
-1. 支持该 finding 的证据
-2. 缺失或矛盾的证据（gaps）
+变量定义:
+%s
 
-只输出 JSON：
-{"confidence": 0.0-1.0, "evidence": "支持的证据摘要", "gaps": ["缺失的证据1", "缺失的证据2"]}`
+调用关系:
+%s
 
-const critiquePrompt = `你是代码审查反思器。给出一个低置信度的 finding 及其 validation 结果，生成具体的反驳理由和改进建议。
+输出 JSON：
+{
+  "confidence": 0.0-1.0,
+  "evidence": "支持该 finding 的关键证据（代码片段）",
+  "gaps": ["证据缺口1", "证据缺口2"]
+}
 
-Finding:
-文件: %s
-行号: %d
-严重程度: %s
-问题: %s
-声称证据: %s
+评分标准：
+- 0.9-1.0：有明确代码证据，必然导致 bug（如：确实 nil check 缺失且后续解引用）
+- 0.7-0.9：有间接证据，很可能是 bug（如：并发访问共享变量但无锁保护）
+- 0.4-0.7：证据不足，可能是误报（如：声称 panic 但没看到触发路径）
+- 0.0-0.4：明显误报（如：声称 nil panic 但代码已有 if x != nil 检查）
+
+如果 confidence < 0.7，必须在 gaps 中列出缺失的证据。
+只输出 JSON，不要其他文字。`
+
+const critiquePrompt = `你是代码审查批评者。给出一个低可信度的 finding 及其 validation 结果，分析为什么可信度低，并给出改进建议。
+
+Finding: [%s] %s:%d - %s
 
 Validation 结果:
-置信度: %.2f
+置信度: %.1f%%
 证据: %s
-缺失项: %s
+缺口: %s
 
-请生成：
-1. Reason: 为什么这个 finding 置信度低？具体的反驳理由
-2. Evidence: 从 validation 证据中提取关键部分
-3. Suggestion: 下次审查时应该做什么？（具体的行动建议）
-
-只输出 JSON：
+输出 JSON：
 {
-  "reason": "反驳理由（一句话说明为什么置信度低）",
+  "reason": "为什么可信度低（一句话）",
   "evidence": "反驳的证据（从 validation 的证据中提取关键部分）",
   "suggestion": "下次审查时应该做什么（具体的行动建议）"
 }
@@ -80,22 +86,24 @@ Validation Gaps: ["未检查所有 x 的使用点", "未追踪 x 的定义"]
 
 只输出 JSON，不要其他文字。`
 
-// LLM 是 OpenAI 兼容的聊天客户端。
+// Config 返回 LLM 的配置（公开给 agent 包使用）。
+func (l *LLM) Config() *Config {
+	return l.config
+}
+
+// LLM 是 OpenAI 兼容的聊天客户端，支持分级模型配置。
 type LLM struct {
-	key    string
-	base   string
-	model  string
+	config *Config
 	client *http.Client
 }
 
-func NewLLM(key, base, model string) *LLM {
-	if base == "" {
-		base = "https://api.deepseek.com/v1"
+// NewLLMWithConfig 创建 LLM 客户端，使用自定义配置。
+func NewLLMWithConfig(opts ...Option) *LLM {
+	cfg := DefaultConfig()
+	for _, opt := range opts {
+		opt(cfg)
 	}
-	if model == "" {
-		model = "deepseek-v4-flash"
-	}
-	return &LLM{key: key, base: base, model: model, client: &http.Client{}}
+	return &LLM{config: cfg, client: &http.Client{}}
 }
 
 type chatMsg struct {
@@ -121,10 +129,15 @@ type chatResp struct {
 	} `json:"choices"`
 }
 
+// Chat 发送一轮对话，返回助手文本（公开给 agent 包使用）。
+func (l *LLM) Chat(ctx context.Context, system, user, model string) (string, error) {
+	return l.chat(ctx, system, user, model)
+}
+
 // chat 发送一轮对话，返回助手文本。
-func (l *LLM) chat(ctx context.Context, system, user string) (string, error) {
+func (l *LLM) chat(ctx context.Context, system, user, model string) (string, error) {
 	body := chatReq{
-		Model:    l.model,
+		Model:    model,
 		Messages: []chatMsg{{Role: "system", Content: system}, {Role: "user", Content: user}},
 	}
 	body.Format.Type = "json_object"
@@ -133,12 +146,12 @@ func (l *LLM) chat(ctx context.Context, system, user string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, l.base+"/chat/completions", bytes.NewReader(raw))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, l.config.BaseURL+"/chat/completions", bytes.NewReader(raw))
 	if err != nil {
 		return "", err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+l.key)
+	req.Header.Set("Authorization", "Bearer "+l.config.APIKey)
 
 	resp, err := l.client.Do(req)
 	if err != nil {
@@ -160,14 +173,9 @@ func (l *LLM) chat(ctx context.Context, system, user string) (string, error) {
 	return out.Choices[0].Message.Content, nil
 }
 
-// CompleteJSON 执行一次 JSON 约束的对话，供编排器复用。
-func (l *LLM) CompleteJSON(ctx context.Context, system, user string) (string, error) {
-	return l.chat(ctx, system, user)
-}
-
 // Review 一次性审查 diff，返回 findings。
 func (l *LLM) Review(ctx context.Context, diffText string) ([]Finding, error) {
-	text, err := l.chat(ctx, reviewPrompt, diffText)
+	text, err := l.chat(ctx, reviewPrompt, diffText, l.config.ReviewModel)
 	if err != nil {
 		return nil, err
 	}
@@ -176,7 +184,7 @@ func (l *LLM) Review(ctx context.Context, diffText string) ([]Finding, error) {
 
 // Plan 规划审查要点。
 func (l *LLM) Plan(ctx context.Context, diffText string) ([]Point, error) {
-	text, err := l.chat(ctx, planPrompt, diffText)
+	text, err := l.chat(ctx, planPrompt, diffText, l.config.PlanModel)
 	if err != nil {
 		return nil, err
 	}
@@ -195,90 +203,61 @@ func (l *LLM) ReviewPoint(ctx context.Context, diffText, desc, ctxText string) (
 只输出 JSON：{"findings":[{"file":"...","line":0,"severity":"error|warning|info","msg":"...","evidence":"..."}]}
 没有则 {"findings":[]}。`, desc)
 	user := "diff:\n" + diffText + "\n\n召回代码:\n" + ctxText
-	text, err := l.chat(ctx, sys, user)
+	text, err := l.chat(ctx, sys, user, l.config.ReviewModel)
 	if err != nil {
 		return nil, err
 	}
 	return parseFindings(text)
 }
 
-// Check 复核一条 finding 是否真实，返回是否保留。
-func (l *LLM) Check(ctx context.Context, f Finding, code string) (bool, error) {
-	sys := `你是代码审查复核员。给出一条 finding 与它所在位置的真实代码，判断它是否是必须修复的真 bug。
-判定为 drop（误报）：风格/可读性建议、代码其实已正确处理、无法从代码证实、与本次 diff 无关。
-判定为 keep（真 bug）：会导致 panic、数据错误、并发错误、资源泄漏等真实缺陷。
-只输出 JSON：{"verdict":"keep|drop","reason":"一句话理由"}`
-	user := fmt.Sprintf("finding: [%s] %s\n声称证据:\n%s\n位置代码:\n%s", f.Severity, f.Msg, f.Evidence, code)
-	text, err := l.chat(ctx, sys, user)
+// ValidateFinding 对一个 finding 进行证据校验，返回置信度评分。
+// 这是 Reflexion 的核心：从二元判断升级为定量评分。
+// 返回：confidence, evidence, gaps, error
+func (l *LLM) ValidateFinding(ctx context.Context, f Finding, funcBody, varDefs, callChain string) (float64, string, []string, error) {
+	user := fmt.Sprintf(validatePrompt,
+		f.File, f.Line, f.Severity, f.Msg, f.Evidence,
+		funcBody, varDefs, callChain)
+
+	text, err := l.chat(ctx, "", user, l.config.ReflectModel)
 	if err != nil {
-		return false, err
-	}
-	var out struct {
-		Verdict string `json:"verdict"`
-	}
-	if err := json.Unmarshal([]byte(stripFence(text)), &out); err != nil {
-		return false, err
-	}
-	return out.Verdict == "keep", nil
-}
-
-// ValidationResult 是 ValidateFinding 的返回结果。
-type ValidationResult struct {
-	Confidence float64  `json:"confidence"`
-	Evidence   string   `json:"evidence"`
-	Gaps       []string `json:"gaps"`
-}
-
-// ValidateFinding 对单个 finding 进行证据校验，返回置信度评分。
-func (l *LLM) ValidateFinding(ctx context.Context, f Finding, evidence interface{}) (ValidationResult, error) {
-	// 将 evidence 格式化为字符串
-	evidenceText := fmt.Sprintf("%+v", evidence)
-
-	sys := fmt.Sprintf(validatePrompt, f.File, f.Line, f.Severity, f.Msg, f.Evidence, evidenceText)
-	text, err := l.chat(ctx, sys, "请评估上述 finding 的置信度。")
-	if err != nil {
-		return ValidationResult{}, err
+		return 0, "", nil, err
 	}
 
-	var result ValidationResult
+	var result struct {
+		Confidence float64  `json:"confidence"`
+		Evidence   string   `json:"evidence"`
+		Gaps       []string `json:"gaps"`
+	}
 	if err := json.Unmarshal([]byte(stripFence(text)), &result); err != nil {
-		return ValidationResult{}, fmt.Errorf("解析 validation 结果: %w", err)
+		return 0, "", nil, fmt.Errorf("解析 validation: %w", err)
 	}
 
-	return result, nil
+	return result.Confidence, result.Evidence, result.Gaps, nil
 }
 
-// CritiqueResult 是 GenerateCritique 的返回结果。
-type CritiqueResult struct {
-	Reason     string `json:"reason"`
-	Evidence   string `json:"evidence"`
-	Suggestion string `json:"suggestion"`
-}
+// GenerateCritique 对低可信度 finding 生成结构化批评。
+// 批评用于指导下一轮审查（Reflexion 的 memory）。
+// 返回：reason, evidence, suggestion, error
+func (l *LLM) GenerateCritique(ctx context.Context, f Finding, confidence float64, evidence string, gaps []string) (string, string, string, error) {
+	user := fmt.Sprintf(critiquePrompt,
+		f.Severity, f.File, f.Line, f.Msg,
+		confidence*100, evidence, strings.Join(gaps, "; "))
 
-// ValidationInput 是传给 GenerateCritique 的 Validation 信息。
-type ValidationInput struct {
-	Confidence float64
-	Evidence   string
-	Gaps       []string
-}
-
-// GenerateCritique 为低置信度的 finding 生成反驳理由 + 改进建议。
-func (l *LLM) GenerateCritique(ctx context.Context, f Finding, val ValidationInput) (CritiqueResult, error) {
-	gapsText := strings.Join(val.Gaps, "; ")
-	sys := fmt.Sprintf(critiquePrompt, f.File, f.Line, f.Severity, f.Msg, f.Evidence,
-		val.Confidence, val.Evidence, gapsText)
-
-	text, err := l.chat(ctx, sys, "请生成 Critique。")
+	text, err := l.chat(ctx, "", user, l.config.ReflectModel)
 	if err != nil {
-		return CritiqueResult{}, err
+		return "", "", "", err
 	}
 
-	var result CritiqueResult
+	var result struct {
+		Reason     string `json:"reason"`
+		Evidence   string `json:"evidence"`
+		Suggestion string `json:"suggestion"`
+	}
 	if err := json.Unmarshal([]byte(stripFence(text)), &result); err != nil {
-		return CritiqueResult{}, fmt.Errorf("解析 critique 结果: %w", err)
+		return "", "", "", fmt.Errorf("解析 critique: %w", err)
 	}
 
-	return result, nil
+	return result.Reason, result.Evidence, result.Suggestion, nil
 }
 
 func parseFindings(text string) ([]Finding, error) {

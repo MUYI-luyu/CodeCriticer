@@ -2,87 +2,162 @@ package agent
 
 import (
 	"context"
-	"errors"
 	"fmt"
-	"time"
+	"strings"
 
+	"github.com/MUYI-luyu/codecritic/internal/recall"
 	"github.com/MUYI-luyu/codecritic/internal/review"
 )
 
-// Orchestrator 负责动态工具编排。
+// Orchestrator 是动态工具编排器。
+// 核心：LLM 根据当前证据决定下一步调用哪个工具，而非固定 pipeline。
 type Orchestrator struct {
-	llm      DecisionClient
+	llm      *review.LLM
 	registry *ToolRegistry
+	diffText string
 	maxSteps int
 }
 
-func NewOrchestrator(llm DecisionClient, registry *ToolRegistry) *Orchestrator {
-	return &Orchestrator{llm: llm, registry: registry, maxSteps: 10}
-}
+// NewOrchestrator 创建工具编排器。
+func NewOrchestrator(llm *review.LLM, store *recall.Store, repo, diffText string) *Orchestrator {
+	registry := NewToolRegistry()
 
-func (o *Orchestrator) SetMaxSteps(n int) {
-	if n > 0 {
-		o.maxSteps = n
+	// 注册工具
+	registry.Register(NewLocateSymbolsTool(diffText, repo))
+	registry.Register(NewAnalyzeImpactTool(store))
+	registry.Register(NewSearchCodeTool(store))
+	registry.Register(NewReviewPointTool(llm, diffText))
+
+	// 静态规则工具：确定性发现是审查结果的最低保障
+	registry.Register(NewStaticRulesTool(repo, diffText))
+
+	return &Orchestrator{
+		llm:      llm,
+		registry: registry,
+		diffText: diffText,
+		maxSteps: 10, // 防止无限循环
 	}
 }
 
-// Execute 运行编排循环。
-func (o *Orchestrator) Execute(ctx context.Context, st *State) (*Result, error) {
-	if st == nil {
-		return nil, errors.New("state 为空")
-	}
-	if o.registry == nil {
-		return nil, errors.New("tool registry 为空")
-	}
-	start := time.Now()
-	res := &Result{}
-	var history []Attempt
+// OrchestrationResult 是编排结果。
+type OrchestrationResult struct {
+	Findings  []review.Finding
+	ToolCalls []ToolCall
+}
 
-	for step := 0; step < o.maxSteps; step++ {
-		action, err := DecideNextAction(ctx, o.llm, o.registry.List(), st, history)
+// Execute 执行动态工具编排。
+func (o *Orchestrator) Execute(ctx context.Context) (*OrchestrationResult, error) {
+	var toolCalls []ToolCall
+	var findings []review.Finding
+	evidence := fmt.Sprintf("Diff:\n%s", o.diffText)
+	noProgressCount := 0 // 连续无进展次数
+
+	for step := 1; step <= o.maxSteps; step++ {
+		// 决策下一步
+		action, err := DecideNextAction(ctx, o.llm, o.registry, evidence, toolCalls)
 		if err != nil {
-			return nil, err
-		}
-		if action.Tool == "done" {
-			res.Converged = true
-			res.Reason = action.Reason
-			res.Attempts = history
-			res.Findings = append([]review.Finding{}, st.Findings...)
-			res.TotalDuration = time.Since(start)
-			return res, nil
+			return nil, fmt.Errorf("决策失败 (step %d): %w", step, err)
 		}
 
+		// 检查是否完成
+		if action.Tool == "done" {
+			break
+		}
+
+		// 检查是否重复调用（连续 3 次相同工具 + 无新 findings）
+		if isRepeatedTool(action.Tool, toolCalls) {
+			noProgressCount++
+			if noProgressCount >= 3 {
+				// 强制退出：连续 3 次重复工具调用
+				break
+			}
+		} else {
+			noProgressCount = 0 // 重置计数
+		}
+
+		// 执行工具
 		tool, ok := o.registry.Get(action.Tool)
 		if !ok {
 			return nil, fmt.Errorf("未知工具: %s", action.Tool)
 		}
 
-		call := ToolCall{Tool: action.Tool, Args: action.Args}
-		callStart := time.Now()
-		result, err := tool.Execute(ctx, st, action.Args)
-		call.Duration = time.Since(callStart)
-		if err != nil {
-			call.Error = err.Error()
-		} else {
-			call.Result = result
+		result, err := tool.Execute(ctx, action.Args)
+		toolCall := ToolCall{
+			Tool: action.Tool,
+			Args: action.Args,
 		}
 
-		st.AppendEvidence(action.Tool, result)
 		if err != nil {
-			st.AppendEvidence(action.Tool+"-error", err.Error())
+			toolCall.Error = err.Error()
+			toolCalls = append(toolCalls, toolCall)
+			continue
 		}
 
-		history = append(history, Attempt{
-			Round:     step + 1,
-			ToolCalls: []ToolCall{call},
-			Evidence:  st.EvidenceText(),
-			Findings:  append([]review.Finding{}, st.Findings...),
-		})
+		toolCall.Result = result
+		toolCalls = append(toolCalls, toolCall)
+
+		// 更新证据
+		evidence = o.updateEvidence(evidence, action, result)
+
+		// 收集确定性发现（static_rules）与 LLM 审查发现（review_point）
+		if action.Tool == "review_point" || action.Tool == "static_rules" {
+			if resultMap, ok := result.(map[string]interface{}); ok {
+				if findingsRaw, ok := resultMap["findings"].([]review.Finding); ok {
+					findings = append(findings, findingsRaw...)
+				}
+			}
+		}
 	}
 
-	res.Attempts = history
-	res.Findings = append([]review.Finding{}, st.Findings...)
-	res.Reason = "达到最大步数"
-	res.TotalDuration = time.Since(start)
-	return res, nil
+	return &OrchestrationResult{
+		Findings:  findings,
+		ToolCalls: toolCalls,
+	}, nil
+}
+
+// updateEvidence 更新证据上下文。
+func (o *Orchestrator) updateEvidence(currentEvidence string, action *NextAction, result interface{}) string {
+	var update strings.Builder
+	update.WriteString(currentEvidence)
+	update.WriteString(fmt.Sprintf("\n\n--- Step: %s (理由: %s) ---\n", action.Tool, action.Reason))
+
+	switch action.Tool {
+	case "locate_symbols":
+		if m, ok := result.(map[string]interface{}); ok {
+			update.WriteString(fmt.Sprintf("定位到 %v 个符号\n", m["count"]))
+		}
+	case "static_rules":
+		if m, ok := result.(map[string]interface{}); ok {
+			update.WriteString(fmt.Sprintf("静态规则发现 %v 个确定性问题\n", m["count"]))
+		}
+	case "analyze_impact":
+		if m, ok := result.(map[string]interface{}); ok {
+			update.WriteString(fmt.Sprintf("符号 %v 有 %v 个调用方\n", m["symbol"], m["count"]))
+		}
+	case "search_code":
+		if m, ok := result.(map[string]interface{}); ok {
+			update.WriteString(fmt.Sprintf("关键词 '%v' 匹配 %v 处\n", m["keyword"], m["count"]))
+		}
+	case "review_point":
+		if m, ok := result.(map[string]interface{}); ok {
+			update.WriteString(fmt.Sprintf("发现 %v 个问题\n", m["count"]))
+		}
+	}
+
+	return update.String()
+}
+
+// isRepeatedTool 检查最近 3 次调用是否都是同一个工具。
+func isRepeatedTool(tool string, history []ToolCall) bool {
+	if len(history) < 2 {
+		return false
+	}
+	// 检查最近 2 次
+	recent := history[len(history)-2:]
+	for _, tc := range recent {
+		if tc.Tool != tool {
+			return false
+		}
+	}
+	return true
 }

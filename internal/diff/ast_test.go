@@ -3,119 +3,271 @@ package diff
 import (
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
 )
 
 func TestLocateWithEnhancedSymbol(t *testing.T) {
-	src := []byte("package p\n\ntype T struct{}\n\nfunc (t *T) Bar(a, b int) int {\n\treturn a + b\n}\n")
-	sym, ok := Locate(src, 6)
-	if !ok {
-		t.Fatal("未定位到符号")
+	src := []byte(`package main
+
+import "fmt"
+
+// Add 计算两数之和
+func Add(a, b int) int {
+	return a + b
+}
+
+type Calculator struct {
+	name string
+}
+
+// Multiply 计算乘积
+func (c *Calculator) Multiply(x, y int) int {
+	return x * y
+}
+
+func main() {
+	fmt.Println(Add(1, 2))
+}
+`)
+
+	tests := []struct {
+		line         int
+		wantName     string
+		wantKind     string
+		wantReceiver string
+		wantParams   int
+		wantReturns  int
+	}{
+		{line: 6, wantName: "Add", wantKind: "func", wantReceiver: "", wantParams: 1, wantReturns: 1},
+		{line: 15, wantName: "Multiply", wantKind: "method", wantReceiver: "*Calculator", wantParams: 1, wantReturns: 1},
+		{line: 19, wantName: "main", wantKind: "func", wantReceiver: "", wantParams: 0, wantReturns: 0},
 	}
-	if sym.Name != "Bar" || sym.Kind != "method" {
-		t.Fatalf("got %+v", sym)
-	}
-	if sym.Receiver != "*T" {
-		t.Fatalf("receiver = %q", sym.Receiver)
-	}
-	if len(sym.Params) == 0 {
-		t.Fatal("params 为空")
-	}
-	if len(sym.Returns) != 1 {
-		t.Fatalf("returns = %v", sym.Returns)
-	}
-	if sym.EndLine < sym.Line {
-		t.Fatalf("EndLine %d < Line %d", sym.EndLine, sym.Line)
-	}
-	if sym.Signature == "" || sym.Body == "" {
-		t.Fatalf("signature/body 为空: %+v", sym)
+
+	for _, tt := range tests {
+		sym, ok := Locate(src, tt.line)
+		if !ok {
+			t.Errorf("Locate(%d) failed", tt.line)
+			continue
+		}
+
+		if sym.Name != tt.wantName {
+			t.Errorf("Locate(%d).Name = %q, want %q", tt.line, sym.Name, tt.wantName)
+		}
+
+		if sym.Kind != tt.wantKind {
+			t.Errorf("Locate(%d).Kind = %q, want %q", tt.line, sym.Kind, tt.wantKind)
+		}
+
+		if sym.Receiver != tt.wantReceiver {
+			t.Errorf("Locate(%d).Receiver = %q, want %q", tt.line, sym.Receiver, tt.wantReceiver)
+		}
+
+		if len(sym.Params) != tt.wantParams {
+			t.Errorf("Locate(%d).Params = %d, want %d", tt.line, len(sym.Params), tt.wantParams)
+		}
+
+		if len(sym.Returns) != tt.wantReturns {
+			t.Errorf("Locate(%d).Returns = %d, want %d", tt.line, len(sym.Returns), tt.wantReturns)
+		}
+
+		if sym.Signature == "" {
+			t.Errorf("Locate(%d).Signature is empty", tt.line)
+		}
+
+		if sym.Body == "" {
+			t.Errorf("Locate(%d).Body is empty", tt.line)
+		}
+
+		if sym.Line <= 0 || sym.EndLine <= sym.Line {
+			t.Errorf("Locate(%d) invalid line range: %d-%d", tt.line, sym.Line, sym.EndLine)
+		}
 	}
 }
 
 func TestExtractBoundary(t *testing.T) {
-	src := []byte("package p\n\nfunc Foo() {\n\tx := 1\n\t_ = x\n}\n")
-	sym, text := ExtractBoundary(src, 4)
-	if sym.Name != "Foo" {
-		t.Fatalf("got %+v", sym)
-	}
-	if !strings.Contains(text, "func Foo") {
-		t.Fatalf("boundary 不含函数定义: %q", text)
-	}
-}
+	src := []byte(`package main
 
-func TestExtractWithContext(t *testing.T) {
-	src := []byte("package p\n\nvar a = 1\nfunc Foo() {\n\tx := 1\n\t_ = x\n}\n")
-	_, text := ExtractWithContext(src, 5, 1)
-	if !strings.Contains(text, "func Foo") {
-		t.Fatalf("context 不含函数定义: %q", text)
+func Add(a, b int) int {
+	return a + b
+}
+`)
+
+	sym, boundary, ok := ExtractBoundary(src, 4)
+	if !ok {
+		t.Fatal("ExtractBoundary failed")
 	}
-	if !strings.Contains(text, "var a") {
-		t.Fatalf("context 不含前文: %q", text)
+
+	if sym.Name != "Add" {
+		t.Errorf("Symbol.Name = %q, want %q", sym.Name, "Add")
+	}
+
+	if boundary == "" {
+		t.Error("Boundary is empty")
+	}
+
+	if sym.Line != 3 || sym.EndLine != 5 {
+		t.Errorf("Line range = %d-%d, want 3-5", sym.Line, sym.EndLine)
 	}
 }
 
 func TestFindAllSymbols(t *testing.T) {
-	src := []byte("package p\n\ntype A struct{}\ntype B struct{}\n\nfunc Foo() {}\n")
-	syms := FindAllSymbols(src)
-	names := map[string]bool{}
-	for _, s := range syms {
-		names[s.Name] = true
+	src := []byte(`package main
+
+func Add(a, b int) int {
+	return a + b
+}
+
+type Calculator struct {
+	name string
+}
+
+func (c *Calculator) Multiply(x, y int) int {
+	return x * y
+}
+
+const MaxValue = 100
+
+var globalVar int
+`)
+
+	symbols := FindAllSymbols(src)
+
+	if len(symbols) < 4 {
+		t.Fatalf("FindAllSymbols returned %d symbols, want at least 4", len(symbols))
 	}
-	if !names["A"] || !names["B"] || !names["Foo"] {
-		t.Fatalf("syms = %+v", syms)
+
+	kinds := map[string]int{}
+	for _, sym := range symbols {
+		kinds[sym.Kind]++
+	}
+
+	if kinds["func"] < 1 {
+		t.Error("No func declarations found")
+	}
+
+	if kinds["method"] < 1 {
+		t.Error("No method declarations found")
+	}
+
+	if kinds["type"] < 1 {
+		t.Error("No type declarations found")
+	}
+
+	if kinds["const"] < 1 {
+		t.Error("No const declarations found")
 	}
 }
 
 func TestParseWithRepo(t *testing.T) {
-	dir := t.TempDir()
-	writeFile(t, dir, "go.mod", "module m\n\ngo 1.22\n")
-	writeFile(t, dir, "a.go", "package m\n\nfunc Foo() {\n\tx := 1\n}\n")
+	tmpDir := t.TempDir()
 
-	raw := "diff --git a/a.go b/a.go\n" +
-		"--- a/a.go\n" +
-		"+++ b/a.go\n" +
-		"@@ -1,3 +1,4 @@\n" +
-		" package m\n" +
-		" \n" +
-		"-func Foo() {}\n" +
-		"+func Foo() {\n" +
-		"+\tx := 1\n" +
-		"+}\n"
-	cs, err := ParseWithRepo([]byte(raw), dir)
+	testFile := filepath.Join(tmpDir, "test.go")
+	err := os.WriteFile(testFile, []byte(`package main
+
+func Add(a, b int) int {
+	return a + b
+}
+`), 0644)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(cs) != 1 || len(cs[0].Symbols) != 1 || cs[0].Symbols[0].Name != "Foo" {
-		t.Fatalf("cs=%+v", cs)
+
+	diffText := `diff --git a/test.go b/test.go
+index 1234567..abcdefg 100644
+--- a/test.go
++++ b/test.go
+@@ -2,5 +2,5 @@ package main
+
+ func Add(a, b int) int {
+-	return a + b
++	return a + b + 1
+ }
+`
+
+	// Parse diff and manually annotate symbols
+	changes, err := Parse([]byte(diffText))
+	if err != nil {
+		t.Fatalf("Parse failed: %v", err)
+	}
+
+	// Manually annotate symbols (equivalent to old ParseWithRepo)
+	for i := range changes {
+		c := &changes[i]
+		if c.File == "" || c.File == "/dev/null" {
+			continue
+		}
+
+		fullPath := filepath.Join(tmpDir, c.File)
+		src, err := os.ReadFile(fullPath)
+		if err != nil {
+			continue
+		}
+
+		c.Annotate(src)
+	}
+
+	if len(changes) != 1 {
+		t.Fatalf("Expected 1 change, got %d", len(changes))
+	}
+
+	if len(changes[0].Symbols) == 0 {
+		t.Error("No symbols extracted from change")
+	}
+
+	sym := changes[0].Symbols[0]
+	if sym.Name != "Add" {
+		t.Errorf("Symbol.Name = %q, want %q", sym.Name, "Add")
+	}
+
+	if sym.Signature == "" {
+		t.Error("Symbol signature is empty")
 	}
 }
 
 func TestSummarize(t *testing.T) {
-	cs := []Change{{
-		File: "a.go",
-		Adds: []Line{{No: 4, Text: "return a + b + 1"}},
-		Dels: []Line{{No: 4, Text: "return a + b"}},
-		Symbols: []Symbol{{
-			Name: "Add", Kind: "func", Line: 3, EndLine: 5,
-			Params: []string{"a, b int"}, Returns: []string{"int"},
-		}},
-	}}
-	s := Summarize(cs)
-	if s.TotalFiles != 1 || s.TotalAdds != 1 || s.TotalDels != 1 {
-		t.Fatalf("summary=%+v", s)
+	changes := []Change{
+		{
+			File: "test.go",
+			Adds: []Line{{No: 4, Text: "return a + b + 1"}},
+			Dels: []Line{{No: 4, Text: "return a + b"}},
+			Symbols: []Symbol{
+				{
+					Name:      "Add",
+					Kind:      "func",
+					Line:      3,
+					EndLine:   5,
+					Params:    []string{"a int", "b int"},
+					Returns:   []string{"int"},
+					Signature: "Add(a, b int) int",
+				},
+			},
+		},
 	}
-	if len(s.ChangedSymbols) != 1 {
-		t.Fatalf("changed symbols=%+v", s.ChangedSymbols)
-	}
-	if s.ChangedSymbols[0].ImpactMsg == "" {
-		t.Fatal("ImpactMsg 为空")
-	}
-}
 
-func writeFile(t *testing.T, dir, name, content string) {
-	t.Helper()
-	if err := os.WriteFile(filepath.Join(dir, name), []byte(content), 0o644); err != nil {
-		t.Fatal(err)
+	summary := Summarize(changes)
+
+	if summary.TotalFiles != 1 {
+		t.Errorf("TotalFiles = %d, want 1", summary.TotalFiles)
+	}
+
+	if summary.TotalAdds != 1 {
+		t.Errorf("TotalAdds = %d, want 1", summary.TotalAdds)
+	}
+
+	if summary.TotalDels != 1 {
+		t.Errorf("TotalDels = %d, want 1", summary.TotalDels)
+	}
+
+	if len(summary.ChangedSymbols) != 1 {
+		t.Fatalf("ChangedSymbols count = %d, want 1", len(summary.ChangedSymbols))
+	}
+
+	cs := summary.ChangedSymbols[0]
+	if cs.Symbol.Name != "Add" {
+		t.Errorf("ChangedSymbol.Name = %q, want %q", cs.Symbol.Name, "Add")
+	}
+
+	if len(cs.AddLines) != 1 || len(cs.DelLines) != 1 {
+		t.Errorf("AddLines = %d, DelLines = %d, want 1, 1", len(cs.AddLines), len(cs.DelLines))
 	}
 }

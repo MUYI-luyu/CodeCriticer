@@ -6,6 +6,7 @@ import (
 	"os"
 	"strings"
 
+	"github.com/MUYI-luyu/codecritic/internal/diff"
 	"github.com/MUYI-luyu/codecritic/internal/recall"
 	"github.com/MUYI-luyu/codecritic/internal/review"
 )
@@ -49,45 +50,66 @@ func (v *Validator) Validate(ctx context.Context, findings []review.Finding) ([]
 }
 
 // validateOne 校验单个 finding。
-func (v *Validator) validateOne(ctx context.Context, f review.Finding, id int) (Validation, error) {
-	// 1. 收集证据
-	evidence := v.collectEvidence(f)
+func (v *Validator) validateOne(ctx context.Context, f review.Finding, findingID int) (Validation, error) {
+	// 1. 召回证据
+	evidence := v.gatherEvidence(f)
 
-	// 2. 调用 LLM 生成置信度评分
-	result, err := v.llm.ValidateFinding(ctx, f, evidence)
+	// 2. 构建上下文信息（包含符号提取信息）
+	contextInfo := evidence.FunctionBody
+	if evidence.SymbolInfo != "" {
+		contextInfo = fmt.Sprintf("[%s]\n\n%s", evidence.SymbolInfo, evidence.FunctionBody)
+	}
+
+	// 3. 调用 LLM 评估置信度
+	confidence, evidenceText, gaps, err := v.llm.ValidateFinding(ctx, f,
+		contextInfo,
+		"", // 变量定义召回已移除
+		evidence.CallChain)
 	if err != nil {
 		return Validation{}, err
 	}
 
 	return Validation{
-		FindingID:  id,
-		Confidence: result.Confidence,
-		Evidence:   result.Evidence,
-		Gaps:       result.Gaps,
+		FindingID:  findingID,
+		Confidence: confidence,
+		Evidence:   evidenceText,
+		Gaps:       gaps,
 	}, nil
 }
 
-// Evidence 是提交给 LLM 的完整证据包。
-type Evidence struct {
-	ClaimedEvidence string   // finding 自己声称的证据
-	FunctionBody    string   // 函数体上下文
-	SymbolInfo      string   // 符号信息
-	CallChain       string   // 调用关系
-	RelatedSymbols  []string // 相关符号
-}
-
-// collectEvidence 从 recall.Store 提取多源证据。
-func (v *Validator) collectEvidence(f review.Finding) Evidence {
+// gatherEvidence 召回 finding 相关的证据。
+// 包括：函数体上下文、变量定义、调用关系。
+func (v *Validator) gatherEvidence(f review.Finding) Evidence {
 	evidence := Evidence{
-		ClaimedEvidence: f.Evidence,
+		ClaimedEvidence: f.Evidence, // finding 自己声称的证据
 	}
 
-	// 1. 函数体上下文：使用 ±10 行（完整符号提取将在后续迭代添加）
+	// 1. 函数体上下文：优先使用完整符号体，回退到 ±10 行
 	if v.store != nil {
-		evidence.FunctionBody = v.readContext(f.File, f.Line, 10)
-		evidence.SymbolInfo = "上下文 ±10 行"
-	} else {
-		evidence.FunctionBody = v.readContext(f.File, f.Line, 10)
+		fileContent := v.readFileContent(f.File)
+		if len(fileContent) > 0 {
+			// 尝试提取完整符号边界
+			if sym, body, ok := diff.ExtractBoundary(fileContent, f.Line); ok {
+				// 限制超长符号体（避免 token 溢出）
+				const maxBodyLines = 150
+				lines := strings.Split(body, "\n")
+				if len(lines) > maxBodyLines {
+					// 保留前 50 + 后 50 行
+					head := strings.Join(lines[:50], "\n")
+					tail := strings.Join(lines[len(lines)-50:], "\n")
+					evidence.FunctionBody = fmt.Sprintf("%s\n\n... [省略 %d 行] ...\n\n%s",
+						head, len(lines)-100, tail)
+					evidence.SymbolInfo = fmt.Sprintf("符号: %s (完整定义 %d 行，已截断)", sym.Name, len(lines))
+				} else {
+					evidence.FunctionBody = body
+					evidence.SymbolInfo = fmt.Sprintf("符号: %s (完整定义 %d 行)", sym.Name, len(lines))
+				}
+			} else {
+				// 回退到 ±10 行
+				evidence.FunctionBody = v.readContext(f.File, f.Line, 10)
+				evidence.SymbolInfo = "无法定位符号边界，回退到 ±10 行"
+			}
+		}
 	}
 
 	// 2. 调用关系（如果 finding 涉及符号）
@@ -98,79 +120,55 @@ func (v *Validator) collectEvidence(f review.Finding) Evidence {
 		}
 	}
 
-	// 3. 相关符号（通过关键词召回）
-	if v.store != nil {
-		// 从 finding msg 提取关键词
-		keywords := messageKeywords(f.Msg)
-		for _, kw := range keywords {
-			syms := v.store.Keyword(kw)
-			if len(syms) > 0 {
-				for _, s := range syms {
-					evidence.RelatedSymbols = append(evidence.RelatedSymbols,
-						fmt.Sprintf("%s:%d %s", s.File, s.Line, s.Text))
-				}
-			}
-		}
-	}
-
 	return evidence
 }
 
-// readContext 读取文件的 ±N 行上下文。
-func (v *Validator) readContext(file string, line, n int) string {
+// readFileContent 读取完整文件内容。
+func (v *Validator) readFileContent(file string) []byte {
+	if v.store == nil {
+		return nil
+	}
+	// 构造绝对路径
+	fullPath := file
+	if !strings.HasPrefix(file, "/") {
+		fullPath = v.store.Root() + "/" + file
+	}
+	content, err := os.ReadFile(fullPath)
+	if err != nil {
+		return nil
+	}
+	return content
+}
+
+// readContext 读取文件指定行的上下文（±lines 行）。
+func (v *Validator) readContext(file string, line, lines int) string {
 	if v.store == nil {
 		return ""
 	}
-
-	fullPath := v.store.Root() + "/" + file
-	content, err := os.ReadFile(fullPath)
-	if err != nil {
-		return ""
-	}
-
-	lines := strings.Split(string(content), "\n")
-	start := max(0, line-n-1)
-	end := min(len(lines), line+n)
-
-	return strings.Join(lines[start:end], "\n")
+	return recall.ReadLines(v.store.Root(), file, line)
 }
 
-func max(a, b int) int {
-	if a > b {
-		return a
-	}
-	return b
+// Evidence 是召回的证据。
+type Evidence struct {
+	ClaimedEvidence string // finding 声称的证据
+	FunctionBody    string // 函数体上下文（完整符号体或 ±10 行）
+	SymbolInfo      string // 符号信息（提取方式和长度）
+	CallChain       string // 调用关系
 }
 
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
-}
-
+// formatCallChain 格式化调用链。
 func formatCallChain(callers []recall.Doc) string {
-	var parts []string
-	for _, c := range callers {
-		parts = append(parts, fmt.Sprintf("%s:%d %s", c.File, c.Line, c.Text))
-	}
-	return strings.Join(parts, "\n")
-}
-
-func messageKeywords(msg string) []string {
-	// 简单提取：分词 + 过滤停用词
-	words := strings.Fields(strings.ToLower(msg))
-	stopWords := map[string]bool{
-		"the": true, "a": true, "an": true, "and": true, "or": true,
-		"but": true, "is": true, "are": true, "was": true, "were": true,
+	if len(callers) == 0 {
+		return "无调用方"
 	}
 
-	var keywords []string
-	for _, w := range words {
-		w = strings.Trim(w, ",.!?;:")
-		if len(w) > 3 && !stopWords[w] {
-			keywords = append(keywords, w)
+	var lines []string
+	for i, c := range callers {
+		if i >= 5 { // 最多显示 5 个调用方
+			lines = append(lines, fmt.Sprintf("... 及其他 %d 个调用方", len(callers)-5))
+			break
 		}
+		lines = append(lines, fmt.Sprintf("- %s:%d", c.File, c.Line))
 	}
-	return keywords
+	return strings.Join(lines, "\n")
 }

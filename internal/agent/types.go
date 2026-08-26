@@ -1,108 +1,54 @@
+// Package agent 实现基于 Reflexion 的代码审查 Agent。
 package agent
 
 import (
-	"fmt"
-	"strings"
 	"time"
 
-	"github.com/MUYI-luyu/codecritic/internal/graph"
-	"github.com/MUYI-luyu/codecritic/internal/recall"
 	"github.com/MUYI-luyu/codecritic/internal/review"
 )
 
-// Action 是编排器的一次决策结果。
-type Action struct {
-	Tool   string         `json:"tool"`
-	Args   map[string]any `json:"args,omitempty"`
-	Reason string         `json:"reason,omitempty"`
+// Validation 是对一个 finding 的证据校验结果。
+// 从二元判断（keep/drop）升级为定量评分（0-1 confidence）。
+type Validation struct {
+	FindingID  int      `json:"finding_id"` // 对应 findings 数组的索引
+	Confidence float64  `json:"confidence"` // 可信度评分 0.0-1.0
+	Evidence   string   `json:"evidence"`   // 支持该 finding 的关键证据（代码片段）
+	Gaps       []string `json:"gaps"`       // 证据缺口（当 confidence < 阈值时）
 }
 
-// ToolSpec 是给决策器展示的工具摘要。
-type ToolSpec struct {
-	Name        string
-	Description string
+// Critique 是对一个低可信度 finding 的结构化批评。
+// 用于指导下一轮审查（Reflexion 的核心）。
+type Critique struct {
+	FindingID  int    `json:"finding_id"` // 对应 findings 数组的索引
+	Reason     string `json:"reason"`     // 为什么可信度低（一句话）
+	Evidence   string `json:"evidence"`   // 反驳的证据（从 validation 中提取）
+	Suggestion string `json:"suggestion"` // 下次审查时应该做什么（具体行动建议）
 }
 
-// ToolCall 记录一次工具执行。
-type ToolCall struct {
-	Tool     string         `json:"tool"`
-	Args     map[string]any `json:"args,omitempty"`
-	Result   string         `json:"result,omitempty"`
-	Error    string         `json:"error,omitempty"`
-	Duration time.Duration  `json:"duration"`
-}
-
-// Attempt 记录一轮编排过程。
+// Attempt 是一次审查尝试的完整记录。
+// 包含 Execute → Validate → Reflect 三个阶段的产出。
 type Attempt struct {
-	Round     int              `json:"round"`
-	ToolCalls []ToolCall       `json:"tool_calls"`
-	Evidence  string           `json:"evidence,omitempty"`
-	Findings  []review.Finding `json:"findings,omitempty"`
+	Round       int              `json:"round"`       // 第几轮（1-based）
+	Findings    []review.Finding `json:"findings"`    // Execute 阶段产出
+	Validations []Validation     `json:"validations"` // Validate 阶段产出
+	Critiques   []Critique       `json:"critiques"`   // Reflect 阶段产出
+	ToolCalls   []ToolCall       `json:"tool_calls"`  // 工具调用记录（仅 orchestration 模式）
+	StartedAt   time.Time        `json:"started_at"`
+	Duration    time.Duration    `json:"duration"`
+	Error       string           `json:"error,omitempty"` // 如果本轮失败
 }
 
-// Result 是编排器的最终结果。
+// Result 是完整的审查结果，包含所有尝试轨迹。
 type Result struct {
-	Findings      []review.Finding `json:"findings"`
-	Attempts      []Attempt        `json:"attempts"`
-	Converged     bool             `json:"converged"`
-	Reason        string           `json:"reason,omitempty"`
+	Attempts      []Attempt        `json:"attempts"`       // 所有尝试的完整记录
+	FinalFindings []review.Finding `json:"final_findings"` // 最终输出（confidence >= 阈值）
+	Converged     bool             `json:"converged"`      // 是否收敛
+	Reason        string           `json:"reason"`         // 收敛原因或 max_attempts
 	TotalDuration time.Duration    `json:"total_duration"`
 }
 
-// Validation 是证据校验结果。
-type Validation struct {
-	FindingID  int
-	Confidence float64
-	Evidence   string
-	Gaps       []string
-}
-
-// Critique 是反思阶段产出的批评建议。
-type Critique struct {
-	FindingID  int
-	Reason     string
-	Evidence   string
-	Suggestion string
-}
-
-// ConfidenceThreshold 是生成批评时的默认置信度阈值。
+// ConfidenceThreshold 是 finding 可信度阈值，低于此值需要 reflect。
 const ConfidenceThreshold = 0.7
 
-// State 保存编排过程中的共享上下文。
-type State struct {
-	Repo     string
-	RawDiff  string
-	Evidence []string
-	Symbols  []review.Sym
-	Index    *graph.Index
-	Store    *recall.Store
-	Findings []review.Finding
-}
-
-// NewState 初始化编排状态。
-func NewState(repo, raw string) *State {
-	return &State{Repo: repo, RawDiff: raw}
-}
-
-// EvidenceText 拼接全部证据文本。
-func (s *State) EvidenceText() string {
-	return strings.Join(s.Evidence, "\n\n")
-}
-
-// AppendEvidence 追加一段证据摘要。
-func (s *State) AppendEvidence(label, text string) {
-	text = strings.TrimSpace(text)
-	if text == "" {
-		return
-	}
-	if label != "" {
-		s.Evidence = append(s.Evidence, fmt.Sprintf("[%s]\n%s", label, text))
-		return
-	}
-	s.Evidence = append(s.Evidence, text)
-}
-
-// AddFindings 追加审查意见。
-func (s *State) AddFindings(fs ...review.Finding) {
-	s.Findings = append(s.Findings, fs...)
-}
+// MaxAttempts 是默认最大尝试轮数。
+const MaxAttempts = 3

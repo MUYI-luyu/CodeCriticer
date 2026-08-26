@@ -75,10 +75,11 @@ func loadCase(dir string) (*Case, error) {
 	}
 
 	// 真实 PR 用例在 case.json 里显式标注 bug；否则回退扫 // BUG 标记。
-	clean := string(buggyRaw)
+	// 无论哪种方式，都要 strip 标记（避免污染测试代码）。
+	clean, extractedBugs := stripMarks(string(buggyRaw))
 	bugs := m.Bugs
 	if len(bugs) == 0 {
-		clean, bugs = stripMarks(clean)
+		bugs = extractedBugs // 使用从注释提取的 bugs
 	}
 	diff, err := unifiedDiff(string(fixed), clean)
 	if err != nil {

@@ -35,8 +35,7 @@ func writeStaticRepo(t *testing.T) string {
 
 func TestStaticRulesTool(t *testing.T) {
 	repo := writeStaticRepo(t)
-	st := NewState(repo, "")
-	res, err := runStaticRules(st, "all")
+	res, err := runStaticRules(repo, "", "all")
 	if err != nil {
 		t.Fatalf("runStaticRules: %v", err)
 	}
@@ -66,44 +65,51 @@ func TestStaticRulesTool(t *testing.T) {
 	if !found {
 		t.Fatalf("未发现 printf 规则命中: %+v", res.Findings)
 	}
-
-	// 确定性发现应并入 State.Findings，作为最终结果的最低保障。
-	if len(st.Findings) == 0 {
-		t.Fatal("static findings 未并入 State")
-	}
 }
 
 func TestStaticRulesToolExecute(t *testing.T) {
 	repo := writeStaticRepo(t)
-	tool := StaticRulesTool{}
-	text, err := tool.Execute(context.Background(), NewState(repo, ""), nil)
+	tool := NewStaticRulesTool(repo, "")
+	got, err := tool.Execute(context.Background(), nil)
 	if err != nil {
 		t.Fatalf("Execute: %v", err)
 	}
-	for _, want := range []string{"count=", "printf", "Greet"} {
-		if !strings.Contains(text, want) {
-			t.Fatalf("输出缺 %q: %q", want, text)
+	m, ok := got.(map[string]interface{})
+	if !ok {
+		t.Fatalf("Execute 返回类型: %T", got)
+	}
+	findings, ok := m["findings"].([]review.Finding)
+	if !ok || len(findings) == 0 {
+		t.Fatalf("确定性发现未并入 findings: %+v", m)
+	}
+	hasPrintf := false
+	for _, f := range findings {
+		if f.Symbol == "printf" && f.Msg != "" {
+			hasPrintf = true
 		}
+	}
+	if !hasPrintf {
+		t.Fatalf("findings 缺 printf: %+v", findings)
 	}
 }
 
 func TestStaticRulesToolNoRepo(t *testing.T) {
-	tool := StaticRulesTool{}
-	if _, err := tool.Execute(context.Background(), NewState("", ""), nil); err == nil {
+	tool := NewStaticRulesTool("", "")
+	if _, err := tool.Execute(context.Background(), nil); err == nil {
 		t.Fatal("缺少 repo 应报错")
 	}
 }
 
 func TestStaticRulesToolIntegration(t *testing.T) {
 	reg := NewToolRegistry()
-	reg.Register(StaticRulesTool{})
+	reg.Register(NewStaticRulesTool("/tmp/repo", ""))
 	if _, ok := reg.Get("static_rules"); !ok {
 		t.Fatal("static_rules 未注册")
 	}
 
 	names := map[string]bool{}
 	for _, s := range reg.List() {
-		names[s.Name] = true
+		names[s.Name()] = true
 	}
 	if !names["static_rules"] {
 		t.Fatalf("registry 列表缺少 static_rules: %+v", reg.List())
@@ -114,13 +120,13 @@ func TestStaticScope(t *testing.T) {
 	if staticScope(nil) != "all" {
 		t.Fatal("默认应为 all")
 	}
-	if staticScope(map[string]any{"scope": "diff"}) != "diff" {
+	if staticScope(map[string]interface{}{"scope": "diff"}) != "diff" {
 		t.Fatal("diff 未识别")
 	}
-	if staticScope(map[string]any{"scope": "DIFF"}) != "diff" {
+	if staticScope(map[string]interface{}{"scope": "DIFF"}) != "diff" {
 		t.Fatal("大小写不敏感失败")
 	}
-	if staticScope(map[string]any{"scope": "unknown"}) != "all" {
+	if staticScope(map[string]interface{}{"scope": "unknown"}) != "all" {
 		t.Fatal("未知值应回退到 all")
 	}
 }

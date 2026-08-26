@@ -2,67 +2,59 @@ package agent
 
 import (
 	"context"
-	"sync"
 
 	"github.com/MUYI-luyu/codecritic/internal/review"
 )
 
-// Reflector 负责生成 Critique（反驳理由 + 改进建议）。
-// 只对低置信度的 finding 生成 Critique，供下一轮审查改进。
+// Reflector 负责生成结构化批评。
+// 批评是 Reflexion 的核心：告诉下一轮"为什么这次错了，下次应该怎么做"。
 type Reflector struct {
 	llm *review.LLM
 }
 
-// NewReflector 创建 Reflector。
+// NewReflector 创建批评生成器。
 func NewReflector(llm *review.LLM) *Reflector {
 	return &Reflector{llm: llm}
 }
 
-// GenerateCritiques 批量生成 Critique。
-// 只对置信度 < ConfidenceThreshold 的 finding 生成 Critique。
-func (r *Reflector) GenerateCritiques(ctx context.Context, findings []review.Finding, validations []Validation) ([]Critique, error) {
+// Reflect 对低可信度的 findings 生成批评。
+// 只对 confidence < ConfidenceThreshold 的 findings 生成批评。
+func (r *Reflector) Reflect(ctx context.Context, findings []review.Finding, validations []Validation) ([]Critique, error) {
 	var critiques []Critique
-	var mu sync.Mutex
-	var wg sync.WaitGroup
 
-	for i, v := range validations {
-		// 只对低置信度的 finding 生成 Critique
+	for _, v := range validations {
+		// 只批评低可信度的 findings
 		if v.Confidence >= ConfidenceThreshold {
 			continue
 		}
 
-		wg.Add(1)
-		go func(idx int, val Validation) {
-			defer wg.Done()
+		// 防止越界
+		if v.FindingID >= len(findings) {
+			continue
+		}
 
-			if idx >= len(findings) {
-				return
-			}
+		finding := findings[v.FindingID]
 
-			f := findings[idx]
-			// 转换为 LLM 的输入格式
-			valInput := review.ValidationInput{
-				Confidence: val.Confidence,
-				Evidence:   val.Evidence,
-				Gaps:       val.Gaps,
-			}
-			critique, err := r.llm.GenerateCritique(ctx, f, valInput)
-			if err != nil {
-				// 生成失败时跳过（不阻塞整体流程）
-				return
-			}
-
-			mu.Lock()
+		// 调用 LLM 生成批评
+		reason, evidence, suggestion, err := r.llm.GenerateCritique(ctx, finding, v.Confidence, v.Evidence, v.Gaps)
+		if err != nil {
+			// 生成失败时，使用默认批评（保证流程不中断）
 			critiques = append(critiques, Critique{
-				FindingID:  idx,
-				Reason:     critique.Reason,
-				Evidence:   critique.Evidence,
-				Suggestion: critique.Suggestion,
+				FindingID:  v.FindingID,
+				Reason:     "证据不足",
+				Evidence:   v.Evidence,
+				Suggestion: "收集更多证据后重新评估",
 			})
-			mu.Unlock()
-		}(i, v)
+			continue
+		}
+
+		critiques = append(critiques, Critique{
+			FindingID:  v.FindingID,
+			Reason:     reason,
+			Evidence:   evidence,
+			Suggestion: suggestion,
+		})
 	}
 
-	wg.Wait()
 	return critiques, nil
 }

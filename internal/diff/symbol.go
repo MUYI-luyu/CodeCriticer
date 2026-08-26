@@ -1,13 +1,11 @@
 package diff
 
 import (
-	"strings"
-
 	sitter "github.com/smacker/go-tree-sitter"
 	"github.com/smacker/go-tree-sitter/golang"
 )
 
-// Symbol 是被改位置所属的声明，携带完整语义信息。
+// Symbol 是被改位置所属的声明。
 type Symbol struct {
 	Name      string   // 函数名 / 方法名 / 类型名
 	Kind      string   // func / method / type / var / const
@@ -22,19 +20,6 @@ type Symbol struct {
 
 // Locate 找出包含行号 line（1-based）的最内层声明符号。
 func Locate(src []byte, line int) (Symbol, bool) {
-	best := locateNode(src, line)
-	if best == nil {
-		return Symbol{}, false
-	}
-	sym := symbolAt(best, src)
-	if sym.Name == "" {
-		return Symbol{}, false
-	}
-	return sym, true
-}
-
-// locateNode 找出包含行号 line 的最内层声明节点。
-func locateNode(src []byte, line int) *sitter.Node {
 	p := sitter.NewParser()
 	defer p.Close()
 	p.SetLanguage(golang.GetLanguage())
@@ -49,26 +34,36 @@ func locateNode(src []byte, line int) *sitter.Node {
 			best = n
 		}
 	})
-	return best
-}
-
-// symbolAt 从声明节点提取增强符号信息。
-func symbolAt(n *sitter.Node, src []byte) Symbol {
-	sym := Symbol{
-		Name:      declName(n, src),
-		Kind:      declKind(n.Type()),
-		Line:      int(n.StartPoint().Row) + 1,
-		EndLine:   int(n.EndPoint().Row) + 1,
-		Receiver:  extractReceiver(n, src),
-		Params:    extractParams(n, src),
-		Returns:   extractReturns(n, src),
-		Body:      extractBody(n, src),
-		Signature: extractSignature(n, src),
+	if best == nil {
+		return Symbol{}, false
 	}
-	return sym
+	name := declName(best, src)
+	if name == "" {
+		return Symbol{}, false
+	}
+
+	sym := Symbol{
+		Name:      name,
+		Kind:      declKind(best.Type()),
+		Line:      int(best.StartPoint().Row) + 1,
+		EndLine:   int(best.EndPoint().Row) + 1,
+		Body:      best.Content(src),
+		Signature: extractSignature(best, src),
+	}
+
+	if sym.Kind == "method" {
+		sym.Receiver = extractReceiver(best, src)
+	}
+
+	if sym.Kind == "func" || sym.Kind == "method" {
+		sym.Params = extractParams(best, src)
+		sym.Returns = extractReturns(best, src)
+	}
+
+	return sym, true
 }
 
-// declName 提取声明名字：函数/方法/type_spec 取直接 name 字段，type/var/const 取首个子节点的 name。
+// declName 提取声明名字：函数/方法取直接 name 字段，type/var/const 取首个子节点的 name。
 func declName(n *sitter.Node, src []byte) string {
 	if name := n.ChildByFieldName("name"); name != nil {
 		return name.Content(src)
@@ -79,68 +74,6 @@ func declName(n *sitter.Node, src []byte) string {
 		}
 	}
 	return ""
-}
-
-// extractReceiver 提取方法接收者类型（如 *T / T）。
-func extractReceiver(n *sitter.Node, src []byte) string {
-	recv := n.ChildByFieldName("receiver")
-	if recv == nil || recv.NamedChildCount() == 0 {
-		return ""
-	}
-	pd := recv.NamedChild(0)
-	if t := pd.ChildByFieldName("type"); t != nil {
-		return t.Content(src)
-	}
-	return pd.Content(src)
-}
-
-// extractParams 提取参数列表，每个参数声明作为一项。
-func extractParams(n *sitter.Node, src []byte) []string {
-	params := n.ChildByFieldName("parameters")
-	if params == nil {
-		return nil
-	}
-	var out []string
-	for i := 0; i < int(params.NamedChildCount()); i++ {
-		if c := params.NamedChild(i); c != nil {
-			out = append(out, c.Content(src))
-		}
-	}
-	return out
-}
-
-// extractReturns 提取返回值列表；单返回值是直接 type 节点，多返回值是 parameter_list。
-func extractReturns(n *sitter.Node, src []byte) []string {
-	result := n.ChildByFieldName("result")
-	if result == nil {
-		return nil
-	}
-	if result.Type() == "parameter_list" {
-		var out []string
-		for i := 0; i < int(result.NamedChildCount()); i++ {
-			if c := result.NamedChild(i); c != nil {
-				out = append(out, c.Content(src))
-			}
-		}
-		return out
-	}
-	return []string{result.Content(src)}
-}
-
-// extractBody 提取函数体源码。
-func extractBody(n *sitter.Node, src []byte) string {
-	if body := n.ChildByFieldName("body"); body != nil {
-		return body.Content(src)
-	}
-	return ""
-}
-
-// extractSignature 提取完整签名（不含 body）。
-func extractSignature(n *sitter.Node, src []byte) string {
-	if body := n.ChildByFieldName("body"); body != nil {
-		return strings.TrimSpace(string(src[n.StartByte():body.StartByte()]))
-	}
-	return strings.TrimSpace(n.Content(src))
 }
 
 // Annotate 用文件内容给变更行标注所属符号，去重后写入 Symbols。
@@ -183,11 +116,11 @@ func declKind(t string) string {
 		return "func"
 	case "method_declaration":
 		return "method"
-	case "type_declaration", "type_spec":
+	case "type_declaration":
 		return "type"
-	case "var_declaration", "var_spec":
+	case "var_declaration":
 		return "var"
-	case "const_declaration", "const_spec":
+	case "const_declaration":
 		return "const"
 	}
 	return t
@@ -202,4 +135,112 @@ func contains(n *sitter.Node, line int) bool {
 // span 返回节点跨行数，越小越内层。
 func span(n *sitter.Node) int {
 	return int(n.EndPoint().Row) - int(n.StartPoint().Row)
+}
+
+// extractSignature 提取完整函数签名（不含 body）。
+func extractSignature(n *sitter.Node, src []byte) string {
+	if n.Type() != "function_declaration" && n.Type() != "method_declaration" {
+		return ""
+	}
+
+	var parts []string
+
+	if receiver := n.ChildByFieldName("receiver"); receiver != nil {
+		parts = append(parts, receiver.Content(src))
+	}
+
+	if name := n.ChildByFieldName("name"); name != nil {
+		parts = append(parts, name.Content(src))
+	}
+
+	if params := n.ChildByFieldName("parameters"); params != nil {
+		parts = append(parts, params.Content(src))
+	}
+
+	if result := n.ChildByFieldName("result"); result != nil {
+		parts = append(parts, result.Content(src))
+	}
+
+	return joinParts(parts)
+}
+
+// extractReceiver 提取方法接收者类型。
+func extractReceiver(n *sitter.Node, src []byte) string {
+	receiver := n.ChildByFieldName("receiver")
+	if receiver == nil {
+		return ""
+	}
+
+	// receiver 的结构是 parameter_list，其中包含一个 parameter_declaration
+	for i := 0; i < int(receiver.ChildCount()); i++ {
+		child := receiver.Child(i)
+		if child == nil || child.Type() != "parameter_declaration" {
+			continue
+		}
+
+		// parameter_declaration 包含 type 字段
+		typeNode := child.ChildByFieldName("type")
+		if typeNode != nil {
+			return typeNode.Content(src)
+		}
+	}
+
+	return ""
+}
+
+// extractParams 提取参数列表。
+func extractParams(n *sitter.Node, src []byte) []string {
+	params := n.ChildByFieldName("parameters")
+	if params == nil {
+		return nil
+	}
+
+	var result []string
+	for i := 0; i < int(params.NamedChildCount()); i++ {
+		child := params.NamedChild(i)
+		if child == nil {
+			continue
+		}
+		result = append(result, child.Content(src))
+	}
+
+	return result
+}
+
+// extractReturns 提取返回值列表。
+func extractReturns(n *sitter.Node, src []byte) []string {
+	result := n.ChildByFieldName("result")
+	if result == nil {
+		return nil
+	}
+
+	if result.Type() == "parameter_list" {
+		var returns []string
+		for i := 0; i < int(result.NamedChildCount()); i++ {
+			child := result.NamedChild(i)
+			if child == nil {
+				continue
+			}
+			returns = append(returns, child.Content(src))
+		}
+		return returns
+	}
+
+	return []string{result.Content(src)}
+}
+
+// joinParts 连接签名各部分。
+func joinParts(parts []string) string {
+	if len(parts) == 0 {
+		return ""
+	}
+
+	sig := ""
+	for i, p := range parts {
+		if i > 0 && p != "" {
+			sig += " "
+		}
+		sig += p
+	}
+	return sig
 }

@@ -2,296 +2,220 @@ package agent
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
-	"sort"
-	"strings"
 
 	"github.com/MUYI-luyu/codecritic/internal/diff"
-	"github.com/MUYI-luyu/codecritic/internal/graph"
 	"github.com/MUYI-luyu/codecritic/internal/recall"
 	"github.com/MUYI-luyu/codecritic/internal/review"
 )
 
-// Tool 定义编排器可调用的能力。
+// Tool 是工具接口，所有可被 Orchestrator 调用的工具都实现此接口。
 type Tool interface {
 	Name() string
 	Description() string
-	Execute(context.Context, *State, map[string]any) (string, error)
+	Execute(ctx context.Context, args map[string]interface{}) (interface{}, error)
 }
 
-// ToolRegistry 负责注册和查找工具。
+// ToolRegistry 是工具注册表。
 type ToolRegistry struct {
 	tools map[string]Tool
 }
 
+// NewToolRegistry 创建工具注册表。
 func NewToolRegistry() *ToolRegistry {
-	return &ToolRegistry{tools: map[string]Tool{}}
+	return &ToolRegistry{
+		tools: make(map[string]Tool),
+	}
 }
 
-func (r *ToolRegistry) Register(t Tool) {
-	if t == nil {
-		return
-	}
-	if r.tools == nil {
-		r.tools = map[string]Tool{}
-	}
-	r.tools[t.Name()] = t
+// Register 注册一个工具。
+func (r *ToolRegistry) Register(tool Tool) {
+	r.tools[tool.Name()] = tool
 }
 
+// Get 获取一个工具。
 func (r *ToolRegistry) Get(name string) (Tool, bool) {
-	if r == nil {
-		return nil, false
-	}
-	t, ok := r.tools[name]
-	return t, ok
+	tool, ok := r.tools[name]
+	return tool, ok
 }
 
-func (r *ToolRegistry) List() []ToolSpec {
-	if r == nil {
-		return nil
+// List 列出所有工具。
+func (r *ToolRegistry) List() []Tool {
+	tools := make([]Tool, 0, len(r.tools))
+	for _, tool := range r.tools {
+		tools = append(tools, tool)
 	}
-	out := make([]ToolSpec, 0, len(r.tools))
-	for _, t := range r.tools {
-		out = append(out, ToolSpec{Name: t.Name(), Description: t.Description()})
-	}
-	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
-	return out
+	return tools
 }
 
-// LocateSymbolsTool 解析 diff 并标注变更符号。
-type LocateSymbolsTool struct{}
+// ToolCall 是工具调用记录。
+type ToolCall struct {
+	Tool   string                 `json:"tool"`
+	Args   map[string]interface{} `json:"args"`
+	Result interface{}            `json:"result"`
+	Error  string                 `json:"error,omitempty"`
+}
 
-func (LocateSymbolsTool) Name() string { return "locate_symbols" }
+// LocateSymbolsTool 定位 diff 中的符号变更。
+type LocateSymbolsTool struct {
+	diffText string
+	repo     string
+}
 
-func (LocateSymbolsTool) Description() string { return "提取 diff 中的变更符号" }
+func NewLocateSymbolsTool(diffText, repo string) *LocateSymbolsTool {
+	return &LocateSymbolsTool{diffText: diffText, repo: repo}
+}
 
-func (LocateSymbolsTool) Execute(ctx context.Context, st *State, _ map[string]any) (string, error) {
-	_ = ctx
-	if st == nil {
-		return "", errors.New("state 为空")
-	}
-	changes, err := diff.Parse([]byte(st.RawDiff))
+func (t *LocateSymbolsTool) Name() string {
+	return "locate_symbols"
+}
+
+func (t *LocateSymbolsTool) Description() string {
+	return "定位 diff 中的函数/方法/类型符号变更，返回符号列表"
+}
+
+func (t *LocateSymbolsTool) Execute(ctx context.Context, args map[string]interface{}) (interface{}, error) {
+	changes, err := diff.Parse([]byte(t.diffText))
 	if err != nil {
-		return "", err
+		return nil, fmt.Errorf("解析 diff: %w", err)
 	}
 
-	seen := map[string]bool{}
-	var names []string
+	// 逐变更标注符号：diff.Parse 只提取变更结构，符号定位需要读取文件原文。
+	var enrichedSymbols []map[string]interface{}
 	for i := range changes {
 		c := &changes[i]
-		if st.Repo != "" && c.File != "/dev/null" {
-			src, err := os.ReadFile(filepath.Join(st.Repo, c.File))
-			if err == nil {
+		if t.repo != "" && c.File != "/dev/null" {
+			if src, err := os.ReadFile(filepath.Join(t.repo, c.File)); err == nil {
 				c.Annotate(src)
 			}
 		}
 		for _, sym := range c.Symbols {
-			key := sym.Kind + ":" + sym.Name + ":" + c.File
-			if seen[key] {
-				continue
-			}
-			seen[key] = true
-			st.Symbols = append(st.Symbols, review.Sym{Name: sym.Name, File: c.File})
-			names = append(names, sym.Name)
+			enrichedSymbols = append(enrichedSymbols, map[string]interface{}{
+				"name":      sym.Name,
+				"kind":      sym.Kind,
+				"file":      c.File,
+				"line":      sym.Line,
+				"end_line":  sym.EndLine,
+				"receiver":  sym.Receiver,
+				"signature": sym.Signature,
+			})
 		}
 	}
-	if len(names) == 0 {
-		return fmt.Sprintf("files=%d symbols=0", len(changes)), nil
-	}
-	st.AppendEvidence(NameOf(LocateSymbolsTool{}), strings.Join(names, ", "))
-	return fmt.Sprintf("files=%d symbols=%d %s", len(changes), len(names), strings.Join(names, ", ")), nil
+
+	return map[string]interface{}{
+		"symbols": enrichedSymbols,
+		"count":   len(enrichedSymbols),
+	}, nil
 }
 
-// AnalyzeImpactTool 计算被改符号的调用方波及面。
-type AnalyzeImpactTool struct{}
-
-func (AnalyzeImpactTool) Name() string { return "analyze_impact" }
-
-func (AnalyzeImpactTool) Description() string { return "分析变更符号的调用图影响" }
-
-func (AnalyzeImpactTool) Execute(ctx context.Context, st *State, _ map[string]any) (string, error) {
-	_ = ctx
-	if st == nil {
-		return "", errors.New("state 为空")
-	}
-	if st.Repo == "" {
-		return "", errors.New("缺少 repo 路径")
-	}
-	if st.Index == nil {
-		idx, err := graph.Build(st.Repo)
-		if err != nil {
-			return "", err
-		}
-		st.Index = idx
-	}
-	if st.Store == nil {
-		st.Store = recall.New(st.Repo, st.Index)
-	}
-	if len(st.Symbols) == 0 {
-		return "no symbols", nil
-	}
-
-	var parts []string
-	for _, sym := range st.Symbols {
-		callers := st.Index.Impact([]graph.SymbolRef{{Name: sym.Name, File: sym.File}})
-		parts = append(parts, fmt.Sprintf("%s=%d callers", sym.Name, len(callers)))
-		for _, c := range callers {
-			st.AppendEvidence(NameOf(AnalyzeImpactTool{}), fmt.Sprintf("%s <- %s:%d", c.Func, c.File, c.Line))
-		}
-	}
-	if len(parts) == 0 {
-		return "no impact", nil
-	}
-	return strings.Join(parts, "; "), nil
+// AnalyzeImpactTool 分析符号的影响范围（调用方）。
+type AnalyzeImpactTool struct {
+	store *recall.Store
 }
 
-// SearchCodeTool 用关键词召回仓库中的相关代码片段。
-type SearchCodeTool struct{}
-
-func (SearchCodeTool) Name() string { return "search_code" }
-
-func (SearchCodeTool) Description() string { return "使用关键词召回相关代码" }
-
-func (SearchCodeTool) Execute(ctx context.Context, st *State, args map[string]any) (string, error) {
-	_ = ctx
-	if st == nil {
-		return "", errors.New("state 为空")
-	}
-	if st.Repo == "" {
-		return "", errors.New("缺少 repo 路径")
-	}
-	if st.Store == nil {
-		st.Store = recall.New(st.Repo, st.Index)
-	}
-
-	keywords := parseKeywords(args)
-	if len(keywords) == 0 {
-		keywords = symbolNames(st.Symbols)
-	}
-	if len(keywords) == 0 {
-		return "no keywords", nil
-	}
-
-	var docs []string
-	for _, kw := range keywords {
-		for _, d := range st.Store.Keyword(kw) {
-			docs = append(docs, fmt.Sprintf("%s:%d %s", d.File, d.Line, strings.TrimSpace(d.Text)))
-			if len(docs) >= 10 {
-				break
-			}
-		}
-		if len(docs) >= 10 {
-			break
-		}
-	}
-	if len(docs) == 0 {
-		return "no matches", nil
-	}
-	joined := strings.Join(docs, "\n")
-	st.AppendEvidence(NameOf(SearchCodeTool{}), joined)
-	return joined, nil
+func NewAnalyzeImpactTool(store *recall.Store) *AnalyzeImpactTool {
+	return &AnalyzeImpactTool{store: store}
 }
 
-// ReviewPointTool 调用现有 review 逻辑生成 findings。
+func (t *AnalyzeImpactTool) Name() string {
+	return "analyze_impact"
+}
+
+func (t *AnalyzeImpactTool) Description() string {
+	return "分析符号的影响范围，通过调用图追踪跨包调用方"
+}
+
+func (t *AnalyzeImpactTool) Execute(ctx context.Context, args map[string]interface{}) (interface{}, error) {
+	symbol, ok := args["symbol"].(string)
+	if !ok {
+		return nil, fmt.Errorf("missing or invalid 'symbol' argument")
+	}
+	file, _ := args["file"].(string)
+
+	if t.store == nil {
+		return map[string]interface{}{"callers": []recall.Doc{}, "count": 0}, nil
+	}
+
+	callers := t.store.Symbol(symbol, file)
+	return map[string]interface{}{
+		"symbol":  symbol,
+		"callers": callers,
+		"count":   len(callers),
+	}, nil
+}
+
+// SearchCodeTool 全文搜索关键词。
+type SearchCodeTool struct {
+	store *recall.Store
+}
+
+func NewSearchCodeTool(store *recall.Store) *SearchCodeTool {
+	return &SearchCodeTool{store: store}
+}
+
+func (t *SearchCodeTool) Name() string {
+	return "search_code"
+}
+
+func (t *SearchCodeTool) Description() string {
+	return "全文搜索关键词（ripgrep），用于召回相关代码片段"
+}
+
+func (t *SearchCodeTool) Execute(ctx context.Context, args map[string]interface{}) (interface{}, error) {
+	keyword, ok := args["keyword"].(string)
+	if !ok {
+		return nil, fmt.Errorf("missing or invalid 'keyword' argument")
+	}
+
+	if t.store == nil {
+		return map[string]interface{}{"matches": []recall.Doc{}, "count": 0}, nil
+	}
+
+	matches := t.store.Keyword(keyword)
+	return map[string]interface{}{
+		"keyword": keyword,
+		"matches": matches,
+		"count":   len(matches),
+	}, nil
+}
+
+// ReviewPointTool 针对审查要点执行审查。
 type ReviewPointTool struct {
-	llm *review.LLM
+	llm      *review.LLM
+	diffText string
 }
 
-func NewReviewPointTool(llm *review.LLM) ReviewPointTool {
-	return ReviewPointTool{llm: llm}
+func NewReviewPointTool(llm *review.LLM, diffText string) *ReviewPointTool {
+	return &ReviewPointTool{
+		llm:      llm,
+		diffText: diffText,
+	}
 }
 
-func (ReviewPointTool) Name() string { return "review_point" }
+func (t *ReviewPointTool) Name() string {
+	return "review_point"
+}
 
-func (ReviewPointTool) Description() string { return "对当前证据执行一次审查" }
+func (t *ReviewPointTool) Description() string {
+	return "针对审查要点与召回代码执行审查，返回 findings"
+}
 
-func (t ReviewPointTool) Execute(ctx context.Context, st *State, _ map[string]any) (string, error) {
-	if st == nil {
-		return "", errors.New("state 为空")
+func (t *ReviewPointTool) Execute(ctx context.Context, args map[string]interface{}) (interface{}, error) {
+	desc, ok := args["description"].(string)
+	if !ok {
+		return nil, fmt.Errorf("missing or invalid 'description' argument")
 	}
-	if t.llm == nil {
-		return "", errors.New("缺少 LLM")
-	}
-	fs, err := t.llm.Review(ctx, st.RawDiff)
+	ctxText, _ := args["context"].(string)
+
+	findings, err := t.llm.ReviewPoint(ctx, t.diffText, desc, ctxText)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
-	st.AddFindings(fs...)
-	return fmt.Sprintf("findings=%d", len(fs)), nil
-}
 
-func parseKeywords(args map[string]any) []string {
-	if len(args) == 0 {
-		return nil
-	}
-	if v, ok := args["keywords"]; ok {
-		return normalizeStrings(v)
-	}
-	if v, ok := args["keyword"]; ok {
-		return normalizeStrings(v)
-	}
-	return nil
-}
-
-func normalizeStrings(v any) []string {
-	switch x := v.(type) {
-	case nil:
-		return nil
-	case string:
-		if strings.TrimSpace(x) == "" {
-			return nil
-		}
-		parts := strings.FieldsFunc(x, func(r rune) bool { return r == ',' || r == ' ' || r == ';' || r == '\n' || r == '\t' })
-		return cleanStrings(parts)
-	case []string:
-		return cleanStrings(x)
-	case []any:
-		out := make([]string, 0, len(x))
-		for _, item := range x {
-			if s, ok := item.(string); ok {
-				out = append(out, s)
-			}
-		}
-		return cleanStrings(out)
-	default:
-		return cleanStrings(strings.Fields(fmt.Sprint(v)))
-	}
-}
-
-func cleanStrings(in []string) []string {
-	seen := map[string]bool{}
-	var out []string
-	for _, s := range in {
-		s = strings.TrimSpace(s)
-		if s == "" || seen[s] {
-			continue
-		}
-		seen[s] = true
-		out = append(out, s)
-	}
-	return out
-}
-
-func symbolNames(syms []review.Sym) []string {
-	seen := map[string]bool{}
-	var out []string
-	for _, s := range syms {
-		if s.Name == "" || seen[s.Name] {
-			continue
-		}
-		seen[s.Name] = true
-		out = append(out, s.Name)
-	}
-	return out
-}
-
-// NameOf 是给空结构体工具生成稳定名字的便捷函数。
-func NameOf(t Tool) string {
-	if t == nil {
-		return ""
-	}
-	return t.Name()
+	return map[string]interface{}{
+		"findings": findings,
+		"count":    len(findings),
+	}, nil
 }

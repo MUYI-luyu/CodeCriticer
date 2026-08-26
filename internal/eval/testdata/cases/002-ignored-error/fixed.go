@@ -1,12 +1,7 @@
 package main
 
-import (
-	"log"
-	"os"
-)
+import "fmt"
 
 func main() {
-	if err := os.Chdir("/tmp"); err != nil {
-		log.Fatal(err)
-	}
+	_ = fmt.Errorf("write failed: %s", "disk")
 }
