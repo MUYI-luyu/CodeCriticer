@@ -8,14 +8,14 @@ import (
 	"github.com/MUYI-luyu/codecritic/internal/review"
 )
 
-// TestLoadCases 期望 3 个用例：STEP4（orchestration + 12 个新用例）完成后改为 15。
+// TestLoadCases 期望 15 个用例（含 STEP4 的 12 个新用例）。
 func TestLoadCases(t *testing.T) {
 	cases, err := Load("testdata/cases")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(cases) != 3 {
-		t.Fatalf("期望 3 个用例，得到 %d", len(cases))
+	if len(cases) != 15 {
+		t.Fatalf("期望 15 个用例，得到 %d", len(cases))
 	}
 	for _, c := range cases {
 		if len(c.Bugs) == 0 {

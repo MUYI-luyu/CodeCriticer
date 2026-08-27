@@ -4,10 +4,13 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"strings"
+	"sync"
+	"time"
 )
 
 const reviewPrompt = `你是资深 Go 代码审查员。审查下面 unified diff，找出真实 bug 与风险（并发、错误处理、边界、资源泄漏、逻辑错误）。
@@ -93,8 +96,9 @@ func (l *LLM) Config() *Config {
 
 // LLM 是 OpenAI 兼容的聊天客户端，支持分级模型配置。
 type LLM struct {
-	config *Config
-	client *http.Client
+	config  *Config
+	client  *http.Client
+	metrics *Metrics
 }
 
 // NewLLMWithConfig 创建 LLM 客户端，使用自定义配置。
@@ -103,7 +107,11 @@ func NewLLMWithConfig(opts ...Option) *LLM {
 	for _, opt := range opts {
 		opt(cfg)
 	}
-	return &LLM{config: cfg, client: &http.Client{}}
+	return &LLM{
+		config:  cfg,
+		client:  &http.Client{Timeout: 30 * time.Second},
+		metrics: newMetrics(),
+	}
 }
 
 type chatMsg struct {
@@ -127,6 +135,11 @@ type chatResp struct {
 			Content string `json:"content"`
 		} `json:"message"`
 	} `json:"choices"`
+	Usage struct {
+		PromptTokens     int `json:"prompt_tokens"`
+		CompletionTokens int `json:"completion_tokens"`
+		TotalTokens      int `json:"total_tokens"`
+	} `json:"usage"`
 }
 
 // Chat 发送一轮对话，返回助手文本（公开给 agent 包使用）。
@@ -134,8 +147,36 @@ func (l *LLM) Chat(ctx context.Context, system, user, model string) (string, err
 	return l.chat(ctx, system, user, model)
 }
 
-// chat 发送一轮对话，返回助手文本。
+// chat 发送一轮对话（带指数退避重试），返回助手文本。
 func (l *LLM) chat(ctx context.Context, system, user, model string) (string, error) {
+	const maxRetries = 3
+	var lastErr error
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		if attempt > 0 {
+			l.metrics.recordRetry(model)
+			select {
+			case <-ctx.Done():
+				return "", ctx.Err()
+			case <-time.After(backoff(attempt)):
+			}
+		}
+
+		text, usage, err := l.chatOnce(ctx, system, user, model)
+		if err == nil {
+			l.metrics.recordSuccess(model, usage)
+			return text, nil
+		}
+		lastErr = err
+		if !retryable(err) {
+			break
+		}
+	}
+	l.metrics.recordFail(model)
+	return "", lastErr
+}
+
+// chatOnce 发送单次 HTTP 请求，返回文本与 token 用量。
+func (l *LLM) chatOnce(ctx context.Context, system, user, model string) (string, usage, error) {
 	body := chatReq{
 		Model:    model,
 		Messages: []chatMsg{{Role: "system", Content: system}, {Role: "user", Content: user}},
@@ -144,38 +185,77 @@ func (l *LLM) chat(ctx context.Context, system, user, model string) (string, err
 
 	raw, err := json.Marshal(body)
 	if err != nil {
-		return "", err
+		return "", usage{}, err
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, l.config.BaseURL+"/chat/completions", bytes.NewReader(raw))
 	if err != nil {
-		return "", err
+		return "", usage{}, err
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+l.config.APIKey)
 
 	resp, err := l.client.Do(req)
 	if err != nil {
-		return "", err
+		return "", usage{}, err
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
 		b, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return "", fmt.Errorf("llm: %s: %s", resp.Status, b)
+		return "", usage{}, &llmError{status: resp.StatusCode, body: string(b)}
 	}
 	var out chatResp
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-		return "", err
+		return "", usage{}, err
 	}
 	if len(out.Choices) == 0 {
-		return "", fmt.Errorf("llm: 空响应")
+		return "", usage{}, fmt.Errorf("llm: 空响应")
 	}
-	return out.Choices[0].Message.Content, nil
+	return out.Choices[0].Message.Content, usage{
+		Input:  out.Usage.PromptTokens,
+		Output: out.Usage.CompletionTokens,
+	}, nil
+}
+
+// chatWithFallback 依次尝试多个模型，主模型失败时降级到下一个。
+func (l *LLM) chatWithFallback(ctx context.Context, system, user string, models ...string) (string, error) {
+	var lastErr error
+	seen := make(map[string]bool)
+	for _, m := range models {
+		if m == "" || seen[m] {
+			continue // 跳过空模型与重复模型：避免降级链退化成对同一模型的重复调用
+		}
+		seen[m] = true
+		text, err := l.chat(ctx, system, user, m)
+		if err == nil {
+			return text, nil
+		}
+		lastErr = err
+	}
+	return "", lastErr
+}
+
+// backoff 返回第 attempt 次重试的退避时间（1s/2s/4s）。
+func backoff(attempt int) time.Duration {
+	return time.Duration(1<<(attempt-1)) * time.Second
+}
+
+// retryable 判断错误是否值得重试：429 限流、5xx 服务端错误、网络错误。
+func retryable(err error) bool {
+	if err == nil {
+		return false
+	}
+	var le *llmError
+	if errors.As(err, &le) {
+		return le.status == http.StatusTooManyRequests || le.status >= 500
+	}
+	// 非 llmError 通常是网络错误（连接失败、超时等），可重试
+	return true
 }
 
 // Review 一次性审查 diff，返回 findings。
 func (l *LLM) Review(ctx context.Context, diffText string) ([]Finding, error) {
-	text, err := l.chat(ctx, reviewPrompt, diffText, l.config.ReviewModel)
+	text, err := l.chatWithFallback(ctx, reviewPrompt, diffText, l.config.ReviewModel, l.config.ReflectModel, l.config.PlanModel)
 	if err != nil {
 		return nil, err
 	}
@@ -184,7 +264,7 @@ func (l *LLM) Review(ctx context.Context, diffText string) ([]Finding, error) {
 
 // Plan 规划审查要点。
 func (l *LLM) Plan(ctx context.Context, diffText string) ([]Point, error) {
-	text, err := l.chat(ctx, planPrompt, diffText, l.config.PlanModel)
+	text, err := l.chatWithFallback(ctx, planPrompt, diffText, l.config.PlanModel, l.config.ReviewModel, l.config.ReflectModel)
 	if err != nil {
 		return nil, err
 	}
@@ -203,7 +283,7 @@ func (l *LLM) ReviewPoint(ctx context.Context, diffText, desc, ctxText string) (
 只输出 JSON：{"findings":[{"file":"...","line":0,"severity":"error|warning|info","msg":"...","evidence":"..."}]}
 没有则 {"findings":[]}。`, desc)
 	user := "diff:\n" + diffText + "\n\n召回代码:\n" + ctxText
-	text, err := l.chat(ctx, sys, user, l.config.ReviewModel)
+	text, err := l.chatWithFallback(ctx, sys, user, l.config.ReviewModel, l.config.ReflectModel, l.config.PlanModel)
 	if err != nil {
 		return nil, err
 	}
@@ -218,7 +298,7 @@ func (l *LLM) ValidateFinding(ctx context.Context, f Finding, funcBody, varDefs,
 		f.File, f.Line, f.Severity, f.Msg, f.Evidence,
 		funcBody, varDefs, callChain)
 
-	text, err := l.chat(ctx, "", user, l.config.ReflectModel)
+	text, err := l.chatWithFallback(ctx, "", user, l.config.ReviewModel, l.config.ReflectModel, l.config.PlanModel)
 	if err != nil {
 		return 0, "", nil, err
 	}
@@ -243,7 +323,7 @@ func (l *LLM) GenerateCritique(ctx context.Context, f Finding, confidence float6
 		f.Severity, f.File, f.Line, f.Msg,
 		confidence*100, evidence, strings.Join(gaps, "; "))
 
-	text, err := l.chat(ctx, "", user, l.config.ReflectModel)
+	text, err := l.chatWithFallback(ctx, "", user, l.config.ReflectModel, l.config.ReviewModel, l.config.PlanModel)
 	if err != nil {
 		return "", "", "", err
 	}
@@ -277,4 +357,90 @@ func stripFence(s string) string {
 	s = strings.TrimPrefix(s, "```")
 	s = strings.TrimSuffix(s, "```")
 	return strings.TrimSpace(s)
+}
+
+// usage 是一次 LLM 调用的 token 用量。
+type usage struct {
+	Input  int
+	Output int
+}
+
+// llmError 是带 HTTP 状态码的 LLM 错误，用于判断是否可重试。
+type llmError struct {
+	status int
+	body   string
+}
+
+func (e *llmError) Error() string {
+	return fmt.Sprintf("llm: %d: %s", e.status, e.body)
+}
+
+// ModelStat 是单个模型的调用统计。
+type ModelStat struct {
+	Calls        int
+	Success      int
+	Fail         int
+	Retries      int
+	InputTokens  int
+	OutputTokens int
+}
+
+// Metrics 记录 LLM 调用统计，按模型分组，用于可观测性。
+type Metrics struct {
+	mu      sync.Mutex
+	byModel map[string]*ModelStat
+}
+
+func newMetrics() *Metrics {
+	return &Metrics{byModel: make(map[string]*ModelStat)}
+}
+
+func (m *Metrics) recordSuccess(model string, u usage) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	s := m.stat(model)
+	s.Calls++
+	s.Success++
+	s.InputTokens += u.Input
+	s.OutputTokens += u.Output
+}
+
+func (m *Metrics) recordFail(model string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	s := m.stat(model)
+	s.Calls++
+	s.Fail++
+}
+
+func (m *Metrics) recordRetry(model string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	s := m.stat(model)
+	s.Retries++
+}
+
+func (m *Metrics) stat(model string) *ModelStat {
+	s, ok := m.byModel[model]
+	if !ok {
+		s = &ModelStat{}
+		m.byModel[model] = s
+	}
+	return s
+}
+
+// Snapshot 返回指标快照（拷贝，避免并发读写）。
+func (m *Metrics) Snapshot() map[string]ModelStat {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make(map[string]ModelStat, len(m.byModel))
+	for k, v := range m.byModel {
+		out[k] = *v
+	}
+	return out
+}
+
+// Metrics 返回 LLM 的调用统计快照。
+func (l *LLM) Metrics() map[string]ModelStat {
+	return l.metrics.Snapshot()
 }

@@ -1,0 +1,1 @@
+{"name":"loop-var-capture","source":"https://github.com/prometheus/prometheus/commit/d521933053bd (Fix incorrect use of loop variable in parallel test)","bugs":[{"file":"main.go","line":12,"desc":"闭包捕获循环变量 n，并发执行时全部读到最后一个值，应先拷贝 n := n"}]}

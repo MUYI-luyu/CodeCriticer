@@ -1,0 +1,1 @@
+{"name": "goroutine-closure", "source": "goroutine 闭包捕获循环变量", "rule": "loopclosure", "bugs": [{"file": "main.go", "line": 10, "desc": "闭包引用循环变量 item，应创建副本"}]}

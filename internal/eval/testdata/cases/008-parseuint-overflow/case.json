@@ -1,0 +1,1 @@
+{"name":"parseuint-overflow","source":"https://github.com/golang/go/commit/fc6b74ce3974 (strconv: fix ParseUint return value on range overflow)","bugs":[{"file":"main.go","line":22,"desc":"溢出时返回 maxUint64，应钳位为 bitSize 对应的 maxVal"}]}

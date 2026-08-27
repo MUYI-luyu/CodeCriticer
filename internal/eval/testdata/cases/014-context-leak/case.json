@@ -1,0 +1,1 @@
+{"name": "context-leak", "source": "context.WithTimeout 未调用 cancel 导致资源泄漏", "rule": "lostcancel", "bugs": [{"file": "main.go", "line": 9, "desc": "WithTimeout 返回的 cancel 函数必须调用"}]}

@@ -1,0 +1,1 @@
+{"name": "mutex-copy", "source": "通过值返回复制了 sync.Mutex", "rule": "copylocks", "bugs": [{"file": "main.go", "line": 17, "desc": "按值返回包含 mutex 的结构体会复制锁"}]}

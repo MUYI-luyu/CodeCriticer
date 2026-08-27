@@ -6,6 +6,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -47,6 +48,8 @@ func usage() {
 	fmt.Fprintln(os.Stderr, "")
 	fmt.Fprintln(os.Stderr, "  codecritic eval [选项]")
 	fmt.Fprintln(os.Stderr, "    --dataset <目录>        评测数据集目录")
+	fmt.Fprintln(os.Stderr, "    --orchestration         评测 orchestration 模式")
+	fmt.Fprintln(os.Stderr, "    --verbose, -v           显示详细的 Agent 执行轨迹")
 	fmt.Fprintln(os.Stderr, "    --plan-model <模型>")
 	fmt.Fprintln(os.Stderr, "    --review-model <模型>")
 	fmt.Fprintln(os.Stderr, "    --reflect-model <模型>")
@@ -57,20 +60,20 @@ func usage() {
 	fmt.Fprintln(os.Stderr, "    --compare <trace2>      对比两个 trace")
 	fmt.Fprintln(os.Stderr, "")
 	fmt.Fprintln(os.Stderr, "环境变量:")
-	fmt.Fprintln(os.Stderr, "  DEEPSEEK_API_KEY        API 密钥（必需）")
-	fmt.Fprintln(os.Stderr, "  DEEPSEEK_BASE_URL       API 基础 URL（可选，默认 https://api.deepseek.com/v1）")
+	fmt.Fprintln(os.Stderr, "  CodeCritic_API_KEY      API 密钥（必需，兼容 DEEPSEEK_API_KEY）")
+	fmt.Fprintln(os.Stderr, "  CodeCritic_URL          API 基础 URL（可选，兼容 DEEPSEEK_BASE_URL）")
 }
 
 func cmdReview(args []string) {
-	repo, diffPath, maxAttempts, tracePath, planModel, reviewModel, reflectModel, useOrchestration := parseReviewArgs(args)
+	repo, diffPath, maxAttempts, tracePath, planModel, reviewModel, reflectModel, useOrchestration, verbose := parseReviewArgs(args)
 	if diffPath == "" || repo == "" {
 		usage()
 		os.Exit(2)
 	}
 
-	key := os.Getenv("DEEPSEEK_API_KEY")
+	key := getEnv("CodeCritic_API_KEY", "DEEPSEEK_API_KEY")
 	if key == "" {
-		fmt.Fprintln(os.Stderr, "未设置 DEEPSEEK_API_KEY")
+		fmt.Fprintln(os.Stderr, "未设置 CodeCritic_API_KEY 或 DEEPSEEK_API_KEY")
 		os.Exit(1)
 	}
 
@@ -122,15 +125,23 @@ func cmdReview(args []string) {
 	for i, att := range result.Attempts {
 		log.Printf("第 %d 轮: %d findings, 平均置信度 %.2f, 耗时 %v",
 			i+1, len(att.Findings), avgConfidence(att.Validations), att.Duration)
+		if att.Error != "" {
+			log.Printf("  第 %d 轮错误: %s", i+1, att.Error)
+		}
 	}
 
 	printFindings(result.FinalFindings)
+
+	if verbose {
+		printLLMMetrics(llm)
+	}
 }
 
 func cmdEval(args []string) {
 	dataset := "internal/eval/testdata/cases"
 	var useOrchestration bool
 	var planModel, reviewModel, reflectModel string
+	var verbose bool
 
 	for i := 0; i < len(args); i++ {
 		switch {
@@ -140,6 +151,8 @@ func cmdEval(args []string) {
 			dataset = strings.TrimPrefix(args[i], "--dataset=")
 		case args[i] == "--orchestration":
 			useOrchestration = true
+		case args[i] == "--verbose" || args[i] == "-v":
+			verbose = true
 		case args[i] == "--plan-model" && i+1 < len(args):
 			planModel, i = args[i+1], i+1
 		case strings.HasPrefix(args[i], "--plan-model="):
@@ -161,26 +174,32 @@ func cmdEval(args []string) {
 		}
 	}
 
-	key := os.Getenv("DEEPSEEK_API_KEY")
+	key := getEnv("CodeCritic_API_KEY", "DEEPSEEK_API_KEY")
 	if key == "" {
-		fmt.Fprintln(os.Stderr, "未设置 DEEPSEEK_API_KEY")
+		fmt.Fprintln(os.Stderr, "未设置 CodeCritic_API_KEY 或 DEEPSEEK_API_KEY")
 		os.Exit(1)
 	}
 
 	llm := buildLLM(key, planModel, reviewModel, reflectModel)
 
+	var err error
 	if useOrchestration {
-		// STEP4（orchestration 评测）尚未落地，先回退到 baseline + Reflexion。
-		log.Printf("--orchestration 评测（STEP4）未实现，回退到 baseline 对比")
+		err = eval.RunOrchestration(context.Background(), llm, dataset, verbose)
+	} else {
+		err = eval.Run(context.Background(), llm, dataset, verbose)
 	}
 
-	if err := eval.Run(context.Background(), llm, dataset); err != nil {
+	if err != nil {
 		log.Fatalf("评测失败: %v", err)
+	}
+
+	if verbose {
+		printLLMMetrics(llm)
 	}
 }
 
 // parseReviewArgs 提取 review 命令的参数。
-func parseReviewArgs(args []string) (repo, diff string, maxAttempts int, tracePath, planModel, reviewModel, reflectModel string, useOrchestration bool) {
+func parseReviewArgs(args []string) (repo, diff string, maxAttempts int, tracePath, planModel, reviewModel, reflectModel string, useOrchestration, verbose bool) {
 	maxAttempts = 3 // 默认值
 	for i := 0; i < len(args); i++ {
 		a := args[i]
@@ -196,6 +215,8 @@ func parseReviewArgs(args []string) (repo, diff string, maxAttempts int, tracePa
 			fmt.Sscanf(strings.TrimPrefix(a, "--max-attempts="), "%d", &maxAttempts)
 		case a == "--orchestration":
 			useOrchestration = true
+		case a == "--verbose" || a == "-v":
+			verbose = true
 		case a == "--trace" && i+1 < len(args):
 			tracePath, i = args[i+1], i+1
 		case strings.HasPrefix(a, "--trace="):
@@ -229,7 +250,7 @@ func parseReviewArgs(args []string) (repo, diff string, maxAttempts int, tracePa
 
 // buildLLM 构建 LLM 客户端。
 func buildLLM(key, planModel, reviewModel, reflectModel string) *review.LLM {
-	baseURL := os.Getenv("DEEPSEEK_BASE_URL")
+	baseURL := getEnv("CodeCritic_URL", "DEEPSEEK_BASE_URL")
 	if baseURL == "" {
 		baseURL = "https://api.deepseek.com/v1"
 	}
@@ -290,6 +311,14 @@ func symbolNames(syms []review.Sym) []string {
 	return names
 }
 
+// getEnv 优先读取 primary，不存在则读取 fallback。
+func getEnv(primary, fallback string) string {
+	if v := os.Getenv(primary); v != "" {
+		return v
+	}
+	return os.Getenv(fallback)
+}
+
 // avgConfidence 计算平均置信度。
 func avgConfidence(validations []agent.Validation) float64 {
 	if len(validations) == 0 {
@@ -325,4 +354,39 @@ func printFindings(fs []review.Finding) {
 			fmt.Printf("    证据: %s\n", f.Evidence)
 		}
 	}
+}
+
+// printLLMMetrics 打印 LLM 调用统计（token、成功率、失败率）。
+func printLLMMetrics(llm *review.LLM) {
+	stats := llm.Metrics()
+	if len(stats) == 0 {
+		return
+	}
+
+	// 按模型名排序，保证输出稳定
+	models := make([]string, 0, len(stats))
+	for m := range stats {
+		models = append(models, m)
+	}
+	sort.Strings(models)
+
+	var totalCalls, totalSuccess, totalFail, totalRetries, totalIn, totalOut int
+	fmt.Println("\n=== LLM Metrics ===")
+	for _, m := range models {
+		s := stats[m]
+		fmt.Printf("%-28s calls=%-3d success=%-3d fail=%-2d retries=%-2d in=%-6d out=%-6d\n",
+			m, s.Calls, s.Success, s.Fail, s.Retries, s.InputTokens, s.OutputTokens)
+		totalCalls += s.Calls
+		totalSuccess += s.Success
+		totalFail += s.Fail
+		totalRetries += s.Retries
+		totalIn += s.InputTokens
+		totalOut += s.OutputTokens
+	}
+	fmt.Println()
+	fmt.Printf("合计:        calls=%d success=%d fail=%d retries=%d\n", totalCalls, totalSuccess, totalFail, totalRetries)
+	if totalCalls > 0 {
+		fmt.Printf("成功率:      %.1f%%\n", float64(totalSuccess)/float64(totalCalls)*100)
+	}
+	fmt.Printf("Token:       input=%d output=%d total=%d\n", totalIn, totalOut, totalIn+totalOut)
 }

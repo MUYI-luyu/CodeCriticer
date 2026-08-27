@@ -1,0 +1,1 @@
+{"name":"buffer-peek-slice","source":"https://github.com/golang/go/commit/b57962b7c7de (bytes: fix panic in bytes.Buffer.Peek)","bugs":[{"file":"main.go","line":16,"desc":"切片上界用 n 而非 b.off+n，偏移后返回错误数据或越界 panic"}]}

@@ -1,0 +1,1 @@
+{"name": "unchecked-close", "source": "defer 中未检查 Close() 返回的错误", "bugs": [{"file": "main.go", "line": 11, "desc": "defer 中的 Close() 可能返回错误但未检查"}]}

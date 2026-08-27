@@ -1,0 +1,1 @@
+{"name":"empty-slice-read","source":"https://github.com/golang/go/commit/6aef900af4ee (runtime/metrics: fix panic in Read with empty slice)","bugs":[{"file":"main.go","line":7,"desc":"空切片时取 m[0] 越界 panic，应先判 len(m)==0"}]}
