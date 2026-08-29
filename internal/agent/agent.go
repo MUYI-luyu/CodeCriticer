@@ -6,6 +6,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/MUYI-luyu/codecritic/internal/diff"
 	"github.com/MUYI-luyu/codecritic/internal/graph"
 	"github.com/MUYI-luyu/codecritic/internal/recall"
 	"github.com/MUYI-luyu/codecritic/internal/review"
@@ -23,6 +24,7 @@ type Agent struct {
 	repo             string
 	llm              *review.LLM // 保存 llm 用于创建 Orchestrator
 	store            *recall.Store
+	staticFindings   []review.Finding // 静态规则命中（确定性，跳过 LLM 复核）
 }
 
 // memoryEntry 是一条历史批评记录。
@@ -46,6 +48,12 @@ func New(llm *review.LLM, repo string, opts ...Option) (*Agent, error) {
 
 	store := recall.New(repo, idx)
 
+	// 静态规则：确定性 bug 发现，失败时降级为空（不影响主流程）
+	var staticFindings []review.Finding
+	if rf, err := review.Rules(repo); err == nil {
+		staticFindings = rf
+	}
+
 	agent := &Agent{
 		planAgent:        review.NewPlanAgent(llm, store),
 		validator:        NewValidator(llm, store),
@@ -55,6 +63,7 @@ func New(llm *review.LLM, repo string, opts ...Option) (*Agent, error) {
 		repo:             repo,
 		llm:              llm,
 		store:            store,
+		staticFindings:   staticFindings,
 	}
 
 	// 应用配置选项
@@ -86,8 +95,10 @@ func WithOrchestration(enable bool) Option {
 // 返回完整的审查结果（包含所有轮次的轨迹）。
 func (a *Agent) Review(ctx context.Context, diff []byte, syms []review.Sym) (*Result, error) {
 	startTime := time.Now()
+	static := a.filterStaticToDiff(diff)
 	result := &Result{
-		Attempts: make([]Attempt, 0, a.maxAttempts),
+		Attempts:       make([]Attempt, 0, a.maxAttempts),
+		StaticFindings: static,
 	}
 
 	var prevFindings []review.Finding
@@ -105,7 +116,7 @@ func (a *Agent) Review(ctx context.Context, diff []byte, syms []review.Sym) (*Re
 		if converged, reason := a.checkConvergence(result.Attempts, prevFindings); converged {
 			result.Converged = true
 			result.Reason = reason
-			result.FinalFindings = filterValidFindings(attempt.Findings, attempt.Validations)
+			result.FinalFindings = mergeAndDedup(static, filterValidFindings(attempt.Findings, attempt.Validations))
 			result.TotalDuration = time.Since(startTime)
 			return result, nil
 		}
@@ -117,7 +128,7 @@ func (a *Agent) Review(ctx context.Context, diff []byte, syms []review.Sym) (*Re
 	lastAttempt := result.Attempts[len(result.Attempts)-1]
 	result.Converged = false
 	result.Reason = "max_attempts"
-	result.FinalFindings = filterValidFindings(lastAttempt.Findings, lastAttempt.Validations)
+	result.FinalFindings = mergeAndDedup(static, filterValidFindings(lastAttempt.Findings, lastAttempt.Validations))
 	result.TotalDuration = time.Since(startTime)
 
 	return result, nil
@@ -158,8 +169,8 @@ func (a *Agent) executeRound(ctx context.Context, round int, diff []byte, syms [
 	attempt.Findings = findings
 	attempt.ToolCalls = toolCalls
 
-	// 2. Validate: 证据校验
-	validations, err := a.validator.Validate(ctx, findings)
+	// 2. Validate: 证据校验（静态规则已命中的 finding 直接置信度 1.0，跳过 LLM 复核）
+	validations, err := a.validate(ctx, findings)
 	if err != nil {
 		attempt.Duration = time.Since(startTime)
 		return attempt, fmt.Errorf("validate: %w", err)
@@ -282,6 +293,21 @@ func fewLowConfidence(validations []Validation, maxLow int) bool {
 	return lowCount <= maxLow
 }
 
+// allHighConfidence 检查所有 validations 的 confidence 是否都 >= 阈值。
+// 已废弃：改用 avgConfidence + fewLowConfidence 组合策略。
+func allHighConfidence(validations []Validation) bool {
+	if len(validations) == 0 {
+		return false
+	}
+
+	for _, v := range validations {
+		if v.Confidence < ConfidenceThreshold {
+			return false
+		}
+	}
+	return true
+}
+
 // findingsStable 检查两轮 findings 是否稳定（Jaccard 相似度）。
 func findingsStable(prev, curr []review.Finding, threshold float64) bool {
 	if len(prev) == 0 && len(curr) == 0 {
@@ -324,4 +350,86 @@ func filterValidFindings(findings []review.Finding, validations []Validation) []
 		}
 	}
 	return result
+}
+
+// filterStaticToDiff 过滤静态规则 findings 到 diff 涉及的文件，避免报告无关的存量问题。
+func (a *Agent) filterStaticToDiff(diffData []byte) []review.Finding {
+	if len(a.staticFindings) == 0 {
+		return nil
+	}
+	changes, err := diff.Parse(diffData)
+	if err != nil {
+		return nil
+	}
+	files := make(map[string]bool)
+	for i := range changes {
+		if changes[i].File != "" && changes[i].File != "/dev/null" {
+			files[changes[i].File] = true
+		}
+	}
+	var out []review.Finding
+	for _, f := range a.staticFindings {
+		if files[f.File] {
+			out = append(out, f)
+		}
+	}
+	return out
+}
+
+// staticHit 判断 finding 是否已被静态规则命中（同文件同行）。
+func (a *Agent) staticHit(file string, line int) bool {
+	for _, f := range a.staticFindings {
+		if f.File == file && f.Line == line {
+			return true
+		}
+	}
+	return false
+}
+
+// validate 逐条校验 finding；静态规则已命中的直接置信度 1.0，跳过 LLM 复核。
+func (a *Agent) validate(ctx context.Context, findings []review.Finding) ([]Validation, error) {
+	validations := make([]Validation, len(findings))
+	for i, f := range findings {
+		if a.staticHit(f.File, f.Line) {
+			validations[i] = Validation{FindingID: i, Confidence: 1.0, Evidence: f.Evidence}
+			continue
+		}
+		v, err := a.validator.validateOne(ctx, f, i)
+		if err != nil {
+			validations[i] = Validation{
+				FindingID:  i,
+				Confidence: 0.5,
+				Evidence:   f.Evidence,
+				Gaps:       []string{"validation failed: " + err.Error()},
+			}
+			continue
+		}
+		validations[i] = v
+	}
+	return validations, nil
+}
+
+// mergeAndDedup 合并静态规则与 LLM findings，按 file:line 去重（静态规则优先）。
+func mergeAndDedup(static, llm []review.Finding) []review.Finding {
+	seen := make(map[string]bool)
+	out := make([]review.Finding, 0, len(static)+len(llm))
+	for _, f := range static {
+		key := fmt.Sprintf("%s:%d", f.File, f.Line)
+		if !seen[key] {
+			seen[key] = true
+			out = append(out, f)
+		}
+	}
+	for _, f := range llm {
+		if f.Line == 0 {
+			out = append(out, f) // 行号未定位，不参与去重
+			continue
+		}
+		key := fmt.Sprintf("%s:%d", f.File, f.Line)
+		if !seen[key] {
+			seen[key] = true
+			out = append(out, f)
+		}
+	}
+	return out
 }

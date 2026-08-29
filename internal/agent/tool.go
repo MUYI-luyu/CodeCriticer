@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"time"
 
 	"github.com/MUYI-luyu/codecritic/internal/diff"
 	"github.com/MUYI-luyu/codecritic/internal/recall"
@@ -52,10 +53,11 @@ func (r *ToolRegistry) List() []Tool {
 
 // ToolCall 是工具调用记录。
 type ToolCall struct {
-	Tool   string                 `json:"tool"`
-	Args   map[string]interface{} `json:"args"`
-	Result interface{}            `json:"result"`
-	Error  string                 `json:"error,omitempty"`
+	Tool     string                 `json:"tool"`
+	Args     map[string]interface{} `json:"args"`
+	Result   interface{}            `json:"result"`
+	Error    string                 `json:"error,omitempty"`
+	Duration time.Duration          `json:"duration"` // 工具执行耗时
 }
 
 // LocateSymbolsTool 定位 diff 中的符号变更。

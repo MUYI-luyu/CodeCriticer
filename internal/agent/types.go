@@ -40,11 +40,12 @@ type Attempt struct {
 
 // Result 是完整的审查结果，包含所有尝试轨迹。
 type Result struct {
-	Attempts      []Attempt        `json:"attempts"`       // 所有尝试的完整记录
-	FinalFindings []review.Finding `json:"final_findings"` // 最终输出（confidence >= 阈值）
-	Converged     bool             `json:"converged"`      // 是否收敛
-	Reason        string           `json:"reason"`         // 收敛原因或 max_attempts
-	TotalDuration time.Duration    `json:"total_duration"`
+	Attempts       []Attempt        `json:"attempts"`                  // 所有尝试的完整记录
+	StaticFindings []review.Finding `json:"static_findings,omitempty"` // 静态规则命中（确定性，不进 Reflexion 循环）
+	FinalFindings  []review.Finding `json:"final_findings"`            // 最终输出（静态规则 + LLM 高置信度，去重后）
+	Converged      bool             `json:"converged"`                 // 是否收敛
+	Reason         string           `json:"reason"`                    // 收敛原因或 max_attempts
+	TotalDuration  time.Duration    `json:"total_duration"`
 }
 
 // ConfidenceThreshold 是 finding 可信度阈值，低于此值需要 reflect。

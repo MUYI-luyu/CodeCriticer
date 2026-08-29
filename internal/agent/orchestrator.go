@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/MUYI-luyu/codecritic/internal/recall"
 	"github.com/MUYI-luyu/codecritic/internal/review"
@@ -28,8 +29,8 @@ func NewOrchestrator(llm *review.LLM, store *recall.Store, repo, diffText string
 	registry.Register(NewSearchCodeTool(store))
 	registry.Register(NewReviewPointTool(llm, diffText))
 
-	// 静态规则工具：确定性发现是审查结果的最低保障
-	registry.Register(NewStaticRulesTool(repo, diffText))
+	// 新增：静态规则工具
+	registry.Register(&StaticRulesTool{repo: repo})
 
 	return &Orchestrator{
 		llm:      llm,
@@ -81,10 +82,12 @@ func (o *Orchestrator) Execute(ctx context.Context) (*OrchestrationResult, error
 			return nil, fmt.Errorf("未知工具: %s", action.Tool)
 		}
 
+		start := time.Now()
 		result, err := tool.Execute(ctx, action.Args)
 		toolCall := ToolCall{
-			Tool: action.Tool,
-			Args: action.Args,
+			Tool:     action.Tool,
+			Args:     action.Args,
+			Duration: time.Since(start),
 		}
 
 		if err != nil {
@@ -99,8 +102,8 @@ func (o *Orchestrator) Execute(ctx context.Context) (*OrchestrationResult, error
 		// 更新证据
 		evidence = o.updateEvidence(evidence, action, result)
 
-		// 收集确定性发现（static_rules）与 LLM 审查发现（review_point）
-		if action.Tool == "review_point" || action.Tool == "static_rules" {
+		// 如果是 review_point，收集 findings
+		if action.Tool == "review_point" {
 			if resultMap, ok := result.(map[string]interface{}); ok {
 				if findingsRaw, ok := resultMap["findings"].([]review.Finding); ok {
 					findings = append(findings, findingsRaw...)
@@ -125,10 +128,6 @@ func (o *Orchestrator) updateEvidence(currentEvidence string, action *NextAction
 	case "locate_symbols":
 		if m, ok := result.(map[string]interface{}); ok {
 			update.WriteString(fmt.Sprintf("定位到 %v 个符号\n", m["count"]))
-		}
-	case "static_rules":
-		if m, ok := result.(map[string]interface{}); ok {
-			update.WriteString(fmt.Sprintf("静态规则发现 %v 个确定性问题\n", m["count"]))
 		}
 	case "analyze_impact":
 		if m, ok := result.(map[string]interface{}); ok {

@@ -80,9 +80,7 @@ func (v *Validator) validateOne(ctx context.Context, f review.Finding, findingID
 // gatherEvidence 召回 finding 相关的证据。
 // 包括：函数体上下文、变量定义、调用关系。
 func (v *Validator) gatherEvidence(f review.Finding) Evidence {
-	evidence := Evidence{
-		ClaimedEvidence: f.Evidence, // finding 自己声称的证据
-	}
+	evidence := Evidence{}
 
 	// 1. 函数体上下文：优先使用完整符号体，回退到 ±10 行
 	if v.store != nil {
@@ -150,10 +148,9 @@ func (v *Validator) readContext(file string, line, lines int) string {
 
 // Evidence 是召回的证据。
 type Evidence struct {
-	ClaimedEvidence string // finding 声称的证据
-	FunctionBody    string // 函数体上下文（完整符号体或 ±10 行）
-	SymbolInfo      string // 符号信息（提取方式和长度）
-	CallChain       string // 调用关系
+	FunctionBody string // 函数体上下文（完整符号体或 ±10 行）
+	SymbolInfo   string // 符号信息（提取方式和长度）
+	CallChain    string // 调用关系
 }
 
 // formatCallChain 格式化调用链。
