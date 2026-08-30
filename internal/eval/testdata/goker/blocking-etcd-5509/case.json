@@ -1,0 +1,12 @@
+{
+  "name": "blocking-etcd-5509",
+  "source": "GoBench/GoKer",
+  "file": "etcd5509_test.go",
+  "bugs": [
+    {
+      "file": "etcd5509_test.go",
+      "line": 27,
+      "desc": "Resource Deadlock: Double locking"
+    }
+  ]
+}

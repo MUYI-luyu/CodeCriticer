@@ -1,0 +1,12 @@
+{
+  "name": "blocking-kubernetes-26980",
+  "source": "GoBench/GoKer",
+  "file": "kubernetes26980_test.go",
+  "bugs": [
+    {
+      "file": "kubernetes26980_test.go",
+      "line": 35,
+      "desc": "Mixed Deadlock: Channel \u0026 Lock"
+    }
+  ]
+}

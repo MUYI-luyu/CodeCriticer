@@ -1,0 +1,12 @@
+{
+  "name": "blocking-cockroach-24808",
+  "source": "GoBench/GoKer",
+  "file": "cockroach24808_test.go",
+  "bugs": [
+    {
+      "file": "cockroach24808_test.go",
+      "line": 0,
+      "desc": "文件级定位: Communication Deadlock: Channel"
+    }
+  ]
+}

@@ -1,0 +1,12 @@
+{
+  "name": "blocking-etcd-7902",
+  "source": "GoBench/GoKer",
+  "file": "etcd7902_test.go",
+  "bugs": [
+    {
+      "file": "etcd7902_test.go",
+      "line": 96,
+      "desc": "Mixed Deadlock: Channel \u0026 Lock"
+    }
+  ]
+}

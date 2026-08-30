@@ -1,0 +1,12 @@
+{
+  "name": "blocking-kubernetes-38669",
+  "source": "GoBench/GoKer",
+  "file": "kubernetes38669_test.go",
+  "bugs": [
+    {
+      "file": "kubernetes38669_test.go",
+      "line": 0,
+      "desc": "文件级定位: Communication Deadlock: Channel"
+    }
+  ]
+}

@@ -21,6 +21,10 @@ func Compute(bugs []Bug, fs []review.Finding, tol int) Metrics {
 			if used[i] || b.File != f.File {
 				continue
 			}
+			if b.Line <= 0 { // 文件级 ground truth（无精确行号）：同文件即命中
+				best = i
+				break
+			}
 			if d := abs(b.Line - f.Line); d > tol {
 				continue
 			}

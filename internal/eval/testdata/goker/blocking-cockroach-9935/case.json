@@ -1,0 +1,12 @@
+{
+  "name": "blocking-cockroach-9935",
+  "source": "GoBench/GoKer",
+  "file": "cockroach9935_test.go",
+  "bugs": [
+    {
+      "file": "cockroach9935_test.go",
+      "line": 0,
+      "desc": "文件级定位: Resource Deadlock: Double Locking"
+    }
+  ]
+}

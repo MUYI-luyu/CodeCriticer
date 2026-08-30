@@ -1,0 +1,12 @@
+{
+  "name": "nonblocking-serving-5865",
+  "source": "GoBench/GoKer",
+  "file": "serving5865_test.go",
+  "bugs": [
+    {
+      "file": "serving5865_test.go",
+      "line": 26,
+      "desc": "Go-Specific: Misuse channel"
+    }
+  ]
+}

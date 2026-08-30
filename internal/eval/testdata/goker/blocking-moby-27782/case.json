@@ -1,0 +1,12 @@
+{
+  "name": "blocking-moby-27782",
+  "source": "GoBench/GoKer",
+  "file": "moby27782_test.go",
+  "bugs": [
+    {
+      "file": "moby27782_test.go",
+      "line": 248,
+      "desc": "Communication Deadlock: Channel \u0026 Condition Variable"
+    }
+  ]
+}

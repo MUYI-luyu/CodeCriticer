@@ -1,0 +1,12 @@
+{
+  "name": "blocking-cockroach-16167",
+  "source": "GoBench/GoKer",
+  "file": "cockroach16167_test.go",
+  "bugs": [
+    {
+      "file": "cockroach16167_test.go",
+      "line": 74,
+      "desc": "Resource Deadlock: Double Locking"
+    }
+  ]
+}

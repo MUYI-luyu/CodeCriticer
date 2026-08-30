@@ -1,0 +1,12 @@
+{
+  "name": "nonblocking-kubernetes-81148",
+  "source": "GoBench/GoKer",
+  "file": "kubernetes81148_test.go",
+  "bugs": [
+    {
+      "file": "kubernetes81148_test.go",
+      "line": 50,
+      "desc": "Traditional: Data race"
+    }
+  ]
+}

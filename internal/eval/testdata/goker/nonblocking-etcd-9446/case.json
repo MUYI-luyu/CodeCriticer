@@ -1,0 +1,12 @@
+{
+  "name": "nonblocking-etcd-9446",
+  "source": "GoBench/GoKer",
+  "file": "etcd9446_test.go",
+  "bugs": [
+    {
+      "file": "etcd9446_test.go",
+      "line": 14,
+      "desc": "Traditional: Data race"
+    }
+  ]
+}

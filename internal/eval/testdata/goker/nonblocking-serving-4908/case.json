@@ -1,0 +1,12 @@
+{
+  "name": "nonblocking-serving-4908",
+  "source": "GoBench/GoKer",
+  "file": "serving4908_test.go",
+  "bugs": [
+    {
+      "file": "serving4908_test.go",
+      "line": 36,
+      "desc": "Go-Specific: Testing library"
+    }
+  ]
+}

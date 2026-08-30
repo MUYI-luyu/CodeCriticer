@@ -1,0 +1,12 @@
+{
+  "name": "blocking-kubernetes-11298",
+  "source": "GoBench/GoKer",
+  "file": "kubernetes11298_test.go",
+  "bugs": [
+    {
+      "file": "kubernetes11298_test.go",
+      "line": 0,
+      "desc": "文件级定位: Communication Deadlock: Channel \u0026 Condition Variable"
+    }
+  ]
+}

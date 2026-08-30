@@ -1,0 +1,12 @@
+{
+  "name": "nonblocking-grpc-1687",
+  "source": "GoBench/GoKer",
+  "file": "grpc1687_test.go",
+  "bugs": [
+    {
+      "file": "grpc1687_test.go",
+      "line": 28,
+      "desc": "Go-Specific: Misuse channel"
+    }
+  ]
+}

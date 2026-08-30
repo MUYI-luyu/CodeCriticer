@@ -1,0 +1,12 @@
+{
+  "name": "nonblocking-istio-16742",
+  "source": "GoBench/GoKer",
+  "file": "istio16742_test.go",
+  "bugs": [
+    {
+      "file": "istio16742_test.go",
+      "line": 72,
+      "desc": "Traditional: Data race"
+    }
+  ]
+}

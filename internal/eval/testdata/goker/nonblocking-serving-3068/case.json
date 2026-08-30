@@ -1,0 +1,12 @@
+{
+  "name": "nonblocking-serving-3068",
+  "source": "GoBench/GoKer",
+  "file": "serving3068_test.go",
+  "bugs": [
+    {
+      "file": "serving3068_test.go",
+      "line": 44,
+      "desc": "Go-Specific: Misuse channel"
+    }
+  ]
+}

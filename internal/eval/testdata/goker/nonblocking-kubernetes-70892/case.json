@@ -1,0 +1,12 @@
+{
+  "name": "nonblocking-kubernetes-70892",
+  "source": "GoBench/GoKer",
+  "file": "kubernetes70892_test.go",
+  "bugs": [
+    {
+      "file": "kubernetes70892_test.go",
+      "line": 57,
+      "desc": "Go-Specific: Anonymous function"
+    }
+  ]
+}

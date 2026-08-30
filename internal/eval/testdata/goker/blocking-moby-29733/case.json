@@ -1,0 +1,12 @@
+{
+  "name": "blocking-moby-29733",
+  "source": "GoBench/GoKer",
+  "file": "moby29733_test.go",
+  "bugs": [
+    {
+      "file": "moby29733_test.go",
+      "line": 0,
+      "desc": "文件级定位: Communication Deadlock: Condition Variable"
+    }
+  ]
+}

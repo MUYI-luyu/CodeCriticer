@@ -1,0 +1,12 @@
+{
+  "name": "blocking-kubernetes-70277",
+  "source": "GoBench/GoKer",
+  "file": "kubernetes70277_test.go",
+  "bugs": [
+    {
+      "file": "kubernetes70277_test.go",
+      "line": 79,
+      "desc": "Communication Deadlock: Channel"
+    }
+  ]
+}

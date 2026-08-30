@@ -1,0 +1,12 @@
+{
+  "name": "nonblocking-istio-8967",
+  "source": "GoBench/GoKer",
+  "file": "istio8967_test.go",
+  "bugs": [
+    {
+      "file": "istio8967_test.go",
+      "line": 22,
+      "desc": "Go-Specific: Misuse channel"
+    }
+  ]
+}

@@ -1,0 +1,12 @@
+{
+  "name": "blocking-kubernetes-1321",
+  "source": "GoBench/GoKer",
+  "file": "kubernetes1321_test.go",
+  "bugs": [
+    {
+      "file": "kubernetes1321_test.go",
+      "line": 111,
+      "desc": "Mixed Deadlock: Channel \u0026 Lock"
+    }
+  ]
+}

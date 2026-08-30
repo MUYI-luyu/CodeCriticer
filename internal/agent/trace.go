@@ -11,10 +11,10 @@ import (
 // Trace 是完整的审查轨迹，用于持久化和回放。
 // 包含输入（diff + repo）、过程（attempts）、输出（result）。
 type Trace struct {
-	ID        string    `json:"id"`     // 唯一标识（用于回放）
-	Diff      string    `json:"diff"`   // diff 内容或路径
-	Repo      string    `json:"repo"`   // 仓库路径
-	Result    *Result   `json:"result"` // 审查结果
+	ID        string    `json:"id"`         // 唯一标识（用于回放）
+	Diff      string    `json:"diff"`       // diff 内容或路径
+	Repo      string    `json:"repo"`       // 仓库路径
+	Result    *Result   `json:"result"`     // 审查结果
 	CreatedAt time.Time `json:"created_at"`
 }
 

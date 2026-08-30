@@ -8,7 +8,6 @@ import (
 	"github.com/MUYI-luyu/codecritic/internal/review"
 )
 
-// TestLoadCases 期望 15 个用例（含 STEP4 的 12 个新用例）。
 func TestLoadCases(t *testing.T) {
 	cases, err := Load("testdata/cases")
 	if err != nil {

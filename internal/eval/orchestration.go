@@ -90,10 +90,10 @@ func RunOrchestration(ctx context.Context, llm *review.LLM, datasetDir string, v
 			CaseName: c.Name,
 			Bugs:     len(c.Bugs),
 			BaselineResult: CaseResult{
-				Findings:  baseMetrics.Findings,
-				Found:     baseMetrics.Found,
-				False:     baseMetrics.False,
-				Rounds:    1,
+				Findings: baseMetrics.Findings,
+				Found:    baseMetrics.Found,
+				False:    baseMetrics.False,
+				Rounds:   1,
 				ToolCalls: 0,
 			},
 			OrchResult: CaseResult{

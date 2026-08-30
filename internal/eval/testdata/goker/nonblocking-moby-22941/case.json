@@ -1,0 +1,12 @@
+{
+  "name": "nonblocking-moby-22941",
+  "source": "GoBench/GoKer",
+  "file": "moby22941_test.go",
+  "bugs": [
+    {
+      "file": "moby22941_test.go",
+      "line": 41,
+      "desc": "Go-Specific: Anonymous function"
+    }
+  ]
+}

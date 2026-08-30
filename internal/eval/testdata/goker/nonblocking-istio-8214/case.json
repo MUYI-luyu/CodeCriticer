@@ -1,0 +1,12 @@
+{
+  "name": "nonblocking-istio-8214",
+  "source": "GoBench/GoKer",
+  "file": "istio8214_test.go",
+  "bugs": [
+    {
+      "file": "istio8214_test.go",
+      "line": 49,
+      "desc": "Traditional: Data race"
+    }
+  ]
+}

@@ -1,0 +1,12 @@
+{
+  "name": "blocking-syncthing-5795",
+  "source": "GoBench/GoKer",
+  "file": "syncthing5795_test.go",
+  "bugs": [
+    {
+      "file": "syncthing5795_test.go",
+      "line": 0,
+      "desc": "文件级定位: Communication Deadlock: Channel"
+    }
+  ]
+}

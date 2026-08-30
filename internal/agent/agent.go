@@ -160,17 +160,19 @@ func (a *Agent) executeRound(ctx context.Context, round int, diff []byte, syms [
 	} else {
 		// Plan-and-Execute 固定 pipeline 模式
 		memoryText := a.formatMemory()
-		findings, err = a.planAgent.ReviewWithMemory(ctx, string(diff), syms, memoryText)
+		var pool *recall.EvidencePool
+		findings, pool, err = a.planAgent.ReviewWithMemory(ctx, string(diff), syms, memoryText)
 		if err != nil {
 			attempt.Duration = time.Since(startTime)
 			return attempt, fmt.Errorf("execute: %w", err)
 		}
+		attempt.EvidencePool = pool
 	}
 	attempt.Findings = findings
 	attempt.ToolCalls = toolCalls
 
 	// 2. Validate: 证据校验（静态规则已命中的 finding 直接置信度 1.0，跳过 LLM 复核）
-	validations, err := a.validate(ctx, findings)
+	validations, err := a.validate(ctx, findings, attempt.EvidencePool)
 	if err != nil {
 		attempt.Duration = time.Since(startTime)
 		return attempt, fmt.Errorf("validate: %w", err)
@@ -352,7 +354,7 @@ func filterValidFindings(findings []review.Finding, validations []Validation) []
 	return result
 }
 
-// filterStaticToDiff 过滤静态规则 findings 到 diff 涉及的文件，避免报告无关的存量问题。
+// filterStaticToDiff 过滤静态规则 findings 到 diff 涉及的文件，避免报告无关的历史遗留问题。
 func (a *Agent) filterStaticToDiff(diffData []byte) []review.Finding {
 	if len(a.staticFindings) == 0 {
 		return nil
@@ -387,14 +389,14 @@ func (a *Agent) staticHit(file string, line int) bool {
 }
 
 // validate 逐条校验 finding；静态规则已命中的直接置信度 1.0，跳过 LLM 复核。
-func (a *Agent) validate(ctx context.Context, findings []review.Finding) ([]Validation, error) {
+func (a *Agent) validate(ctx context.Context, findings []review.Finding, pool *recall.EvidencePool) ([]Validation, error) {
 	validations := make([]Validation, len(findings))
 	for i, f := range findings {
 		if a.staticHit(f.File, f.Line) {
 			validations[i] = Validation{FindingID: i, Confidence: 1.0, Evidence: f.Evidence}
 			continue
 		}
-		v, err := a.validator.validateOne(ctx, f, i)
+		v, err := a.validator.validateOne(ctx, f, i, pool)
 		if err != nil {
 			validations[i] = Validation{
 				FindingID:  i,

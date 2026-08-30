@@ -1,0 +1,12 @@
+{
+  "name": "nonblocking-cockroach-35501",
+  "source": "GoBench/GoKer",
+  "file": "cockroach35501_test.go",
+  "bugs": [
+    {
+      "file": "cockroach35501_test.go",
+      "line": 19,
+      "desc": "Go-Specific: Anonymous function"
+    }
+  ]
+}

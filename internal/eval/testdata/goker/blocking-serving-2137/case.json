@@ -1,0 +1,12 @@
+{
+  "name": "blocking-serving-2137",
+  "source": "GoBench/GoKer",
+  "file": "serving2137_test.go",
+  "bugs": [
+    {
+      "file": "serving2137_test.go",
+      "line": 116,
+      "desc": "Mixed Deadlock: Channel \u0026 Lock"
+    }
+  ]
+}

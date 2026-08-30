@@ -1,0 +1,12 @@
+{
+  "name": "blocking-etcd-6857",
+  "source": "GoBench/GoKer",
+  "file": "etcd6857_test.go",
+  "bugs": [
+    {
+      "file": "etcd6857_test.go",
+      "line": 76,
+      "desc": "Communication Deadlock: Channel"
+    }
+  ]
+}

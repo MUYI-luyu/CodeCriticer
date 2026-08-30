@@ -1,0 +1,12 @@
+{
+  "name": "blocking-kubernetes-62464",
+  "source": "GoBench/GoKer",
+  "file": "kubernetes62464_test.go",
+  "bugs": [
+    {
+      "file": "kubernetes62464_test.go",
+      "line": 84,
+      "desc": "Resource Deadlock: RWR deadlock"
+    }
+  ]
+}

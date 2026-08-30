@@ -81,14 +81,13 @@ func loadCase(dir string) (*Case, error) {
 	if len(bugs) == 0 {
 		bugs = extractedBugs // 使用从注释提取的 bugs
 	}
-	diff, err := unifiedDiff(string(fixed), clean)
-	if err != nil {
-		return nil, err
-	}
-
 	file := m.File
 	if file == "" {
 		file = "main.go"
+	}
+	diff, err := unifiedDiff(string(fixed), clean, file)
+	if err != nil {
+		return nil, err
 	}
 	return &Case{
 		Name:   m.Name,
@@ -118,7 +117,8 @@ func stripMarks(src string) (string, []Bug) {
 }
 
 // unifiedDiff 生成 fixed → buggy 的 unified diff（即引入 bug 的 diff）。
-func unifiedDiff(fixed, buggy string) ([]byte, error) {
+// fixed 为空时生成"整个文件新增"的 diff，用于 GoKer 这类只有 buggy 无 fixed 的数据源。
+func unifiedDiff(fixed, buggy, file string) ([]byte, error) {
 	dir, err := os.MkdirTemp("", "ccdiff")
 	if err != nil {
 		return nil, err
@@ -134,7 +134,7 @@ func unifiedDiff(fixed, buggy string) ([]byte, error) {
 		return nil, err
 	}
 
-	out, err := exec.Command("diff", "-u", "--label", "a/main.go", "--label", "b/main.go", a, b).Output()
+	out, err := exec.Command("diff", "-u", "--label", "a/"+file, "--label", "b/"+file, a, b).Output()
 	if err != nil {
 		// diff 返回 1 表示有差异，属正常；>1 才是错误。
 		if ee, ok := err.(*exec.ExitError); ok && ee.ExitCode() == 1 {

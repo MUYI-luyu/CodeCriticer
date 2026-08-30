@@ -1,0 +1,12 @@
+{
+  "name": "blocking-cockroach-3710",
+  "source": "GoBench/GoKer",
+  "file": "cockroach3710_test.go",
+  "bugs": [
+    {
+      "file": "cockroach3710_test.go",
+      "line": 114,
+      "desc": "Resource Deadlock: RWR Deadlock"
+    }
+  ]
+}

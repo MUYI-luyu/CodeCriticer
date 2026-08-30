@@ -1,0 +1,12 @@
+{
+  "name": "blocking-kubernetes-30872",
+  "source": "GoBench/GoKer",
+  "file": "kubernetes30872_test.go",
+  "bugs": [
+    {
+      "file": "kubernetes30872_test.go",
+      "line": 0,
+      "desc": "文件级定位: Resource Deadlock: AB-BA deadlock"
+    }
+  ]
+}

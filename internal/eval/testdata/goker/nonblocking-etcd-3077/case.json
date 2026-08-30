@@ -1,0 +1,12 @@
+{
+  "name": "nonblocking-etcd-3077",
+  "source": "GoBench/GoKer",
+  "file": "etcd3077_test.go",
+  "bugs": [
+    {
+      "file": "etcd3077_test.go",
+      "line": 41,
+      "desc": "Go-Specific: Misuse channel"
+    }
+  ]
+}

@@ -36,7 +36,7 @@ func New(root string, idx *graph.Index) *Store {
 	return &Store{root: abs, idx: idx}
 }
 
-// Root 返回仓库根目录（供 Validator 读取文件）。
+// Root 返回仓库根路径（用于外部访问）。
 func (s *Store) Root() string {
 	return s.root
 }

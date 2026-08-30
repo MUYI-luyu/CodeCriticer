@@ -1,0 +1,12 @@
+{
+  "name": "blocking-moby-28462",
+  "source": "GoBench/GoKer",
+  "file": "moby28462_test.go",
+  "bugs": [
+    {
+      "file": "moby28462_test.go",
+      "line": 120,
+      "desc": "Mixed Deadlock: Channel \u0026 Lock"
+    }
+  ]
+}

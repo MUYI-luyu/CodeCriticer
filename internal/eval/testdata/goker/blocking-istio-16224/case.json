@@ -1,0 +1,12 @@
+{
+  "name": "blocking-istio-16224",
+  "source": "GoBench/GoKer",
+  "file": "istio16224_test.go",
+  "bugs": [
+    {
+      "file": "istio16224_test.go",
+      "line": 0,
+      "desc": "文件级定位: Mixed Deadlock: Channel \u0026 Lock"
+    }
+  ]
+}

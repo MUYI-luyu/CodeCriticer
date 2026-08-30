@@ -23,7 +23,8 @@ type Change struct {
 	Symbols []Symbol // Annotate 填充
 }
 
-// Parse 把 unified diff 解析为变更列表。符号信息需要调用方用文件内容 Annotate。
+// Parse 把 unified diff 解析为变更列表，并自动标注符号信息。
+// 如果提供了 repoPath，会尝试读取文件内容进行 AST 解析。
 func Parse(data []byte) ([]Change, error) {
 	fds, err := sgd.ParseMultiFileDiff(data)
 	if err != nil {

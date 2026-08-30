@@ -1,0 +1,12 @@
+{
+  "name": "blocking-grpc-660",
+  "source": "GoBench/GoKer",
+  "file": "grpc660_test.go",
+  "bugs": [
+    {
+      "file": "grpc660_test.go",
+      "line": 53,
+      "desc": "Communication Deadlock: Channel"
+    }
+  ]
+}

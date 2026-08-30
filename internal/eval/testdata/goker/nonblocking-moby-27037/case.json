@@ -1,0 +1,12 @@
+{
+  "name": "nonblocking-moby-27037",
+  "source": "GoBench/GoKer",
+  "file": "moby27037_test.go",
+  "bugs": [
+    {
+      "file": "moby27037_test.go",
+      "line": 15,
+      "desc": "Go-Specific: Anonymous function"
+    }
+  ]
+}

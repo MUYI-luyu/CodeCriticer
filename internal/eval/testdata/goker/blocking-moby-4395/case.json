@@ -1,0 +1,12 @@
+{
+  "name": "blocking-moby-4395",
+  "source": "GoBench/GoKer",
+  "file": "moby4395_test.go",
+  "bugs": [
+    {
+      "file": "moby4395_test.go",
+      "line": 36,
+      "desc": "Communication Deadlock: Channel"
+    }
+  ]
+}

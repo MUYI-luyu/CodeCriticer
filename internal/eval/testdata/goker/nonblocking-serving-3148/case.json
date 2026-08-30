@@ -1,0 +1,12 @@
+{
+  "name": "nonblocking-serving-3148",
+  "source": "GoBench/GoKer",
+  "file": "serving3148_test.go",
+  "bugs": [
+    {
+      "file": "serving3148_test.go",
+      "line": 148,
+      "desc": "Traditional: Data race"
+    }
+  ]
+}

@@ -1,0 +1,12 @@
+{
+  "name": "blocking-etcd-6873",
+  "source": "GoBench/GoKer",
+  "file": "etcd6873_test.go",
+  "bugs": [
+    {
+      "file": "etcd6873_test.go",
+      "line": 74,
+      "desc": "Mixed Deadlock: Channel \u0026 Lock"
+    }
+  ]
+}

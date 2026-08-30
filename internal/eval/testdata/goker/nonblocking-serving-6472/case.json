@@ -1,0 +1,12 @@
+{
+  "name": "nonblocking-serving-6472",
+  "source": "GoBench/GoKer",
+  "file": "serving6472_test.go",
+  "bugs": [
+    {
+      "file": "serving6472_test.go",
+      "line": 0,
+      "desc": "文件级定位: Traditional: Data race"
+    }
+  ]
+}

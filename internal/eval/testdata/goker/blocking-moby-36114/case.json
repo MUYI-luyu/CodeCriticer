@@ -1,0 +1,12 @@
+{
+  "name": "blocking-moby-36114",
+  "source": "GoBench/GoKer",
+  "file": "moby36114_test.go",
+  "bugs": [
+    {
+      "file": "moby36114_test.go",
+      "line": 0,
+      "desc": "文件级定位: Resource Deadlock: Double locking"
+    }
+  ]
+}

@@ -7,15 +7,15 @@ import (
 
 // Symbol 是被改位置所属的声明。
 type Symbol struct {
-	Name      string   // 函数名 / 方法名 / 类型名
-	Kind      string   // func / method / type / var / const
-	Line      int      // 声明起始行（1-based）
-	EndLine   int      // 声明结束行（1-based）
-	Receiver  string   // 方法接收者类型（仅 method）
-	Params    []string // 参数列表（函数/方法）
-	Returns   []string // 返回值列表（函数/方法）
-	Body      string   // 完整函数体源码
-	Signature string   // 完整签名（用于精确匹配）
+	Name       string   // 函数名 / 方法名 / 类型名
+	Kind       string   // func / method / type / var / const
+	Line       int      // 声明起始行（1-based）
+	EndLine    int      // 声明结束行（1-based）
+	Receiver   string   // 方法接收者类型（仅 method）
+	Params     []string // 参数列表（函数/方法）
+	Returns    []string // 返回值列表（函数/方法）
+	Body       string   // 完整函数体源码
+	Signature  string   // 完整签名（用于精确匹配）
 }
 
 // Locate 找出包含行号 line（1-based）的最内层声明符号。

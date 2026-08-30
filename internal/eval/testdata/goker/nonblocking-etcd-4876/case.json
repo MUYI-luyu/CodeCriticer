@@ -1,0 +1,12 @@
+{
+  "name": "nonblocking-etcd-4876",
+  "source": "GoBench/GoKer",
+  "file": "etcd4876_test.go",
+  "bugs": [
+    {
+      "file": "etcd4876_test.go",
+      "line": 33,
+      "desc": "Traditional: Data race"
+    }
+  ]
+}

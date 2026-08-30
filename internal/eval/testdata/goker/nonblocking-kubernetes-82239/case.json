@@ -1,0 +1,12 @@
+{
+  "name": "nonblocking-kubernetes-82239",
+  "source": "GoBench/GoKer",
+  "file": "kubernetes82239_test.go",
+  "bugs": [
+    {
+      "file": "kubernetes82239_test.go",
+      "line": 132,
+      "desc": "Traditional: Data race"
+    }
+  ]
+}

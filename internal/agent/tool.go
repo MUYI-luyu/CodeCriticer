@@ -3,8 +3,6 @@ package agent
 import (
 	"context"
 	"fmt"
-	"os"
-	"path/filepath"
 	"time"
 
 	"github.com/MUYI-luyu/codecritic/internal/diff"
@@ -63,11 +61,10 @@ type ToolCall struct {
 // LocateSymbolsTool 定位 diff 中的符号变更。
 type LocateSymbolsTool struct {
 	diffText string
-	repo     string
 }
 
-func NewLocateSymbolsTool(diffText, repo string) *LocateSymbolsTool {
-	return &LocateSymbolsTool{diffText: diffText, repo: repo}
+func NewLocateSymbolsTool(diffText string) *LocateSymbolsTool {
+	return &LocateSymbolsTool{diffText: diffText}
 }
 
 func (t *LocateSymbolsTool) Name() string {
@@ -84,15 +81,8 @@ func (t *LocateSymbolsTool) Execute(ctx context.Context, args map[string]interfa
 		return nil, fmt.Errorf("解析 diff: %w", err)
 	}
 
-	// 逐变更标注符号：diff.Parse 只提取变更结构，符号定位需要读取文件原文。
 	var enrichedSymbols []map[string]interface{}
-	for i := range changes {
-		c := &changes[i]
-		if t.repo != "" && c.File != "/dev/null" {
-			if src, err := os.ReadFile(filepath.Join(t.repo, c.File)); err == nil {
-				c.Annotate(src)
-			}
-		}
+	for _, c := range changes {
 		for _, sym := range c.Symbols {
 			enrichedSymbols = append(enrichedSymbols, map[string]interface{}{
 				"name":      sym.Name,

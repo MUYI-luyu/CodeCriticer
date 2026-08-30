@@ -1,0 +1,12 @@
+{
+  "name": "blocking-kubernetes-10182",
+  "source": "GoBench/GoKer",
+  "file": "kubernetes10182_test.go",
+  "bugs": [
+    {
+      "file": "kubernetes10182_test.go",
+      "line": 72,
+      "desc": "Mixed Deadlock: Channel \u0026 Lock"
+    }
+  ]
+}

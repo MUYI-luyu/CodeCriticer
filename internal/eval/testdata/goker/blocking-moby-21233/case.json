@@ -1,0 +1,12 @@
+{
+  "name": "blocking-moby-21233",
+  "source": "GoBench/GoKer",
+  "file": "moby21233_test.go",
+  "bugs": [
+    {
+      "file": "moby21233_test.go",
+      "line": 129,
+      "desc": "Communication Deadlock: Channel"
+    }
+  ]
+}

@@ -7,19 +7,19 @@ import (
 
 // DiffSummary 提供 diff 的结构化摘要。
 type DiffSummary struct {
-	TotalFiles     int             // 变更文件数
-	TotalAdds      int             // 新增行数
-	TotalDels      int             // 删除行数
+	TotalFiles    int              // 变更文件数
+	TotalAdds     int              // 新增行数
+	TotalDels     int              // 删除行数
 	ChangedSymbols []ChangedSymbol // 变更的符号列表
 }
 
 // ChangedSymbol 表示一个被修改的符号及其变更详情。
 type ChangedSymbol struct {
-	File      string // 文件路径
-	Symbol    Symbol // 符号信息（含完整签名）
-	AddLines  []int  // 新增的行号
-	DelLines  []int  // 删除的行号
-	ImpactMsg string // 影响描述
+	File      string   // 文件路径
+	Symbol    Symbol   // 符号信息（含完整签名）
+	AddLines  []int    // 新增的行号
+	DelLines  []int    // 删除的行号
+	ImpactMsg string   // 影响描述
 }
 
 // Summarize 生成 diff 的结构化摘要。

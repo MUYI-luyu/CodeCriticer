@@ -1,0 +1,12 @@
+{
+  "name": "nonblocking-kubernetes-13058",
+  "source": "GoBench/GoKer",
+  "file": "kubernetes13058_test.go",
+  "bugs": [
+    {
+      "file": "kubernetes13058_test.go",
+      "line": 78,
+      "desc": "Go-Specific: WaitGroup"
+    }
+  ]
+}

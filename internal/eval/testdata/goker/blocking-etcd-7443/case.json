@@ -1,0 +1,12 @@
+{
+  "name": "blocking-etcd-7443",
+  "source": "GoBench/GoKer",
+  "file": "etcd7443_test.go",
+  "bugs": [
+    {
+      "file": "etcd7443_test.go",
+      "line": 0,
+      "desc": "文件级定位: Mixed Deadlock: Channel \u0026 Lock"
+    }
+  ]
+}

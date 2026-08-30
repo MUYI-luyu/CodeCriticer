@@ -1,0 +1,12 @@
+{
+  "name": "blocking-kubernetes-5316",
+  "source": "GoBench/GoKer",
+  "file": "kubernetes5316_test.go",
+  "bugs": [
+    {
+      "file": "kubernetes5316_test.go",
+      "line": 57,
+      "desc": "Communication Deadlock: Channel"
+    }
+  ]
+}

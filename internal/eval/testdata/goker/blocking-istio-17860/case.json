@@ -1,0 +1,12 @@
+{
+  "name": "blocking-istio-17860",
+  "source": "GoBench/GoKer",
+  "file": "istio17860_test.go",
+  "bugs": [
+    {
+      "file": "istio17860_test.go",
+      "line": 0,
+      "desc": "文件级定位: Communication Deadlock: Channel"
+    }
+  ]
+}

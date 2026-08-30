@@ -32,7 +32,7 @@ func (v *Validator) Validate(ctx context.Context, findings []review.Finding) ([]
 	validations := make([]Validation, len(findings))
 
 	for i, f := range findings {
-		validation, err := v.validateOne(ctx, f, i)
+		validation, err := v.validateOne(ctx, f, i, nil)
 		if err != nil {
 			// 校验失败时给默认中等置信度（保守策略）
 			validations[i] = Validation{
@@ -50,21 +50,35 @@ func (v *Validator) Validate(ctx context.Context, findings []review.Finding) ([]
 }
 
 // validateOne 校验单个 finding。
-func (v *Validator) validateOne(ctx context.Context, f review.Finding, findingID int) (Validation, error) {
-	// 1. 召回证据
-	evidence := v.gatherEvidence(f)
+// 优先使用 pool 中保存的 Plan 阶段召回结果，回退到 gatherEvidence。
+func (v *Validator) validateOne(ctx context.Context, f review.Finding, findingID int, pool *recall.EvidencePool) (Validation, error) {
+	var contextInfo, callChain string
 
-	// 2. 构建上下文信息（包含符号提取信息）
-	contextInfo := evidence.FunctionBody
-	if evidence.SymbolInfo != "" {
-		contextInfo = fmt.Sprintf("[%s]\n\n%s", evidence.SymbolInfo, evidence.FunctionBody)
+	// 1. 尝试从 pool 复用 Plan 阶段的召回结果
+	if pool != nil {
+		docs := pool.FindContext(f.File, f.Line, f.Msg)
+		if len(docs) > 0 {
+			// 过滤同文件的 docs，最多取 20 个
+			sameDocs := recall.FilterSameFile(docs, f.File, 20)
+			contextInfo = formatPoolDocs(sameDocs)
+		}
+	}
+
+	// 2. 回退到 gatherEvidence（pool 为空或未命中）
+	if contextInfo == "" {
+		evidence := v.gatherEvidence(f)
+		contextInfo = evidence.FunctionBody
+		if evidence.SymbolInfo != "" {
+			contextInfo = fmt.Sprintf("[%s]\n\n%s", evidence.SymbolInfo, evidence.FunctionBody)
+		}
+		callChain = evidence.CallChain
 	}
 
 	// 3. 调用 LLM 评估置信度
 	confidence, evidenceText, gaps, err := v.llm.ValidateFinding(ctx, f,
 		contextInfo,
 		"", // 变量定义召回已移除
-		evidence.CallChain)
+		callChain)
 	if err != nil {
 		return Validation{}, err
 	}
@@ -148,9 +162,9 @@ func (v *Validator) readContext(file string, line, lines int) string {
 
 // Evidence 是召回的证据。
 type Evidence struct {
-	FunctionBody string // 函数体上下文（完整符号体或 ±10 行）
-	SymbolInfo   string // 符号信息（提取方式和长度）
-	CallChain    string // 调用关系
+	FunctionBody    string // 函数体上下文（完整符号体或 ±10 行）
+	SymbolInfo      string // 符号信息（提取方式和长度）
+	CallChain       string // 调用关系
 }
 
 // formatCallChain 格式化调用链。
@@ -168,4 +182,13 @@ func formatCallChain(callers []recall.Doc) string {
 		lines = append(lines, fmt.Sprintf("- %s:%d", c.File, c.Line))
 	}
 	return strings.Join(lines, "\n")
+}
+
+// formatPoolDocs 格式化从 EvidencePool 复用的 docs。
+func formatPoolDocs(docs []recall.Doc) string {
+	var parts []string
+	for _, d := range docs {
+		parts = append(parts, fmt.Sprintf("// %s:%d\n%s", d.File, d.Line, d.Text))
+	}
+	return strings.Join(parts, "\n\n")
 }

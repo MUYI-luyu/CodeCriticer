@@ -1,0 +1,12 @@
+{
+  "name": "blocking-moby-30408",
+  "source": "GoBench/GoKer",
+  "file": "moby30408_test.go",
+  "bugs": [
+    {
+      "file": "moby30408_test.go",
+      "line": 0,
+      "desc": "文件级定位: Communication Deadlock: Condition Variable"
+    }
+  ]
+}

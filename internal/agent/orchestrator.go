@@ -24,7 +24,7 @@ func NewOrchestrator(llm *review.LLM, store *recall.Store, repo, diffText string
 	registry := NewToolRegistry()
 
 	// 注册工具
-	registry.Register(NewLocateSymbolsTool(diffText, repo))
+	registry.Register(NewLocateSymbolsTool(diffText))
 	registry.Register(NewAnalyzeImpactTool(store))
 	registry.Register(NewSearchCodeTool(store))
 	registry.Register(NewReviewPointTool(llm, diffText))

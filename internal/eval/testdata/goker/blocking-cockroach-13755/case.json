@@ -1,0 +1,12 @@
+{
+  "name": "blocking-cockroach-13755",
+  "source": "GoBench/GoKer",
+  "file": "cockroach13755_test.go",
+  "bugs": [
+    {
+      "file": "cockroach13755_test.go",
+      "line": 37,
+      "desc": "Communication Deadlock: Channel \u0026 Context"
+    }
+  ]
+}

@@ -1,0 +1,12 @@
+{
+  "name": "blocking-etcd-10492",
+  "source": "GoBench/GoKer",
+  "file": "etcd10492_test.go",
+  "bugs": [
+    {
+      "file": "etcd10492_test.go",
+      "line": 19,
+      "desc": "Resource Deadlock: Double locking"
+    }
+  ]
+}

@@ -1,0 +1,12 @@
+{
+  "name": "nonblocking-serving-6171",
+  "source": "GoBench/GoKer",
+  "file": "serving6171_test.go",
+  "bugs": [
+    {
+      "file": "serving6171_test.go",
+      "line": 36,
+      "desc": "Go-Specific: Testing library"
+    }
+  ]
+}

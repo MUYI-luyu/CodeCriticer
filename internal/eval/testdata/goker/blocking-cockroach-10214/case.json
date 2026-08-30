@@ -1,0 +1,12 @@
+{
+  "name": "blocking-cockroach-10214",
+  "source": "GoBench/GoKer",
+  "file": "cockroach10214_test.go",
+  "bugs": [
+    {
+      "file": "cockroach10214_test.go",
+      "line": 30,
+      "desc": "Resource Deadlock: AB-BA deadlock"
+    }
+  ]
+}

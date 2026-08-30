@@ -1,0 +1,12 @@
+{
+  "name": "nonblocking-moby-18412",
+  "source": "GoBench/GoKer",
+  "file": "moby18412_test.go",
+  "bugs": [
+    {
+      "file": "moby18412_test.go",
+      "line": 52,
+      "desc": "Traditional: Order violation"
+    }
+  ]
+}

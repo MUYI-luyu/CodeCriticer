@@ -1,0 +1,12 @@
+{
+  "name": "blocking-syncthing-4829",
+  "source": "GoBench/GoKer",
+  "file": "syncthing4829_test.go",
+  "bugs": [
+    {
+      "file": "syncthing4829_test.go",
+      "line": 0,
+      "desc": "文件级定位: Resource Deadlock: Double locking"
+    }
+  ]
+}

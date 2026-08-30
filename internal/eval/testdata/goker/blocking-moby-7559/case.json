@@ -1,0 +1,12 @@
+{
+  "name": "blocking-moby-7559",
+  "source": "GoBench/GoKer",
+  "file": "moby7559_test.go",
+  "bugs": [
+    {
+      "file": "moby7559_test.go",
+      "line": 25,
+      "desc": "Resource Deadlock: Double locking"
+    }
+  ]
+}

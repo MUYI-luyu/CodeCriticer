@@ -1,0 +1,12 @@
+{
+  "name": "nonblocking-cockroach-4407",
+  "source": "GoBench/GoKer",
+  "file": "cockroach4407_test.go",
+  "bugs": [
+    {
+      "file": "cockroach4407_test.go",
+      "line": 31,
+      "desc": "Go-Specific: WaitGroup"
+    }
+  ]
+}

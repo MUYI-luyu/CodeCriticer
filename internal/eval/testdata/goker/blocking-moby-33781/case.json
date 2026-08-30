@@ -1,0 +1,12 @@
+{
+  "name": "blocking-moby-33781",
+  "source": "GoBench/GoKer",
+  "file": "moby33781_test.go",
+  "bugs": [
+    {
+      "file": "moby33781_test.go",
+      "line": 67,
+      "desc": "Communication Deadlock: Channel \u0026 Context"
+    }
+  ]
+}

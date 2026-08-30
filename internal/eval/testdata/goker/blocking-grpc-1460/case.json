@@ -1,0 +1,12 @@
+{
+  "name": "blocking-grpc-1460",
+  "source": "GoBench/GoKer",
+  "file": "grpc1460_test.go",
+  "bugs": [
+    {
+      "file": "grpc1460_test.go",
+      "line": 67,
+      "desc": "Mixed Deadlock: Channel \u0026 Lock"
+    }
+  ]
+}

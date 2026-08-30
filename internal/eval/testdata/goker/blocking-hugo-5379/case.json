@@ -1,0 +1,12 @@
+{
+  "name": "blocking-hugo-5379",
+  "source": "GoBench/GoKer",
+  "file": "hugo5379_test.go",
+  "bugs": [
+    {
+      "file": "hugo5379_test.go",
+      "line": 0,
+      "desc": "文件级定位: Resource Deadlock: Double locking"
+    }
+  ]
+}

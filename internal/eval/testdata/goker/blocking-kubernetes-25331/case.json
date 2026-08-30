@@ -1,0 +1,12 @@
+{
+  "name": "blocking-kubernetes-25331",
+  "source": "GoBench/GoKer",
+  "file": "kubernetes25331_test.go",
+  "bugs": [
+    {
+      "file": "kubernetes25331_test.go",
+      "line": 68,
+      "desc": "Communication Deadlock: Channel \u0026 Context"
+    }
+  ]
+}

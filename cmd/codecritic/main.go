@@ -130,6 +130,10 @@ func cmdReview(args []string) {
 		}
 	}
 
+	if len(result.StaticFindings) > 0 {
+		log.Printf("静态规则命中 %d 个问题（确定性，直接进入结果）", len(result.StaticFindings))
+	}
+
 	printFindings(result.FinalFindings)
 
 	if verbose {

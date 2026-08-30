@@ -1,0 +1,12 @@
+{
+  "name": "blocking-kubernetes-13135",
+  "source": "GoBench/GoKer",
+  "file": "kubernetes13135_test.go",
+  "bugs": [
+    {
+      "file": "kubernetes13135_test.go",
+      "line": 166,
+      "desc": "Resource Deadlock: AB-BA deadlock"
+    }
+  ]
+}

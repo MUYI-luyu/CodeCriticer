@@ -1,0 +1,12 @@
+{
+  "name": "blocking-moby-4951",
+  "source": "GoBench/GoKer",
+  "file": "moby4951_test.go",
+  "bugs": [
+    {
+      "file": "moby4951_test.go",
+      "line": 0,
+      "desc": "文件级定位: Resource Deadlock: AB-BA deadlock"
+    }
+  ]
+}

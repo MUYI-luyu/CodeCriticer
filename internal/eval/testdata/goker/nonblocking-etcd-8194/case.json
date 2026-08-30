@@ -1,0 +1,12 @@
+{
+  "name": "nonblocking-etcd-8194",
+  "source": "GoBench/GoKer",
+  "file": "etcd8194_test.go",
+  "bugs": [
+    {
+      "file": "etcd8194_test.go",
+      "line": 14,
+      "desc": "Traditional: Data race"
+    }
+  ]
+}

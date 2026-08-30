@@ -4,6 +4,7 @@ package agent
 import (
 	"time"
 
+	"github.com/MUYI-luyu/codecritic/internal/recall"
 	"github.com/MUYI-luyu/codecritic/internal/review"
 )
 
@@ -28,14 +29,15 @@ type Critique struct {
 // Attempt 是一次审查尝试的完整记录。
 // 包含 Execute → Validate → Reflect 三个阶段的产出。
 type Attempt struct {
-	Round       int              `json:"round"`       // 第几轮（1-based）
-	Findings    []review.Finding `json:"findings"`    // Execute 阶段产出
-	Validations []Validation     `json:"validations"` // Validate 阶段产出
-	Critiques   []Critique       `json:"critiques"`   // Reflect 阶段产出
-	ToolCalls   []ToolCall       `json:"tool_calls"`  // 工具调用记录（仅 orchestration 模式）
-	StartedAt   time.Time        `json:"started_at"`
-	Duration    time.Duration    `json:"duration"`
-	Error       string           `json:"error,omitempty"` // 如果本轮失败
+	Round        int                  `json:"round"`       // 第几轮（1-based）
+	Findings     []review.Finding     `json:"findings"`    // Execute 阶段产出
+	Validations  []Validation         `json:"validations"` // Validate 阶段产出
+	Critiques    []Critique           `json:"critiques"`   // Reflect 阶段产出
+	ToolCalls    []ToolCall           `json:"tool_calls"`  // 工具调用记录（仅 orchestration 模式）
+	EvidencePool *recall.EvidencePool `json:"-"`           // Plan 阶段召回的证据池（传递给 Validate）
+	StartedAt    time.Time            `json:"started_at"`
+	Duration     time.Duration        `json:"duration"`
+	Error        string               `json:"error,omitempty"` // 如果本轮失败
 }
 
 // Result 是完整的审查结果，包含所有尝试轨迹。

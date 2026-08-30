@@ -1,0 +1,12 @@
+{
+  "name": "blocking-moby-25384",
+  "source": "GoBench/GoKer",
+  "file": "moby25384_test.go",
+  "bugs": [
+    {
+      "file": "moby25384_test.go",
+      "line": 33,
+      "desc": "Mixed Deadlock: Misuse WaitGroup"
+    }
+  ]
+}

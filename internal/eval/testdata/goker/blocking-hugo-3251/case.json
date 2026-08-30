@@ -1,0 +1,12 @@
+{
+  "name": "blocking-hugo-3251",
+  "source": "GoBench/GoKer",
+  "file": "hugo3251_test.go",
+  "bugs": [
+    {
+      "file": "hugo3251_test.go",
+      "line": 0,
+      "desc": "文件级定位: Resource Deadlock: AB-BA deadlock"
+    }
+  ]
+}
