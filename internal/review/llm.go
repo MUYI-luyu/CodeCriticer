@@ -42,6 +42,9 @@ Finding:
 调用关系:
 %s
 
+注意：召回的证据可能来自 Plan 阶段（包含跨函数/跨文件的上下文），也可能来自局部提取（仅函数体）。
+如果证据中包含多个代码片段（不同文件或行号），说明是跨函数证据，应优先利用这些跨函数关系进行评估。
+
 输出 JSON：
 {
   "confidence": 0.0-1.0,
@@ -142,29 +145,46 @@ type chatResp struct {
 	} `json:"usage"`
 }
 
-// Chat 发送一轮对话，返回助手文本（公开给 agent 包使用）。
-func (l *LLM) Chat(ctx context.Context, system, user, model string) (string, error) {
-	return l.chat(ctx, system, user, model)
+// LLMUsage 是一次 LLM 调用的 token 用量（公开给 agent/eval 包使用）。
+type LLMUsage struct {
+	PromptTokens     int `json:"prompt_tokens"`
+	CompletionTokens int `json:"completion_tokens"`
+	TotalTokens      int `json:"total_tokens"`
 }
 
-// chat 发送一轮对话（带指数退避重试），返回助手文本。
-func (l *LLM) chat(ctx context.Context, system, user, model string) (string, error) {
+// Chat 发送一轮对话，返回助手文本（公开给 agent 包使用）。
+func (l *LLM) Chat(ctx context.Context, system, user, model string) (string, error) {
+	text, _, err := l.chatWithUsage(ctx, system, user, model)
+	return text, err
+}
+
+// ChatWithUsage 发送一轮对话，返回助手文本 + token 用量（公开给 agent 包使用）。
+func (l *LLM) ChatWithUsage(ctx context.Context, system, user, model string) (string, LLMUsage, error) {
+	return l.chatWithUsage(ctx, system, user, model)
+}
+
+// chatWithUsage 发送一轮对话（带指数退避重试），返回助手文本 + token 用量。
+func (l *LLM) chatWithUsage(ctx context.Context, system, user, model string) (string, LLMUsage, error) {
 	const maxRetries = 3
 	var lastErr error
+	var totalUsage LLMUsage
 	for attempt := 0; attempt < maxRetries; attempt++ {
 		if attempt > 0 {
 			l.metrics.recordRetry(model)
 			select {
 			case <-ctx.Done():
-				return "", ctx.Err()
+				return "", totalUsage, ctx.Err()
 			case <-time.After(backoff(attempt)):
 			}
 		}
 
 		text, usage, err := l.chatOnce(ctx, system, user, model)
 		if err == nil {
+			totalUsage.PromptTokens += usage.Input
+			totalUsage.CompletionTokens += usage.Output
+			totalUsage.TotalTokens = totalUsage.PromptTokens + totalUsage.CompletionTokens
 			l.metrics.recordSuccess(model, usage)
-			return text, nil
+			return text, totalUsage, nil
 		}
 		lastErr = err
 		if !retryable(err) {
@@ -172,7 +192,13 @@ func (l *LLM) chat(ctx context.Context, system, user, model string) (string, err
 		}
 	}
 	l.metrics.recordFail(model)
-	return "", lastErr
+	return "", totalUsage, lastErr
+}
+
+// chat 发送一轮对话（带指数退避重试），返回助手文本。
+func (l *LLM) chat(ctx context.Context, system, user, model string) (string, error) {
+	text, _, err := l.chatWithUsage(ctx, system, user, model)
+	return text, err
 }
 
 // chatOnce 发送单次 HTTP 请求，返回文本与 token 用量。
@@ -218,21 +244,25 @@ func (l *LLM) chatOnce(ctx context.Context, system, user, model string) (string,
 }
 
 // chatWithFallback 依次尝试多个模型，主模型失败时降级到下一个。
-func (l *LLM) chatWithFallback(ctx context.Context, system, user string, models ...string) (string, error) {
+func (l *LLM) chatWithFallback(ctx context.Context, system, user string, models ...string) (string, LLMUsage, error) {
 	var lastErr error
+	var totalUsage LLMUsage
 	seen := make(map[string]bool)
 	for _, m := range models {
 		if m == "" || seen[m] {
 			continue // 跳过空模型与重复模型：避免降级链退化成对同一模型的重复调用
 		}
 		seen[m] = true
-		text, err := l.chat(ctx, system, user, m)
+		text, usage, err := l.chatWithUsage(ctx, system, user, m)
+		totalUsage.PromptTokens += usage.PromptTokens
+		totalUsage.CompletionTokens += usage.CompletionTokens
+		totalUsage.TotalTokens += usage.TotalTokens
 		if err == nil {
-			return text, nil
+			return text, totalUsage, nil
 		}
 		lastErr = err
 	}
-	return "", lastErr
+	return "", totalUsage, lastErr
 }
 
 // backoff 返回第 attempt 次重试的退避时间（1s/2s/4s）。
@@ -253,54 +283,56 @@ func retryable(err error) bool {
 	return true
 }
 
-// Review 一次性审查 diff，返回 findings。
-func (l *LLM) Review(ctx context.Context, diffText string) ([]Finding, error) {
-	text, err := l.chatWithFallback(ctx, reviewPrompt, diffText, l.config.ReviewModel, l.config.ReflectModel, l.config.PlanModel)
+// Review 一次性审查 diff，返回 findings + token 用量。
+func (l *LLM) Review(ctx context.Context, diffText string) ([]Finding, LLMUsage, error) {
+	text, usage, err := l.chatWithFallback(ctx, reviewPrompt, diffText, l.config.ReviewModel, l.config.ReflectModel, l.config.PlanModel)
 	if err != nil {
-		return nil, err
+		return nil, usage, err
 	}
-	return parseFindings(text)
+	findings, err := parseFindings(text)
+	return findings, usage, err
 }
 
-// Plan 规划审查要点。
-func (l *LLM) Plan(ctx context.Context, diffText string) ([]Point, error) {
-	text, err := l.chatWithFallback(ctx, planPrompt, diffText, l.config.PlanModel, l.config.ReviewModel, l.config.ReflectModel)
+// Plan 规划审查要点，返回要点 + token 用量。
+func (l *LLM) Plan(ctx context.Context, diffText string) ([]Point, LLMUsage, error) {
+	text, usage, err := l.chatWithFallback(ctx, planPrompt, diffText, l.config.PlanModel, l.config.ReviewModel, l.config.ReflectModel)
 	if err != nil {
-		return nil, err
+		return nil, usage, err
 	}
 	var out struct {
 		Points []Point `json:"points"`
 	}
 	if err := json.Unmarshal([]byte(stripFence(text)), &out); err != nil {
-		return nil, err
+		return nil, usage, err
 	}
-	return out.Points, nil
+	return out.Points, usage, nil
 }
 
-// ReviewPoint 针对单个要点审查，ctxText 是召回的代码。
-func (l *LLM) ReviewPoint(ctx context.Context, diffText, desc, ctxText string) ([]Finding, error) {
+// ReviewPoint 针对单个要点审查，ctxText 是召回的代码，返回 findings + token 用量。
+func (l *LLM) ReviewPoint(ctx context.Context, diffText, desc, ctxText string) ([]Finding, LLMUsage, error) {
 	sys := fmt.Sprintf(`你是资深 Go 代码审查员。针对审查要点「%s」，结合 diff 与召回代码，找出该要点下的真实 bug。
 只输出 JSON：{"findings":[{"file":"...","line":0,"severity":"error|warning|info","msg":"...","evidence":"..."}]}
 没有则 {"findings":[]}。`, desc)
 	user := "diff:\n" + diffText + "\n\n召回代码:\n" + ctxText
-	text, err := l.chatWithFallback(ctx, sys, user, l.config.ReviewModel, l.config.ReflectModel, l.config.PlanModel)
+	text, usage, err := l.chatWithFallback(ctx, sys, user, l.config.ReviewModel, l.config.ReflectModel, l.config.PlanModel)
 	if err != nil {
-		return nil, err
+		return nil, usage, err
 	}
-	return parseFindings(text)
+	findings, err := parseFindings(text)
+	return findings, usage, err
 }
 
-// ValidateFinding 对一个 finding 进行证据校验，返回置信度评分。
+// ValidateFinding 对一个 finding 进行证据校验，返回置信度评分 + token 用量。
 // 这是 Reflexion 的核心：从二元判断升级为定量评分。
-// 返回：confidence, evidence, gaps, error
-func (l *LLM) ValidateFinding(ctx context.Context, f Finding, funcBody, varDefs, callChain string) (float64, string, []string, error) {
+// 返回：confidence, evidence, gaps, usage, error
+func (l *LLM) ValidateFinding(ctx context.Context, f Finding, funcBody, varDefs, callChain string) (float64, string, []string, LLMUsage, error) {
 	user := fmt.Sprintf(validatePrompt,
 		f.File, f.Line, f.Severity, f.Msg, f.Evidence,
 		funcBody, varDefs, callChain)
 
-	text, err := l.chatWithFallback(ctx, "", user, l.config.ReviewModel, l.config.ReflectModel, l.config.PlanModel)
+	text, usage, err := l.chatWithFallback(ctx, "", user, l.config.ReviewModel, l.config.ReflectModel, l.config.PlanModel)
 	if err != nil {
-		return 0, "", nil, err
+		return 0, "", nil, usage, err
 	}
 
 	var result struct {
@@ -309,23 +341,23 @@ func (l *LLM) ValidateFinding(ctx context.Context, f Finding, funcBody, varDefs,
 		Gaps       []string `json:"gaps"`
 	}
 	if err := json.Unmarshal([]byte(stripFence(text)), &result); err != nil {
-		return 0, "", nil, fmt.Errorf("解析 validation: %w", err)
+		return 0, "", nil, usage, fmt.Errorf("解析 validation: %w", err)
 	}
 
-	return result.Confidence, result.Evidence, result.Gaps, nil
+	return result.Confidence, result.Evidence, result.Gaps, usage, nil
 }
 
-// GenerateCritique 对低可信度 finding 生成结构化批评。
+// GenerateCritique 对低可信度 finding 生成结构化批评，返回批评 + token 用量。
 // 批评用于指导下一轮审查（Reflexion 的 memory）。
-// 返回：reason, evidence, suggestion, error
-func (l *LLM) GenerateCritique(ctx context.Context, f Finding, confidence float64, evidence string, gaps []string) (string, string, string, error) {
+// 返回：reason, evidence, suggestion, usage, error
+func (l *LLM) GenerateCritique(ctx context.Context, f Finding, confidence float64, evidence string, gaps []string) (string, string, string, LLMUsage, error) {
 	user := fmt.Sprintf(critiquePrompt,
 		f.Severity, f.File, f.Line, f.Msg,
 		confidence*100, evidence, strings.Join(gaps, "; "))
 
-	text, err := l.chatWithFallback(ctx, "", user, l.config.ReflectModel, l.config.ReviewModel, l.config.PlanModel)
+	text, usage, err := l.chatWithFallback(ctx, "", user, l.config.ReflectModel, l.config.ReviewModel, l.config.PlanModel)
 	if err != nil {
-		return "", "", "", err
+		return "", "", "", usage, err
 	}
 
 	var result struct {
@@ -334,10 +366,10 @@ func (l *LLM) GenerateCritique(ctx context.Context, f Finding, confidence float6
 		Suggestion string `json:"suggestion"`
 	}
 	if err := json.Unmarshal([]byte(stripFence(text)), &result); err != nil {
-		return "", "", "", fmt.Errorf("解析 critique: %w", err)
+		return "", "", "", usage, fmt.Errorf("解析 critique: %w", err)
 	}
 
-	return result.Reason, result.Evidence, result.Suggestion, nil
+	return result.Reason, result.Evidence, result.Suggestion, usage, nil
 }
 
 func parseFindings(text string) ([]Finding, error) {

@@ -201,7 +201,7 @@ func (t *ReviewPointTool) Execute(ctx context.Context, args map[string]interface
 	}
 	ctxText, _ := args["context"].(string)
 
-	findings, err := t.llm.ReviewPoint(ctx, t.diffText, desc, ctxText)
+	findings, _, err := t.llm.ReviewPoint(ctx, t.diffText, desc, ctxText)
 	if err != nil {
 		return nil, err
 	}

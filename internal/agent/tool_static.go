@@ -42,3 +42,4 @@ func (t *StaticRulesTool) Execute(ctx context.Context, args map[string]interface
 		"count":    len(results),
 	}, nil
 }
+

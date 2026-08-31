@@ -27,12 +27,17 @@ func NewValidator(llm *review.LLM, store *recall.Store) *Validator {
 }
 
 // Validate 对每个 finding 进行证据校验。
-// 返回 0-1 的置信度评分，而非二元的 keep/drop。
-func (v *Validator) Validate(ctx context.Context, findings []review.Finding) ([]Validation, error) {
+// 返回 0-1 的置信度评分，而非二元的 keep/drop，以及累计 token 用量。
+func (v *Validator) Validate(ctx context.Context, findings []review.Finding) ([]Validation, review.LLMUsage, error) {
 	validations := make([]Validation, len(findings))
+	var totalUsage review.LLMUsage
 
 	for i, f := range findings {
-		validation, err := v.validateOne(ctx, f, i, nil)
+		validation, usage, err := v.validateOneWithUsage(ctx, f, i, nil)
+		totalUsage.PromptTokens += usage.PromptTokens
+		totalUsage.CompletionTokens += usage.CompletionTokens
+		totalUsage.TotalTokens += usage.TotalTokens
+
 		if err != nil {
 			// 校验失败时给默认中等置信度（保守策略）
 			validations[i] = Validation{
@@ -46,12 +51,11 @@ func (v *Validator) Validate(ctx context.Context, findings []review.Finding) ([]
 		validations[i] = validation
 	}
 
-	return validations, nil
+	return validations, totalUsage, nil
 }
 
-// validateOne 校验单个 finding。
-// 优先使用 pool 中保存的 Plan 阶段召回结果，回退到 gatherEvidence。
-func (v *Validator) validateOne(ctx context.Context, f review.Finding, findingID int, pool *recall.EvidencePool) (Validation, error) {
+// validateOneWithUsage 校验单个 finding，返回 validation + token 用量。
+func (v *Validator) validateOneWithUsage(ctx context.Context, f review.Finding, findingID int, pool *recall.EvidencePool) (Validation, review.LLMUsage, error) {
 	var contextInfo, callChain string
 
 	// 1. 尝试从 pool 复用 Plan 阶段的召回结果
@@ -75,12 +79,12 @@ func (v *Validator) validateOne(ctx context.Context, f review.Finding, findingID
 	}
 
 	// 3. 调用 LLM 评估置信度
-	confidence, evidenceText, gaps, err := v.llm.ValidateFinding(ctx, f,
+	confidence, evidenceText, gaps, usage, err := v.llm.ValidateFinding(ctx, f,
 		contextInfo,
 		"", // 变量定义召回已移除
 		callChain)
 	if err != nil {
-		return Validation{}, err
+		return Validation{}, usage, err
 	}
 
 	return Validation{
@@ -88,7 +92,14 @@ func (v *Validator) validateOne(ctx context.Context, f review.Finding, findingID
 		Confidence: confidence,
 		Evidence:   evidenceText,
 		Gaps:       gaps,
-	}, nil
+	}, usage, nil
+}
+
+// validateOne 校验单个 finding。
+// 优先使用 pool 中保存的 Plan 阶段召回结果，回退到 gatherEvidence。
+func (v *Validator) validateOne(ctx context.Context, f review.Finding, findingID int, pool *recall.EvidencePool) (Validation, error) {
+	validation, _, err := v.validateOneWithUsage(ctx, f, findingID, pool)
+	return validation, err
 }
 
 // gatherEvidence 召回 finding 相关的证据。

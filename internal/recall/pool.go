@@ -30,6 +30,18 @@ func NewEvidencePool(findings []Finding, docsPerFinding [][]Doc) *EvidencePool {
 	return pool
 }
 
+// AllDocs 返回池内全部召回片段（去重后），供离线观测/归因使用。
+func (p *EvidencePool) AllDocs() []Doc {
+	if p == nil {
+		return nil
+	}
+	var all []Doc
+	for _, docs := range p.contexts {
+		all = append(all, docs...)
+	}
+	return Dedup(all)
+}
+
 // FindContext 根据 finding 的 file:line:msg 精确查找对应的召回证据。
 func (p *EvidencePool) FindContext(file string, line int, msg string) []Doc {
 	if p == nil {

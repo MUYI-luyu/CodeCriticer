@@ -21,10 +21,10 @@ func TestLoadGoker(t *testing.T) {
 
 	var exact, fileLevel int
 	for _, c := range cases {
-		if len(c.Bugs) == 0 {
+		if len(c.Bugs()) == 0 {
 			t.Fatalf("%s: 未提取到 bug", c.Name)
 		}
-		for _, b := range c.Bugs {
+		for _, b := range c.Bugs() {
 			if b.Line > 0 {
 				exact++
 			} else {

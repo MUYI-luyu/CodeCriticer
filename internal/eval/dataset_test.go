@@ -17,7 +17,7 @@ func TestLoadCases(t *testing.T) {
 		t.Fatalf("期望 15 个用例，得到 %d", len(cases))
 	}
 	for _, c := range cases {
-		if len(c.Bugs) == 0 {
+		if len(c.Bugs()) == 0 {
 			t.Fatalf("%s: 未提取到 bug", c.Name)
 		}
 		if strings.Contains(c.Repo["main.go"], "// BUG") {
@@ -52,8 +52,8 @@ func TestRuleCatches(t *testing.T) {
 		if err != nil {
 			t.Fatalf("%s: Rules: %v", c.Name, err)
 		}
-		if !hitRule(fs, c.Rule, c.Bugs, 3) {
-			t.Fatalf("%s: 规则 %s 未命中 bug %+v（findings=%+v）", c.Name, c.Rule, c.Bugs, fs)
+		if !hitRule(fs, c.Rule, c.Bugs(), 3) {
+			t.Fatalf("%s: 规则 %s 未命中 bug %+v（findings=%+v）", c.Name, c.Rule, c.Bugs(), fs)
 		}
 	}
 }

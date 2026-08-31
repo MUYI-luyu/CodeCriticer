@@ -17,10 +17,11 @@ func NewReflector(llm *review.LLM) *Reflector {
 	return &Reflector{llm: llm}
 }
 
-// Reflect 对低可信度的 findings 生成批评。
+// Reflect 对低可信度的 findings 生成批评，返回批评 + token 用量。
 // 只对 confidence < ConfidenceThreshold 的 findings 生成批评。
-func (r *Reflector) Reflect(ctx context.Context, findings []review.Finding, validations []Validation) ([]Critique, error) {
+func (r *Reflector) Reflect(ctx context.Context, findings []review.Finding, validations []Validation) ([]Critique, review.LLMUsage, error) {
 	var critiques []Critique
+	var totalUsage review.LLMUsage
 
 	for _, v := range validations {
 		// 只批评低可信度的 findings
@@ -36,7 +37,11 @@ func (r *Reflector) Reflect(ctx context.Context, findings []review.Finding, vali
 		finding := findings[v.FindingID]
 
 		// 调用 LLM 生成批评
-		reason, evidence, suggestion, err := r.llm.GenerateCritique(ctx, finding, v.Confidence, v.Evidence, v.Gaps)
+		reason, evidence, suggestion, usage, err := r.llm.GenerateCritique(ctx, finding, v.Confidence, v.Evidence, v.Gaps)
+		totalUsage.PromptTokens += usage.PromptTokens
+		totalUsage.CompletionTokens += usage.CompletionTokens
+		totalUsage.TotalTokens += usage.TotalTokens
+
 		if err != nil {
 			// 生成失败时，使用默认批评（保证流程不中断）
 			critiques = append(critiques, Critique{
@@ -56,5 +61,5 @@ func (r *Reflector) Reflect(ctx context.Context, findings []review.Finding, vali
 		})
 	}
 
-	return critiques, nil
+	return critiques, totalUsage, nil
 }

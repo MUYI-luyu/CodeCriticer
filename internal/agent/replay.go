@@ -12,7 +12,7 @@ import (
 
 // ReplayAnalysis 是 trace 回放的分析结果。
 type ReplayAnalysis struct {
-	TraceID     string
+	TraceID    string
 	TotalRounds int
 	Convergence ConvergenceInfo
 	Performance PerformanceInfo
@@ -22,17 +22,17 @@ type ReplayAnalysis struct {
 
 // ConvergenceInfo 收敛信息。
 type ConvergenceInfo struct {
-	Converged        bool
-	Reason           string
+	Converged      bool
+	Reason         string
 	RoundsToConverge int
 }
 
 // PerformanceInfo 性能信息。
 type PerformanceInfo struct {
-	TotalDuration time.Duration
-	AvgRoundTime  time.Duration
-	FastestRound  time.Duration
-	SlowestRound  time.Duration
+	TotalDuration   time.Duration
+	AvgRoundTime    time.Duration
+	FastestRound    time.Duration
+	SlowestRound    time.Duration
 }
 
 // QualityInfo 质量信息。

@@ -41,7 +41,7 @@ func (a *PlanAgent) Review(ctx context.Context, diffText string, syms []Sym) ([]
 // 返回 findings 及其对应的召回证据池（供 Validate 复用）。
 func (a *PlanAgent) ReviewWithMemory(ctx context.Context, diffText string, syms []Sym, memory string) ([]Finding, *recall.EvidencePool, error) {
 	if a.store == nil {
-		fs, err := a.llm.Review(ctx, diffText)
+		fs, _, err := a.llm.Review(ctx, diffText)
 		return fs, nil, err
 	}
 
@@ -51,9 +51,9 @@ func (a *PlanAgent) ReviewWithMemory(ctx context.Context, diffText string, syms 
 		symDocs = append(symDocs, a.store.Symbol(s.Name, s.File)...)
 	}
 
-	points, err := a.llm.Plan(ctx, diffText)
+	points, _, err := a.llm.Plan(ctx, diffText)
 	if err != nil || len(points) == 0 {
-		fs, err := a.llm.Review(ctx, diffText)
+		fs, _, err := a.llm.Review(ctx, diffText)
 		return fs, nil, err
 	}
 
@@ -80,7 +80,7 @@ func (a *PlanAgent) ReviewWithMemory(ctx context.Context, diffText string, syms 
 			ctxText = fmt.Sprintf("历史批评（避免重犯）：\n%s\n\n召回代码：\n%s", memory, ctxText)
 		}
 
-		fs, err := a.llm.ReviewPoint(ctx, diffText, p.Desc, ctxText)
+		fs, _, err := a.llm.ReviewPoint(ctx, diffText, p.Desc, ctxText)
 		if err != nil {
 			continue
 		}

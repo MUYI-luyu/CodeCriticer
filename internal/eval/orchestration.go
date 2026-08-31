@@ -15,6 +15,7 @@ import (
 type OrchestrationMetrics struct {
 	CaseName       string
 	Bugs           int
+	Dimension      CaseDimension
 	BaselineResult CaseResult
 	OrchResult     CaseResult
 }
@@ -26,6 +27,7 @@ type CaseResult struct {
 	False     int // 误报数
 	Rounds    int // 尝试轮数
 	ToolCalls int // 工具调用次数
+	Cost      CostSummary
 }
 
 // RunOrchestration 评测 orchestration 模式 vs baseline。
@@ -54,7 +56,7 @@ func RunOrchestration(ctx context.Context, llm *review.LLM, datasetDir string, v
 			return fmt.Errorf("%s baseline: %w", c.Name, err)
 		}
 		baseFindings := append(append([]review.Finding{}, baseRes.Rules...), baseRes.LLM...)
-		baseMetrics := Compute(c.Bugs, baseFindings, tol)
+		baseMetrics := Compute(c.Bugs(), baseFindings, tol)
 
 		// Orchestration: 动态工具编排
 		orchAgent, err := agent.New(llm, repo,
@@ -76,7 +78,12 @@ func RunOrchestration(ctx context.Context, llm *review.LLM, datasetDir string, v
 		if err != nil {
 			return fmt.Errorf("%s orchestration: %w", c.Name, err)
 		}
-		orchMetrics := Compute(c.Bugs, orchResult.FinalFindings, tol)
+		orchMetrics := Compute(c.Bugs(), orchResult.FinalFindings, tol)
+
+		// 计算维度和成本
+		dim := ComputeDimension(c)
+		baseCost := CostSummary{Rounds: 1} // baseline 无 LLM usage 追踪
+		orchCost := ComputeCost(orchResult)
 
 		baseTotal = baseTotal.Add(baseMetrics)
 		orchTotal = orchTotal.Add(orchMetrics)
@@ -87,14 +94,16 @@ func RunOrchestration(ctx context.Context, llm *review.LLM, datasetDir string, v
 		}
 
 		result := OrchestrationMetrics{
-			CaseName: c.Name,
-			Bugs:     len(c.Bugs),
+			CaseName:  c.Name,
+			Bugs:      len(c.Bugs()),
+			Dimension: dim,
 			BaselineResult: CaseResult{
-				Findings: baseMetrics.Findings,
-				Found:    baseMetrics.Found,
-				False:    baseMetrics.False,
-				Rounds:   1,
+				Findings:  baseMetrics.Findings,
+				Found:     baseMetrics.Found,
+				False:     baseMetrics.False,
+				Rounds:    1,
 				ToolCalls: 0,
+				Cost:      baseCost,
 			},
 			OrchResult: CaseResult{
 				Findings:  orchMetrics.Findings,
@@ -102,15 +111,16 @@ func RunOrchestration(ctx context.Context, llm *review.LLM, datasetDir string, v
 				False:     orchMetrics.False,
 				Rounds:    len(orchResult.Attempts),
 				ToolCalls: toolCallsCount,
+				Cost:      orchCost,
 			},
 		}
 		results = append(results, result)
 
-		fmt.Printf("%-20s bugs=%d  baseline[F=%d hit=%d fp=%d]  orch[F=%d hit=%d fp=%d tools=%d]\n",
-			c.Name, len(c.Bugs),
+		fmt.Printf("%-20s bugs=%d scale=%s scope=%s baseline[F=%d hit=%d fp=%d] orch[F=%d hit=%d fp=%d tools=%d cost=%dtok]\n",
+			c.Name, len(c.Bugs()), dim.ScaleLabel, dim.ScopeLabel,
 			baseMetrics.Findings, baseMetrics.Found, baseMetrics.False,
 			orchMetrics.Findings, orchMetrics.Found, orchMetrics.False,
-			toolCallsCount)
+			toolCallsCount, orchCost.TotalTokens)
 	}
 
 	fmt.Println()

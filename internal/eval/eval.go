@@ -23,18 +23,20 @@ type caseResult struct {
 	name    string
 	base    Metrics
 	reflex  Metrics
-	output  string // verbose trace 或单行摘要（原子打印，避免交错）
+	attrs   []BugAttribution // 末轮阶段归因（供分布汇总）
+	output  string           // verbose trace 或单行摘要（原子打印，避免交错）
 	err     error
 }
 
 // Run 跑全量评测，对比 Baseline（无 Reflexion）vs Reflexion Agent。
 // concurrency<=0 时取 DefaultConcurrency。
 func Run(ctx context.Context, llm *review.LLM, datasetDir string, verbose bool) error {
-	return RunConcurrent(ctx, llm, datasetDir, verbose, DefaultConcurrency)
+	return RunConcurrent(ctx, llm, datasetDir, verbose, DefaultConcurrency, "")
 }
 
 // RunConcurrent 以指定并发度跑评测。case 之间相互独立，可安全并发。
-func RunConcurrent(ctx context.Context, llm *review.LLM, datasetDir string, verbose bool, concurrency int) error {
+// traceDir 非空时，把每个 case 的 EvalTrace 持久化成 JSON（离线观测用）；为空则只做内存归因。
+func RunConcurrent(ctx context.Context, llm *review.LLM, datasetDir string, verbose bool, concurrency int, traceDir string) error {
 	cases, err := Load(datasetDir)
 	if err != nil {
 		return err
@@ -48,6 +50,11 @@ func RunConcurrent(ctx context.Context, llm *review.LLM, datasetDir string, verb
 	if concurrency > len(cases) {
 		concurrency = len(cases)
 	}
+	if traceDir != "" {
+		if err := os.MkdirAll(traceDir, 0o755); err != nil {
+			return fmt.Errorf("创建 trace 目录失败: %w", err)
+		}
+	}
 
 	jobs := make(chan *Case)
 	results := make(chan caseResult)
@@ -58,7 +65,7 @@ func RunConcurrent(ctx context.Context, llm *review.LLM, datasetDir string, verb
 		go func() {
 			defer wg.Done()
 			for c := range jobs {
-				results <- runCase(ctx, llm, c, verbose)
+				results <- runCase(ctx, llm, c, verbose, traceDir)
 			}
 		}()
 	}
@@ -76,6 +83,7 @@ func RunConcurrent(ctx context.Context, llm *review.LLM, datasetDir string, verb
 	}()
 
 	var base, reflexion Metrics
+	var attrCounts AttributionCounts
 	var failed, done int
 	total := len(cases)
 	for res := range results {
@@ -87,6 +95,7 @@ func RunConcurrent(ctx context.Context, llm *review.LLM, datasetDir string, verb
 		}
 		base = base.Add(res.base)
 		reflexion = reflexion.Add(res.reflex)
+		attrCounts = attrCounts.Add(res.attrs)
 		// 原子打印单个 case 的完整输出（worker 内已拼好）
 		fmt.Printf("[%d/%d] %s", done, total, res.output)
 	}
@@ -99,11 +108,17 @@ func RunConcurrent(ctx context.Context, llm *review.LLM, datasetDir string, verb
 	fmt.Printf("%-12s %10s %10s %8s %10s\n", "", "Recall", "Precision", "FP", "误报率")
 	fmt.Printf("%-12s %9.0f%% %10.0f%% %8d %9.0f%%\n", "Baseline", pct(base.Recall()), pct(base.Precision()), base.False, pct(base.FPRate()))
 	fmt.Printf("%-12s %9.0f%% %10.0f%% %8d %9.0f%%\n", "Reflexion", pct(reflexion.Recall()), pct(reflexion.Precision()), reflexion.False, pct(reflexion.FPRate()))
+
+	attrCounts.Print(os.Stdout)
+	if traceDir != "" {
+		fmt.Printf("\nTrace 已写入: %s\n", traceDir)
+	}
 	return nil
 }
 
 // runCase 跑单个 case 的 baseline + reflexion，输出拼进 buffer 由调用方原子打印。
-func runCase(ctx context.Context, llm *review.LLM, c *Case, verbose bool) caseResult {
+// traceDir 非空时把本 case 的 EvalTrace 落盘。
+func runCase(ctx context.Context, llm *review.LLM, c *Case, verbose bool, traceDir string) caseResult {
 	repo, err := materialize(c)
 	if err != nil {
 		return caseResult{name: c.Name, err: err, output: fmt.Sprintf("%-16s materialize 失败: %v", c.Name, err)}
@@ -116,7 +131,7 @@ func runCase(ctx context.Context, llm *review.LLM, c *Case, verbose bool) caseRe
 		return caseResult{name: c.Name, err: err, output: fmt.Sprintf("%-16s baseline 失败: %v", c.Name, err)}
 	}
 	baseFindings := append(append([]review.Finding{}, baseRes.Rules...), baseRes.LLM...)
-	b := Compute(c.Bugs, baseFindings, tol)
+	b := Compute(c.Bugs(), baseFindings, tol)
 
 	// Reflexion Agent: 完整的 Reflexion Loop
 	reflexAgent, err := agent.New(llm, repo, agent.WithMaxAttempts(3))
@@ -137,20 +152,56 @@ func runCase(ctx context.Context, llm *review.LLM, c *Case, verbose bool) caseRe
 	if err != nil {
 		return caseResult{name: c.Name, err: err, output: fmt.Sprintf("%-16s reflexion 失败: %v", c.Name, err)}
 	}
-	r := Compute(c.Bugs, reflexResult.FinalFindings, tol)
+	r := Compute(c.Bugs(), reflexResult.FinalFindings, tol)
+
+	// 计算维度（Scale/Scope）
+	dim := ComputeDimension(c)
+
+	// 计算 Cost
+	cost := ComputeCost(reflexResult)
+
+	// 阶段归因：针对 Reflexion 末轮 attempt，用 ground-truth 逐 bug 定位漏在哪一阶段。
+	var attrs []BugAttribution
+	if last := lastAttempt(reflexResult); last != nil {
+		attrs = Attribute(c.Bugs(), last, tol)
+	}
+
+	// 落盘 EvalTrace（可选）：把 ground-truth + baseline + 全轨迹 + 归因聚成一份 JSON。
+	if traceDir != "" {
+		if err := SaveTrace(traceDir, EvalTrace{
+			Name:             c.Name,
+			Bugs:             c.Bugs(),
+			BaselineFindings: baseFindings,
+			Reflex:           reflexResult,
+			Attributions:     attrs,
+			Dimension:        &dim,
+			CostSummary:      cost,
+		}); err != nil {
+			// trace 落盘失败不应打断评测，降级为在输出里标注。
+			fmt.Fprintf(os.Stderr, "warn: 写 trace 失败 %s: %v\n", c.Name, err)
+		}
+	}
 
 	var buf bytes.Buffer
 	if verbose {
-		printDetailedTrace(&buf, c.Name, reflexResult, baseFindings, c.Bugs, tol)
+		printDetailedTrace(&buf, c.Name, reflexResult, baseFindings, c.Bugs(), &dim, cost, tol)
 	} else {
-		fmt.Fprintf(&buf, "%-16s bug=%d  baseline[F=%d hit=%d fp=%d]  reflexion[F=%d hit=%d fp=%d rounds=%d]\n",
-			c.Name, len(c.Bugs),
+		fmt.Fprintf(&buf, "%-16s bug=%d scale=%s scope=%s cost=%dtok baseline[F=%d hit=%d fp=%d] reflex[F=%d hit=%d fp=%d r=%d]\n",
+			c.Name, len(c.Bugs()), dim.ScaleLabel, dim.ScopeLabel, cost.TotalTokens,
 			b.Findings, b.Found, b.False,
 			r.Findings, r.Found, r.False,
 			len(reflexResult.Attempts))
 	}
 
-	return caseResult{name: c.Name, base: b, reflex: r, output: buf.String()}
+	return caseResult{name: c.Name, base: b, reflex: r, attrs: attrs, output: buf.String()}
+}
+
+// lastAttempt 返回 Reflexion 的末轮 attempt（无则 nil）。归因以最终采纳的那轮为准。
+func lastAttempt(r *agent.Result) *agent.Attempt {
+	if r == nil || len(r.Attempts) == 0 {
+		return nil
+	}
+	return &r.Attempts[len(r.Attempts)-1]
 }
 
 // materialize 把用例写成临时仓库，返回仓库路径。
@@ -177,8 +228,19 @@ func materialize(c *Case) (string, error) {
 func pct(f float64) float64 { return f * 100 }
 
 // printDetailedTrace 打印详细的 Agent 执行轨迹（三层输出）到 w。
-func printDetailedTrace(w io.Writer, caseName string, result *agent.Result, baselineFindings []review.Finding, bugs []Bug, tol int) {
+func printDetailedTrace(w io.Writer, caseName string, result *agent.Result, baselineFindings []review.Finding, bugs []Bug, dim *CaseDimension, cost CostSummary, tol int) {
 	fmt.Fprintf(w, "\n=== Case: %s ===\n\n", caseName)
+
+	// Dimension & Cost
+	if dim != nil {
+		fmt.Fprintln(w, "=== Dimension ===")
+		fmt.Fprintf(w, "Scale:         %s (RepoLOC=%d, DiffLOC=%d)\n", dim.ScaleLabel, dim.RepoLOC, dim.DiffLOC)
+		fmt.Fprintf(w, "Scope:         %s (Files=%d, Packages=%d)\n\n", dim.ScopeLabel, dim.Files, dim.Packages)
+	}
+
+	fmt.Fprintln(w, "=== Cost ===")
+	fmt.Fprintf(w, "Total Tokens:  %d (prompt=%d, completion=%d)\n", cost.TotalTokens, cost.TotalPromptTokens, cost.TotalCompletionTokens)
+	fmt.Fprintf(w, "Rounds:        %d\n\n", cost.Rounds)
 
 	// Layer 2: Agent Trace
 	fmt.Fprintln(w, "\n=== Agent Trace ===")

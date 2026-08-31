@@ -167,27 +167,36 @@ func (a *Agent) executeRound(ctx context.Context, round int, diff []byte, syms [
 			return attempt, fmt.Errorf("execute: %w", err)
 		}
 		attempt.EvidencePool = pool
+		attempt.RecalledDocs = pool.AllDocs()
 	}
 	attempt.Findings = findings
 	attempt.ToolCalls = toolCalls
 
 	// 2. Validate: 证据校验（静态规则已命中的 finding 直接置信度 1.0，跳过 LLM 复核）
-	validations, err := a.validate(ctx, findings, attempt.EvidencePool)
+	validations, validateUsage, err := a.validateWithUsage(ctx, findings, attempt.EvidencePool)
 	if err != nil {
 		attempt.Duration = time.Since(startTime)
 		return attempt, fmt.Errorf("validate: %w", err)
 	}
 	attempt.Validations = validations
+	attempt.LLMUsage.PromptTokens += validateUsage.PromptTokens
+	attempt.LLMUsage.CompletionTokens += validateUsage.CompletionTokens
+	attempt.LLMUsage.TotalTokens += validateUsage.TotalTokens
 
 	// 3. Reflect: 生成批评（只对低可信度的）
-	critiques, err := a.reflector.Reflect(ctx, findings, validations)
+	critiques, reflectUsage, err := a.reflector.Reflect(ctx, findings, validations)
 	if err != nil {
 		// reflect 失败不影响主流程
 		critiques = []Critique{}
 	}
 	attempt.Critiques = critiques
 
-	// 4. 更新 memory
+	// 4. 汇总本轮 LLM usage（TODO: 累加 Execute/Validate 阶段的 usage）
+	attempt.LLMUsage.PromptTokens += reflectUsage.PromptTokens
+	attempt.LLMUsage.CompletionTokens += reflectUsage.CompletionTokens
+	attempt.LLMUsage.TotalTokens += reflectUsage.TotalTokens
+
+	// 5. 更新 memory
 	a.updateMemory(findings, critiques)
 
 	attempt.Duration = time.Since(startTime)
@@ -388,15 +397,21 @@ func (a *Agent) staticHit(file string, line int) bool {
 	return false
 }
 
-// validate 逐条校验 finding；静态规则已命中的直接置信度 1.0，跳过 LLM 复核。
-func (a *Agent) validate(ctx context.Context, findings []review.Finding, pool *recall.EvidencePool) ([]Validation, error) {
+// validateWithUsage 逐条校验 finding；静态规则已命中的直接置信度 1.0，跳过 LLM 复核。
+func (a *Agent) validateWithUsage(ctx context.Context, findings []review.Finding, pool *recall.EvidencePool) ([]Validation, review.LLMUsage, error) {
 	validations := make([]Validation, len(findings))
+	var totalUsage review.LLMUsage
+
 	for i, f := range findings {
 		if a.staticHit(f.File, f.Line) {
 			validations[i] = Validation{FindingID: i, Confidence: 1.0, Evidence: f.Evidence}
 			continue
 		}
-		v, err := a.validator.validateOne(ctx, f, i, pool)
+		v, usage, err := a.validator.validateOneWithUsage(ctx, f, i, pool)
+		totalUsage.PromptTokens += usage.PromptTokens
+		totalUsage.CompletionTokens += usage.CompletionTokens
+		totalUsage.TotalTokens += usage.TotalTokens
+
 		if err != nil {
 			validations[i] = Validation{
 				FindingID:  i,
@@ -408,7 +423,7 @@ func (a *Agent) validate(ctx context.Context, findings []review.Finding, pool *r
 		}
 		validations[i] = v
 	}
-	return validations, nil
+	return validations, totalUsage, nil
 }
 
 // mergeAndDedup 合并静态规则与 LLM findings，按 file:line 去重（静态规则优先）。
