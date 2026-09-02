@@ -9,3 +9,13 @@ type Finding struct {
 	Msg      string `json:"msg"`                // 问题描述
 	Evidence string `json:"evidence,omitempty"` // 证据片段
 }
+
+type Point struct {
+	Desc string   `json:"desc"`
+	Kw   []string `json:"kw"`
+}
+
+type Sym struct {
+	Name string
+	File string
+}

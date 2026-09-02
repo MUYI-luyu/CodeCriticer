@@ -1,14 +1,11 @@
 package main
 
-import "sync"
+import (
+	"fmt"
+	"sync"
+)
 
-type Config struct {
-	mu sync.Mutex
-	v  int
+func main() {
+	m := &sync.Mutex{}
+	fmt.Println(m)
 }
-
-func clone(c *Config) *Config {
-	return &Config{v: c.v}
-}
-
-func main() {}

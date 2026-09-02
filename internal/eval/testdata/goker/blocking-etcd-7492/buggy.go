@@ -1,10 +1,3 @@
-
-
-
-
-
-
-
 package etcd7492
 
 import (
@@ -124,24 +117,6 @@ func setupAuthStore() (store *authStore, teardownfunc func()) {
 	}
 	return as, tearDown
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 func TestEtcd7492(t *testing.T) {
 	as, tearDown := setupAuthStore()

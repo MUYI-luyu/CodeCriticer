@@ -16,10 +16,10 @@ const limit = 20
 
 // Doc 是召回到的代码片段。
 type Doc struct {
-	File string
-	Line int
-	Text string
-	Src  string // symbol / keyword
+	File string `json:"file"`
+	Line int    `json:"line"`
+	Text string `json:"text"`
+	Src  string `json:"src"` // symbol / keyword
 }
 
 // Store 是召回上下文：仓库根 + 调用图。

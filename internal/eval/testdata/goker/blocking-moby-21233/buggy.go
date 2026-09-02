@@ -1,18 +1,3 @@
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 package moby21233
 
 import (
@@ -132,21 +117,6 @@ func testTransfer() {
 	close(progressChan)
 	<-progressDone
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 func TestMoby21233(t *testing.T) {
 	go testTransfer()

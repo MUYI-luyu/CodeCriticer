@@ -1,15 +1,3 @@
-
-
-
-
-
-
-
-
-
-
-
-
 package kubernetes6632
 
 import (
@@ -59,17 +47,6 @@ func NewIdleAwareFramer() *idleAwareFramer {
 		},
 	}
 }
-
-
-
-
-
-
-
-
-
-
-
 
 func TestKubernetes6632(t *testing.T) {
 	i := NewIdleAwareFramer()

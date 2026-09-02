@@ -45,7 +45,6 @@ func newRevisionBackendsManagerWithProbeFrequency() *revisionBackendsManager {
 func TestServing5865(t *testing.T) {
 	rbm := newRevisionBackendsManagerWithProbeFrequency()
 
-
 	func() {
 		rbm.endpointsUpdated()
 	}()

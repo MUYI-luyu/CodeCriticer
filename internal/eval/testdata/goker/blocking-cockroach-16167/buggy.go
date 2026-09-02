@@ -1,20 +1,3 @@
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 package cockroach16167
 
 import (
@@ -85,14 +68,6 @@ func NewExectorAndSession() (*Executor, *Session) {
 	e := &Executor{}
 	return e, session
 }
-
-
-
-
-
-
-
-
 
 func TestCockroach16167(t *testing.T) {
 	e, s := NewExectorAndSession()

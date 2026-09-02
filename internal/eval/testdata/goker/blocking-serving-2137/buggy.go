@@ -26,7 +26,6 @@ func (b *Breaker) Maybe(thunk func()) bool {
 		return false
 	case b.pendingRequests <- t:
 
-
 		b.activeRequests <- t
 
 		defer func() { <-b.activeRequests; <-b.pendingRequests }()
@@ -56,8 +55,6 @@ func (b *Breaker) concurrentRequest() request {
 	return r
 }
 
-
-
 func (b *Breaker) concurrentRequests(n int) []request {
 	requests := make([]request, n)
 	for i := range requests {
@@ -86,29 +83,6 @@ func unlockAll(requests []request) {
 		unlock(lc)
 	}
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 func TestServing2137(t *testing.T) {
 	b := NewBreaker(1, 1)

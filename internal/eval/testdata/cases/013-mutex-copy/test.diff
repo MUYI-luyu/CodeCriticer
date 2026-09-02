@@ -1,0 +1,29 @@
+--- buggy.go	2026-08-23 01:18:50.115299435 +0800
++++ fixed.go	2026-08-23 01:19:04.345125374 +0800
+@@ -14,17 +14,21 @@
+ 	return val, ok
+ }
+ 
+-// BUG: 按值返回包含 Mutex 的结构体，会复制锁
+-func (c Cache) Clone() Cache {
++// 正确：返回指针，避免值复制
++func (c *Cache) Clone() *Cache {
+ 	c.mu.Lock()
+ 	defer c.mu.Unlock()
+-	return c
++	newItems := make(map[string]string, len(c.items))
++	for k, v := range c.items {
++		newItems[k] = v
++	}
++	return &Cache{mu: sync.Mutex{}, items: newItems}
+ }
+ 
+ func main() {
+-	cache := Cache{items: make(map[string]string)}
++	cache := &Cache{items: make(map[string]string)}
+ 	cache.items["key"] = "value"
+ 
+ 	clone := cache.Clone()
+-	clone.Get("key") // 死锁或 panic
++	clone.Get("key")
+ }

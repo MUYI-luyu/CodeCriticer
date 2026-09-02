@@ -1,10 +1,3 @@
-
-
-
-
-
-
-
 package etcd6857
 
 import (
@@ -53,21 +46,6 @@ func NewNode() *node {
 		done:   make(chan struct{}),
 	}
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 func TestEtcd6857(t *testing.T) {
 	n := NewNode()

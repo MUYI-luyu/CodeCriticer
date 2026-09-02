@@ -1,15 +1,3 @@
-
-
-
-
-
-
-
-
-
-
-
-
 package kubernetes25331
 
 import (
@@ -49,18 +37,6 @@ func NewWatchChan() *watchChan {
 		errChan:    make(chan error),
 	}
 }
-
-
-
-
-
-
-
-
-
-
-
-
 
 func TestKubernetes25331(t *testing.T) {
 	wc := NewWatchChan()

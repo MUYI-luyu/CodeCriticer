@@ -23,7 +23,7 @@ const planPrompt = `你是代码审查规划者。读下面的 unified diff，�
 只输出 JSON：
 {"points":[{"desc":"要点描述","kw":["关键词"]}]}`
 
-const validatePrompt = `你是代码审查证据校验员。给出一个 finding 与召回的证据，评估该 finding 的可信度。
+/* const validatePrompt = `你是代码审查证据校验员。给出一个 finding 与召回的证据，评估该 finding 的可信度。
 
 Finding:
 文件: %s
@@ -90,7 +90,7 @@ Validation Gaps: ["未检查所有 x 的使用点", "未追踪 x 的定义"]
   "suggestion": "下次审查前，先检索变量的所有赋值语句和 nil 检查，确认是否有未保护的使用点"
 }
 
-只输出 JSON，不要其他文字。`
+只输出 JSON，不要其他文字。` */
 
 // Config 返回 LLM 的配置（公开给 agent 包使用）。
 func (l *LLM) Config() *Config {
@@ -99,10 +99,47 @@ func (l *LLM) Config() *Config {
 
 // LLM 是 OpenAI 兼容的聊天客户端，支持分级模型配置。
 type LLM struct {
-	config  *Config
-	client  *http.Client
-	metrics *Metrics
+	config   *Config
+	client   *http.Client
+	metrics  *Metrics
+	observer LLMObserver
 }
+
+// LLMCall describes one completed HTTP attempt. It is intentionally a callback
+// so callers can route it to slog, a trace, or both without coupling this
+// package to a logging backend.
+type LLMCall struct {
+	TraceID      string `json:"trace_id,omitempty"`
+	Stage        string `json:"stage,omitempty"`
+	Model        string
+	SystemPrompt string
+	UserPrompt   string
+	Response     string
+	Usage        LLMUsage
+	Attempt      int
+	Status       int
+	Duration     time.Duration
+	Error        string
+}
+
+type LLMObserver interface{ OnLLMCall(LLMCall) }
+
+type observerContextKey struct{}
+
+// WithLLMObserver scopes observation to a single invocation.
+func WithLLMObserver(ctx context.Context, observer LLMObserver) context.Context {
+	return context.WithValue(ctx, observerContextKey{}, observer)
+}
+
+func observerFromContext(ctx context.Context) LLMObserver {
+	if observer, ok := ctx.Value(observerContextKey{}).(LLMObserver); ok {
+		return observer
+	}
+	return nil
+}
+
+// SetObserver attaches an optional observer for request/response tracing.
+func (l *LLM) SetObserver(observer LLMObserver) { l.observer = observer }
 
 // NewLLMWithConfig 创建 LLM 客户端，使用自定义配置。
 func NewLLMWithConfig(opts ...Option) *LLM {
@@ -178,7 +215,7 @@ func (l *LLM) chatWithUsage(ctx context.Context, system, user, model string) (st
 			}
 		}
 
-		text, usage, err := l.chatOnce(ctx, system, user, model)
+		text, usage, err := l.chatOnce(ctx, system, user, model, attempt+1)
 		if err == nil {
 			totalUsage.PromptTokens += usage.Input
 			totalUsage.CompletionTokens += usage.Output
@@ -202,7 +239,30 @@ func (l *LLM) chat(ctx context.Context, system, user, model string) (string, err
 }
 
 // chatOnce 发送单次 HTTP 请求，返回文本与 token 用量。
-func (l *LLM) chatOnce(ctx context.Context, system, user, model string) (string, usage, error) {
+func (l *LLM) chatOnce(ctx context.Context, system, user, model string, attempt int) (string, usage, error) {
+	started := time.Now()
+	observer := observerFromContext(ctx)
+	if observer == nil {
+		observer = l.observer
+	}
+	if err := l.config.Validate(); err != nil {
+		if observer != nil {
+			observer.OnLLMCall(LLMCall{Model: model, SystemPrompt: system, UserPrompt: user, Attempt: attempt, Duration: time.Since(started), Error: err.Error()})
+		}
+		return "", usage{}, err
+	}
+	record := func(response string, u usage, status int, err error) {
+		if observer == nil {
+			return
+		}
+		msg := ""
+		if err != nil {
+			msg = err.Error()
+		}
+		observer.OnLLMCall(LLMCall{Model: model, SystemPrompt: system, UserPrompt: user,
+			Response: response, Usage: LLMUsage{PromptTokens: u.Input, CompletionTokens: u.Output, TotalTokens: u.Input + u.Output},
+			Attempt: attempt, Status: status, Duration: time.Since(started), Error: msg})
+	}
 	body := chatReq{
 		Model:    model,
 		Messages: []chatMsg{{Role: "system", Content: system}, {Role: "user", Content: user}},
@@ -211,10 +271,12 @@ func (l *LLM) chatOnce(ctx context.Context, system, user, model string) (string,
 
 	raw, err := json.Marshal(body)
 	if err != nil {
+		record("", usage{}, 0, err)
 		return "", usage{}, err
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, l.config.BaseURL+"/chat/completions", bytes.NewReader(raw))
 	if err != nil {
+		record("", usage{}, 0, err)
 		return "", usage{}, err
 	}
 	req.Header.Set("Content-Type", "application/json")
@@ -222,25 +284,33 @@ func (l *LLM) chatOnce(ctx context.Context, system, user, model string) (string,
 
 	resp, err := l.client.Do(req)
 	if err != nil {
+		record("", usage{}, 0, err)
 		return "", usage{}, err
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
 		b, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return "", usage{}, &llmError{status: resp.StatusCode, body: string(b)}
+		err := &llmError{status: resp.StatusCode, body: string(b)}
+		record(string(b), usage{}, resp.StatusCode, err)
+		return "", usage{}, err
 	}
 	var out chatResp
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		record("", usage{}, resp.StatusCode, err)
 		return "", usage{}, err
 	}
 	if len(out.Choices) == 0 {
-		return "", usage{}, fmt.Errorf("llm: 空响应")
+		err := fmt.Errorf("llm: 空响应")
+		record("", usage{}, resp.StatusCode, err)
+		return "", usage{}, err
 	}
-	return out.Choices[0].Message.Content, usage{
+	u := usage{
 		Input:  out.Usage.PromptTokens,
 		Output: out.Usage.CompletionTokens,
-	}, nil
+	}
+	record(out.Choices[0].Message.Content, u, resp.StatusCode, nil)
+	return out.Choices[0].Message.Content, u, nil
 }
 
 // chatWithFallback 依次尝试多个模型，主模型失败时降级到下一个。
@@ -285,7 +355,7 @@ func retryable(err error) bool {
 
 // Review 一次性审查 diff，返回 findings + token 用量。
 func (l *LLM) Review(ctx context.Context, diffText string) ([]Finding, LLMUsage, error) {
-	text, usage, err := l.chatWithFallback(ctx, reviewPrompt, diffText, l.config.ReviewModel, l.config.ReflectModel, l.config.PlanModel)
+	text, usage, err := l.chatWithFallback(ctx, reviewPrompt, diffText, l.config.ReviewModel, l.config.PlanModel)
 	if err != nil {
 		return nil, usage, err
 	}
@@ -295,7 +365,7 @@ func (l *LLM) Review(ctx context.Context, diffText string) ([]Finding, LLMUsage,
 
 // Plan 规划审查要点，返回要点 + token 用量。
 func (l *LLM) Plan(ctx context.Context, diffText string) ([]Point, LLMUsage, error) {
-	text, usage, err := l.chatWithFallback(ctx, planPrompt, diffText, l.config.PlanModel, l.config.ReviewModel, l.config.ReflectModel)
+	text, usage, err := l.chatWithFallback(ctx, planPrompt, diffText, l.config.PlanModel, l.config.ReviewModel)
 	if err != nil {
 		return nil, usage, err
 	}
@@ -306,70 +376,6 @@ func (l *LLM) Plan(ctx context.Context, diffText string) ([]Point, LLMUsage, err
 		return nil, usage, err
 	}
 	return out.Points, usage, nil
-}
-
-// ReviewPoint 针对单个要点审查，ctxText 是召回的代码，返回 findings + token 用量。
-func (l *LLM) ReviewPoint(ctx context.Context, diffText, desc, ctxText string) ([]Finding, LLMUsage, error) {
-	sys := fmt.Sprintf(`你是资深 Go 代码审查员。针对审查要点「%s」，结合 diff 与召回代码，找出该要点下的真实 bug。
-只输出 JSON：{"findings":[{"file":"...","line":0,"severity":"error|warning|info","msg":"...","evidence":"..."}]}
-没有则 {"findings":[]}。`, desc)
-	user := "diff:\n" + diffText + "\n\n召回代码:\n" + ctxText
-	text, usage, err := l.chatWithFallback(ctx, sys, user, l.config.ReviewModel, l.config.ReflectModel, l.config.PlanModel)
-	if err != nil {
-		return nil, usage, err
-	}
-	findings, err := parseFindings(text)
-	return findings, usage, err
-}
-
-// ValidateFinding 对一个 finding 进行证据校验，返回置信度评分 + token 用量。
-// 这是 Reflexion 的核心：从二元判断升级为定量评分。
-// 返回：confidence, evidence, gaps, usage, error
-func (l *LLM) ValidateFinding(ctx context.Context, f Finding, funcBody, varDefs, callChain string) (float64, string, []string, LLMUsage, error) {
-	user := fmt.Sprintf(validatePrompt,
-		f.File, f.Line, f.Severity, f.Msg, f.Evidence,
-		funcBody, varDefs, callChain)
-
-	text, usage, err := l.chatWithFallback(ctx, "", user, l.config.ReviewModel, l.config.ReflectModel, l.config.PlanModel)
-	if err != nil {
-		return 0, "", nil, usage, err
-	}
-
-	var result struct {
-		Confidence float64  `json:"confidence"`
-		Evidence   string   `json:"evidence"`
-		Gaps       []string `json:"gaps"`
-	}
-	if err := json.Unmarshal([]byte(stripFence(text)), &result); err != nil {
-		return 0, "", nil, usage, fmt.Errorf("解析 validation: %w", err)
-	}
-
-	return result.Confidence, result.Evidence, result.Gaps, usage, nil
-}
-
-// GenerateCritique 对低可信度 finding 生成结构化批评，返回批评 + token 用量。
-// 批评用于指导下一轮审查（Reflexion 的 memory）。
-// 返回：reason, evidence, suggestion, usage, error
-func (l *LLM) GenerateCritique(ctx context.Context, f Finding, confidence float64, evidence string, gaps []string) (string, string, string, LLMUsage, error) {
-	user := fmt.Sprintf(critiquePrompt,
-		f.Severity, f.File, f.Line, f.Msg,
-		confidence*100, evidence, strings.Join(gaps, "; "))
-
-	text, usage, err := l.chatWithFallback(ctx, "", user, l.config.ReflectModel, l.config.ReviewModel, l.config.PlanModel)
-	if err != nil {
-		return "", "", "", usage, err
-	}
-
-	var result struct {
-		Reason     string `json:"reason"`
-		Evidence   string `json:"evidence"`
-		Suggestion string `json:"suggestion"`
-	}
-	if err := json.Unmarshal([]byte(stripFence(text)), &result); err != nil {
-		return "", "", "", usage, fmt.Errorf("解析 critique: %w", err)
-	}
-
-	return result.Reason, result.Evidence, result.Suggestion, usage, nil
 }
 
 func parseFindings(text string) ([]Finding, error) {

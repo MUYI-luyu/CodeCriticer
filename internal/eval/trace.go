@@ -8,21 +8,21 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/MUYI-luyu/codecritic/internal/agent"
 	"github.com/MUYI-luyu/codecritic/internal/review"
+	"github.com/MUYI-luyu/codecritic/internal/workflow"
 )
 
 // EvalTrace 是单个评测用例的离线观测快照。
-// 它把「ground-truth、baseline 产出、Reflexion 完整轨迹、阶段归因」聚在一份 JSON 里，
+// 它把「ground-truth、Workflow 产出、阶段归因」聚在一份 JSON 里，
 // 让 31 例自伤 / 19 例真漏这类问题可以事后逐阶段回看，而不是黑盒。
 type EvalTrace struct {
 	Name             string           `json:"name"`
 	Bugs             []Bug            `json:"bugs"`              // ground-truth
-	BaselineFindings []review.Finding `json:"baseline_findings"` // 无 Reflexion 的单次产出
-	Reflex           *agent.Result    `json:"reflex"`            // Reflexion 全轨迹（含每轮 RecalledDocs）
-	Attributions     []BugAttribution `json:"attributions"`      // 对末轮 attempt 的阶段归因
-	Dimension        *CaseDimension   `json:"dimension"`         // 运行时计算的维度（Scale/Scope）
-	CostSummary      CostSummary      `json:"cost_summary"`      // 本 case 的 token 成本汇总
+	BaselineFindings []review.Finding `json:"baseline_findings"`
+	Workflow         *workflow.Trace  `json:"workflow"`
+	Attributions     []BugAttribution `json:"attributions"` // 对末轮 attempt 的阶段归因
+	Dimension        *CaseDimension   `json:"dimension"`    // 运行时计算的维度（Scale/Scope）
+	CostSummary      CostSummary      `json:"cost_summary"` // 本 case 的 token 成本汇总
 }
 
 // SaveTrace 把一份 EvalTrace 持久化成 <dir>/<name>.json。
@@ -75,7 +75,7 @@ func (c AttributionCounts) Total() int {
 // Print 打印阶段归因分布表到 w。
 func (c AttributionCounts) Print(w io.Writer) {
 	total := c.Total()
-	fmt.Fprintln(w, "\n=== 阶段归因分布（Reflexion 末轮）===")
+	fmt.Fprintln(w, "\n=== 阶段归因分布（Workflow）===")
 	fmt.Fprintf(w, "%-12s %8s %8s\n", "阶段", "数量", "占比")
 	rows := []struct {
 		label string

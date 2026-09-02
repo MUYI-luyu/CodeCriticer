@@ -1,15 +1,3 @@
-
-
-
-
-
-
-
-
-
-
-
-
 package kubernetes62464
 
 import (
@@ -79,19 +67,6 @@ func NewPolicyAndManager() (*staticPolicy, *manager) {
 	p := &staticPolicy{}
 	return p, m
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 func TestKubernetes62464(t *testing.T) {
 	p, m := NewPolicyAndManager()

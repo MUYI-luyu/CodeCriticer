@@ -1,15 +1,3 @@
-
-
-
-
-
-
-
-
-
-
-
-
 package cockroach10790
 
 import (
@@ -66,7 +54,6 @@ func (r *Replica) beginCmds(ctx context.Context) {
 	}
 }
 
-
 func (r *Replica) sendChans(ctx context.Context) {
 	for _, ch := range r.chans {
 		select {
@@ -87,18 +74,6 @@ func NewReplica() *Replica {
 	r.chans = append(r.chans, make(chan bool))
 	return r
 }
-
-
-
-
-
-
-
-
-
-
-
-
 
 func TestCockroach10790(t *testing.T) {
 	r := NewReplica()

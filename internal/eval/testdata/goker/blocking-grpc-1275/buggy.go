@@ -1,20 +1,3 @@
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 package grpc1275
 
 import (
@@ -54,8 +37,6 @@ type http2Client struct{}
 
 func (t *http2Client) CloseStream(s *Stream) {
 
-
-
 }
 
 func (t *http2Client) NewStream() *Stream {
@@ -88,17 +69,6 @@ func testInflightStreamClosing() {
 	case <-timeout.C:
 	}
 }
-
-
-
-
-
-
-
-
-
-
-
 
 func TestGrpc1293(t *testing.T) {
 	testInflightStreamClosing()

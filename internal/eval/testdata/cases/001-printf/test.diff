@@ -1,0 +1,9 @@
+--- buggy.go	2026-08-16 23:20:11.756810332 +0800
++++ fixed.go	2026-08-16 23:20:11.758810356 +0800
+@@ -4,5 +4,5 @@
+ 
+ func main() {
+ 	name := "world"
+-	fmt.Printf("%d\n", name) // BUG: 格式化动词 %d 用于字符串，应为 %s
++	fmt.Printf("%s\n", name)
+ }

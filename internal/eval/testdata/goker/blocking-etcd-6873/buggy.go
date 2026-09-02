@@ -1,10 +1,3 @@
-
-
-
-
-
-
-
 package etcd6873
 
 import (
@@ -52,21 +45,6 @@ func (wbs *watchBroadcasts) update(wb *watchBroadcast) {
 	default:
 	}
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 func TestEtcd(t *testing.T) {
 	wbs := newWatchBroadcasts()

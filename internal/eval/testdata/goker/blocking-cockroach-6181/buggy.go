@@ -1,10 +1,3 @@
-
-
-
-
-
-
-
 package cockroach6181
 
 import (
@@ -62,24 +55,6 @@ func testRangeCacheCoalescedRquests() {
 	}
 	pauseLookupResumeAndAssert()
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 func TestCockroach6181(t *testing.T) {
 	go testRangeCacheCoalescedRquests()

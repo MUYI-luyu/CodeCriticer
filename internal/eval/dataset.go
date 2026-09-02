@@ -26,11 +26,11 @@ type Location struct {
 
 // GroundTruth 是缺陷的完整标注（单一事实来源）。
 type GroundTruth struct {
-	Primary  Location   `json:"primary"`              // 主缺陷位置
-	Related  []Location `json:"related,omitempty"`    // 相关位置（多位置证据链）
-	Symbols  []string   `json:"symbols,omitempty"`    // 涉及的符号（函数/变量名）
-	BugTypes []string   `json:"bug_types,omitempty"`  // Bug 类型（可多标签）
-	Evidence string     `json:"evidence,omitempty"`   // 人工标注的关键证据
+	Primary  Location   `json:"primary"`             // 主缺陷位置
+	Related  []Location `json:"related,omitempty"`   // 相关位置（多位置证据链）
+	Symbols  []string   `json:"symbols,omitempty"`   // 涉及的符号（函数/变量名）
+	BugTypes []string   `json:"bug_types,omitempty"` // Bug 类型（可多标签）
+	Evidence string     `json:"evidence,omitempty"`  // 人工标注的关键证据
 }
 
 // Metadata 是数据集原始提供的元信息（不可变事实）。

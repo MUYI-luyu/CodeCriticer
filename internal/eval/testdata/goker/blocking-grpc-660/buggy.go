@@ -1,12 +1,3 @@
-
-
-
-
-
-
-
-
-
 package grpc660
 
 import (
@@ -35,16 +26,6 @@ func (bc *benchmarkClient) doCloseLoopUnary() {
 		}
 	}
 }
-
-
-
-
-
-
-
-
-
-
 
 func TestGrpc660(t *testing.T) {
 	bc := &benchmarkClient{

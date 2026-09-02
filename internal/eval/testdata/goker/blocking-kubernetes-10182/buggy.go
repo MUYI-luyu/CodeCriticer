@@ -1,14 +1,3 @@
-
-
-
-
-
-
-
-
-
-
-
 package kubernetes10182
 
 import (
@@ -50,20 +39,6 @@ func NewStatusManager() *statusManager {
 		podStatusChannel: make(chan bool),
 	}
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 func TestKubernetes10182(t *testing.T) {
 	s := NewStatusManager()

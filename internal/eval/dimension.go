@@ -7,10 +7,10 @@ import (
 // CaseDimension 是运行时计算的派生维度（不存储在 Case 中）。
 type CaseDimension struct {
 	// Scale
-	RepoLOC     int    `json:"repo_loc"`      // Case.Repo 的行数
-	DiffLOC     int    `json:"diff_loc"`      // diff 修改行数（changed lines）
-	RelevantLOC int    `json:"relevant_loc"`  // GT 相关代码行数
-	ScaleLabel  string `json:"scale_label"`   // "100_LOC" / "1K_LOC" / ...
+	RepoLOC     int    `json:"repo_loc"`     // Case.Repo 的行数
+	DiffLOC     int    `json:"diff_loc"`     // diff 修改行数（changed lines）
+	RelevantLOC int    `json:"relevant_loc"` // GT 相关代码行数
+	ScaleLabel  string `json:"scale_label"`  // "100_LOC" / "1K_LOC" / ...
 
 	// Scope
 	Files      int    `json:"files"`

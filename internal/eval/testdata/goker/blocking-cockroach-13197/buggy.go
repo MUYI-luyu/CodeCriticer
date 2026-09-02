@@ -1,12 +1,3 @@
-
-
-
-
-
-
-
-
-
 package cockroach13197
 
 import (
@@ -46,12 +37,6 @@ func (tx *Tx) rollback() {
 func (tx *Tx) close() {
 	tx.cancel()
 }
-
-
-
-
-
-
 
 func TestCockroach13197(t *testing.T) {
 	db := &DB{}

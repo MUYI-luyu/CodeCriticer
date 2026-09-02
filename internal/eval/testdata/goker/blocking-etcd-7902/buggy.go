@@ -1,20 +1,3 @@
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 package etcd7902
 
 import (
@@ -72,25 +55,6 @@ func doRounds(rcs []roundClient, rounds int) {
 	}
 	wg.Wait()
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 func TestEtcd7902(t *testing.T) {
 	go runElectionFunc()

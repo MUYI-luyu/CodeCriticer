@@ -1,11 +1,12 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"strings"
 
-	"github.com/MUYI-luyu/codecritic/internal/agent"
+	"github.com/MUYI-luyu/codecritic/internal/workflow"
 )
 
 func cmdReplay(args []string) {
@@ -14,119 +15,33 @@ func cmdReplay(args []string) {
 		usage()
 		os.Exit(1)
 	}
-
-	tracePath := args[0]
-	var outputPath string
-	var comparePath string
-
-	// 解析参数
-	for i := 1; i < len(args); i++ {
-		switch {
-		case args[i] == "--output" && i+1 < len(args):
-			outputPath, i = args[i+1], i+1
-		case strings.HasPrefix(args[i], "--output="):
-			outputPath = strings.TrimPrefix(args[i], "--output=")
-		case args[i] == "--compare" && i+1 < len(args):
-			comparePath, i = args[i+1], i+1
-		case strings.HasPrefix(args[i], "--compare="):
-			comparePath = strings.TrimPrefix(args[i], "--compare=")
-		}
-	}
-
-	// 对比模式
-	if comparePath != "" {
-		if err := runCompare(tracePath, comparePath); err != nil {
-			fmt.Fprintf(os.Stderr, "对比失败: %v\n", err)
-			os.Exit(1)
-		}
-		return
-	}
-
-	// 单个 trace 分析
-	analysis, err := agent.AnalyzeTrace(tracePath)
+	data, err := os.ReadFile(args[0])
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "分析失败: %v\n", err)
+		fmt.Fprintf(os.Stderr, "读取失败: %v\n", err)
 		os.Exit(1)
 	}
-
-	// 打印分析结果
-	fmt.Print(agent.FormatAnalysis(analysis))
-
-	// 保存到文件（可选）
-	if outputPath != "" {
-		if err := agent.SaveAnalysis(analysis, outputPath); err != nil {
-			fmt.Fprintf(os.Stderr, "警告: 保存分析结果失败: %v\n", err)
-		} else {
-			fmt.Printf("\n分析结果已保存: %s\n", outputPath)
-		}
+	var trace workflow.Trace
+	if err := json.Unmarshal(data, &trace); err != nil {
+		fmt.Fprintf(os.Stderr, "解析失败: %v\n", err)
+		os.Exit(1)
 	}
-}
-
-func runCompare(trace1Path, trace2Path string) error {
-	analyses, err := agent.CompareTraces([]string{trace1Path, trace2Path})
-	if err != nil {
-		return err
+	fmt.Printf("Trace: %s\nStopReason: %s\nDuration: %v\n", trace.ID, trace.StopReason, trace.Duration)
+	fmt.Printf("Plan:\n  files: %s\n  symbols: %s\n  questions: %s\n  keywords: %s\n", strings.Join(trace.Plan.TargetFiles, ", "), strings.Join(trace.Plan.Symbols, ", "), strings.Join(trace.Plan.Questions, " | "), strings.Join(trace.Plan.Keywords, ", "))
+	fmt.Printf("ToolCalls: %d\n", len(trace.ToolCalls))
+	for i, c := range trace.ToolCalls {
+		fmt.Printf("  %d. %s args=%v evidence=%v error=%s\n", i+1, c.Tool, c.Args, c.EvidenceIDs, c.Error)
 	}
-
-	if len(analyses) != 2 {
-		return fmt.Errorf("对比需要 2 个 trace，实际得到 %d 个", len(analyses))
+	fmt.Printf("Evidence: %d\n", len(trace.Evidence))
+	for _, e := range trace.Evidence {
+		fmt.Printf("  %s %s:%d [%s]\n", e.ID, e.File, e.Line, e.Type)
 	}
-
-	fmt.Println("=== Trace 对比 ===")
-	fmt.Println()
-
-	// Trace 1
-	fmt.Printf("Trace 1: %s\n", analyses[0].TraceID)
-	fmt.Printf("  轮次: %d\n", analyses[0].TotalRounds)
-	fmt.Printf("  收敛: %v (%s)\n", analyses[0].Convergence.Converged, analyses[0].Convergence.Reason)
-	fmt.Printf("  耗时: %v\n", analyses[0].Performance.TotalDuration)
-	fmt.Printf("  最终 findings: %d (高置信度: %d)\n",
-		analyses[0].Quality.FinalFindingsCount,
-		analyses[0].Quality.HighConfidenceCount)
-	if analyses[0].ToolUsage.TotalCalls > 0 {
-		fmt.Printf("  工具调用: %d 次\n", analyses[0].ToolUsage.TotalCalls)
+	fmt.Printf("Findings: %d\n", len(trace.Findings))
+	for i, f := range trace.Findings {
+		fmt.Printf("  %d. [%s] %s:%d %s\n", i+1, f.Severity, f.File, f.Line, f.Msg)
 	}
-	fmt.Println()
-
-	// Trace 2
-	fmt.Printf("Trace 2: %s\n", analyses[1].TraceID)
-	fmt.Printf("  轮次: %d\n", analyses[1].TotalRounds)
-	fmt.Printf("  收敛: %v (%s)\n", analyses[1].Convergence.Converged, analyses[1].Convergence.Reason)
-	fmt.Printf("  耗时: %v\n", analyses[1].Performance.TotalDuration)
-	fmt.Printf("  最终 findings: %d (高置信度: %d)\n",
-		analyses[1].Quality.FinalFindingsCount,
-		analyses[1].Quality.HighConfidenceCount)
-	if analyses[1].ToolUsage.TotalCalls > 0 {
-		fmt.Printf("  工具调用: %d 次\n", analyses[1].ToolUsage.TotalCalls)
+	fmt.Printf("Validations: %d\n", len(trace.Validations))
+	for _, v := range trace.Validations {
+		fmt.Printf("  %d. accepted=%v confidence=%.2f reason=%s\n", v.FindingIndex+1, v.Accepted, v.Confidence, v.Reason)
 	}
-	fmt.Println()
-
-	// 差异对比
-	fmt.Println("=== 差异分析 ===")
-	roundsDiff := analyses[1].TotalRounds - analyses[0].TotalRounds
-	if roundsDiff != 0 {
-		fmt.Printf("轮次差异: %+d\n", roundsDiff)
-	}
-
-	timeDiff := analyses[1].Performance.TotalDuration - analyses[0].Performance.TotalDuration
-	if timeDiff != 0 {
-		fmt.Printf("耗时差异: %+v\n", timeDiff)
-	}
-
-	findingsDiff := analyses[1].Quality.FinalFindingsCount - analyses[0].Quality.FinalFindingsCount
-	if findingsDiff != 0 {
-		fmt.Printf("Findings 差异: %+d\n", findingsDiff)
-	}
-
-	confDiff := analyses[1].Quality.HighConfidenceCount - analyses[0].Quality.HighConfidenceCount
-	if confDiff != 0 {
-		fmt.Printf("高置信度差异: %+d\n", confDiff)
-	}
-
-	if analyses[0].ToolUsage.TotalCalls > 0 || analyses[1].ToolUsage.TotalCalls > 0 {
-		toolDiff := analyses[1].ToolUsage.TotalCalls - analyses[0].ToolUsage.TotalCalls
-		fmt.Printf("工具调用差异: %+d\n", toolDiff)
-	}
-
-	return nil
+	fmt.Printf("LLMCalls: %d tokens=%d (prompt=%d completion=%d)\n", len(trace.LLMCalls), trace.Usage.TotalTokens, trace.Usage.PromptTokens, trace.Usage.CompletionTokens)
 }

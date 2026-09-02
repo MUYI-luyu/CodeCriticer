@@ -1,14 +1,3 @@
-
-
-
-
-
-
-
-
-
-
-
 package moby4395
 
 import (
@@ -23,14 +12,6 @@ func Go(f func() error) chan error {
 	}()
 	return ch
 }
-
-
-
-
-
-
-
-
 
 func TestMoby4395(t *testing.T) {
 	Go(func() error {

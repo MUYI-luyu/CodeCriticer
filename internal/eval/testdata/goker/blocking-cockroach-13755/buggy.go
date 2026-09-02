@@ -1,14 +1,3 @@
-
-
-
-
-
-
-
-
-
-
-
 package cockroach13755
 
 import (
@@ -33,12 +22,6 @@ func (rs *Rows) awaitDone(ctx context.Context) {
 func (rs *Rows) close(err error) {
 
 }
-
-
-
-
-
-
 
 func TestCockroach13755(t *testing.T) {
 	rs := &Rows{}

@@ -9,33 +9,25 @@ import (
 	"path/filepath"
 	"sync"
 
-	"github.com/MUYI-luyu/codecritic/internal/agent"
 	"github.com/MUYI-luyu/codecritic/internal/review"
+	"github.com/MUYI-luyu/codecritic/internal/workflow"
 )
 
-const tol = 3 // 定位容差（行）
-
-// DefaultConcurrency 是默认并发 case 数（受 LLM 限流约束，保守取值）。
+const tol = 3
 const DefaultConcurrency = 4
 
-// caseResult 是单个 case 评测的产出，供并发收集后串行汇总。
 type caseResult struct {
 	name    string
-	base    Metrics
-	reflex  Metrics
-	attrs   []BugAttribution // 末轮阶段归因（供分布汇总）
-	output  string           // verbose trace 或单行摘要（原子打印，避免交错）
+	metrics Metrics
+	attrs   []BugAttribution
+	output  string
 	err     error
 }
 
-// Run 跑全量评测，对比 Baseline（无 Reflexion）vs Reflexion Agent。
-// concurrency<=0 时取 DefaultConcurrency。
 func Run(ctx context.Context, llm *review.LLM, datasetDir string, verbose bool) error {
 	return RunConcurrent(ctx, llm, datasetDir, verbose, DefaultConcurrency, "")
 }
 
-// RunConcurrent 以指定并发度跑评测。case 之间相互独立，可安全并发。
-// traceDir 非空时，把每个 case 的 EvalTrace 持久化成 JSON（离线观测用）；为空则只做内存归因。
 func RunConcurrent(ctx context.Context, llm *review.LLM, datasetDir string, verbose bool, concurrency int, traceDir string) error {
 	cases, err := Load(datasetDir)
 	if err != nil {
@@ -51,16 +43,14 @@ func RunConcurrent(ctx context.Context, llm *review.LLM, datasetDir string, verb
 		concurrency = len(cases)
 	}
 	if traceDir != "" {
-		if err := os.MkdirAll(traceDir, 0o755); err != nil {
-			return fmt.Errorf("创建 trace 目录失败: %w", err)
+		if err := os.MkdirAll(traceDir, 0755); err != nil {
+			return err
 		}
 	}
-
 	jobs := make(chan *Case)
 	results := make(chan caseResult)
-
 	var wg sync.WaitGroup
-	for w := 0; w < concurrency; w++ {
+	for i := 0; i < concurrency; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -69,311 +59,87 @@ func RunConcurrent(ctx context.Context, llm *review.LLM, datasetDir string, verb
 			}
 		}()
 	}
-
 	go func() {
+		defer close(jobs)
 		for _, c := range cases {
 			jobs <- c
 		}
-		close(jobs)
 	}()
-
-	go func() {
-		wg.Wait()
-		close(results)
-	}()
-
-	var base, reflexion Metrics
-	var attrCounts AttributionCounts
-	var failed, done int
-	total := len(cases)
-	for res := range results {
+	go func() { wg.Wait(); close(results) }()
+	var total Metrics
+	var attrs AttributionCounts
+	done := 0
+	for r := range results {
 		done++
-		if res.err != nil {
-			fmt.Printf("[%d/%d] %s\n", done, total, res.output)
-			failed++
+		if r.err != nil {
+			fmt.Printf("[%d/%d] %s\n", done, len(cases), r.output)
 			continue
 		}
-		base = base.Add(res.base)
-		reflexion = reflexion.Add(res.reflex)
-		attrCounts = attrCounts.Add(res.attrs)
-		// 原子打印单个 case 的完整输出（worker 内已拼好）
-		fmt.Printf("[%d/%d] %s", done, total, res.output)
+		total = total.Add(r.metrics)
+		attrs = attrs.Add(r.attrs)
+		fmt.Printf("[%d/%d] %s", done, len(cases), r.output)
 	}
-
-	if failed > 0 {
-		fmt.Printf("\n%d 个用例失败（已跳过，不打断整体评测）\n", failed)
-	}
-
-	fmt.Println()
-	fmt.Printf("%-12s %10s %10s %8s %10s\n", "", "Recall", "Precision", "FP", "误报率")
-	fmt.Printf("%-12s %9.0f%% %10.0f%% %8d %9.0f%%\n", "Baseline", pct(base.Recall()), pct(base.Precision()), base.False, pct(base.FPRate()))
-	fmt.Printf("%-12s %9.0f%% %10.0f%% %8d %9.0f%%\n", "Reflexion", pct(reflexion.Recall()), pct(reflexion.Precision()), reflexion.False, pct(reflexion.FPRate()))
-
-	attrCounts.Print(os.Stdout)
-	if traceDir != "" {
-		fmt.Printf("\nTrace 已写入: %s\n", traceDir)
-	}
+	fmt.Printf("\n%-12s %10s %10s %8s %10s\n", "Workflow", "Recall", "Precision", "FP", "误报率")
+	fmt.Printf("%-12s %9.0f%% %10.0f%% %8d %9.0f%%\n", "Workflow", pct(total.Recall()), pct(total.Precision()), total.False, pct(total.FPRate()))
+	attrs.Print(os.Stdout)
 	return nil
 }
 
-// runCase 跑单个 case 的 baseline + reflexion，输出拼进 buffer 由调用方原子打印。
-// traceDir 非空时把本 case 的 EvalTrace 落盘。
 func runCase(ctx context.Context, llm *review.LLM, c *Case, verbose bool, traceDir string) caseResult {
 	repo, err := materialize(c)
 	if err != nil {
 		return caseResult{name: c.Name, err: err, output: fmt.Sprintf("%-16s materialize 失败: %v", c.Name, err)}
 	}
 	defer os.RemoveAll(repo)
-
-	// Baseline: 单次 Plan-and-Execute（无 Reflexion）
-	baseRes, err := review.Analyze(ctx, llm, repo, c.Diff)
+	wf, err := workflow.New(llm, repo)
 	if err != nil {
-		return caseResult{name: c.Name, err: err, output: fmt.Sprintf("%-16s baseline 失败: %v", c.Name, err)}
+		return caseResult{name: c.Name, err: err, output: fmt.Sprintf("%-16s workflow 创建失败: %v", c.Name, err)}
 	}
-	baseFindings := append(append([]review.Finding{}, baseRes.Rules...), baseRes.LLM...)
-	b := Compute(c.Bugs(), baseFindings, tol)
-
-	// Reflexion Agent: 完整的 Reflexion Loop
-	reflexAgent, err := agent.New(llm, repo, agent.WithMaxAttempts(3))
-	if err != nil {
-		return caseResult{name: c.Name, err: err, output: fmt.Sprintf("%-16s agent 创建失败: %v", c.Name, err)}
+	res, err := wf.Run(ctx, workflow.Request{Repo: repo, Diff: c.Diff})
+	if err != nil || res == nil || res.Trace == nil {
+		return caseResult{name: c.Name, err: err, output: fmt.Sprintf("%-16s workflow 失败: %v", c.Name, err)}
 	}
-
-	// 从 Impact 提取 Sym 列表
-	syms := make([]review.Sym, len(baseRes.Impact))
-	for i, imp := range baseRes.Impact {
-		syms[i] = review.Sym{Name: imp.Symbol, File: ""} // File 从 Caller 中提取
-		if len(imp.Callers) > 0 {
-			syms[i].File = imp.Callers[0].File
-		}
-	}
-
-	reflexResult, err := reflexAgent.Review(ctx, c.Diff, syms)
-	if err != nil {
-		return caseResult{name: c.Name, err: err, output: fmt.Sprintf("%-16s reflexion 失败: %v", c.Name, err)}
-	}
-	r := Compute(c.Bugs(), reflexResult.FinalFindings, tol)
-
-	// 计算维度（Scale/Scope）
+	t := res.Trace
+	m := Compute(c.Bugs(), t.Findings, tol)
+	attrs := Attribute(c.Bugs(), t, tol)
+	cost := ComputeCost(t)
 	dim := ComputeDimension(c)
-
-	// 计算 Cost
-	cost := ComputeCost(reflexResult)
-
-	// 阶段归因：针对 Reflexion 末轮 attempt，用 ground-truth 逐 bug 定位漏在哪一阶段。
-	var attrs []BugAttribution
-	if last := lastAttempt(reflexResult); last != nil {
-		attrs = Attribute(c.Bugs(), last, tol)
-	}
-
-	// 落盘 EvalTrace（可选）：把 ground-truth + baseline + 全轨迹 + 归因聚成一份 JSON。
 	if traceDir != "" {
-		if err := SaveTrace(traceDir, EvalTrace{
-			Name:             c.Name,
-			Bugs:             c.Bugs(),
-			BaselineFindings: baseFindings,
-			Reflex:           reflexResult,
-			Attributions:     attrs,
-			Dimension:        &dim,
-			CostSummary:      cost,
-		}); err != nil {
-			// trace 落盘失败不应打断评测，降级为在输出里标注。
-			fmt.Fprintf(os.Stderr, "warn: 写 trace 失败 %s: %v\n", c.Name, err)
-		}
+		_ = SaveTrace(traceDir, EvalTrace{Name: c.Name, Bugs: c.Bugs(), BaselineFindings: t.Findings, Workflow: t, Attributions: attrs, Dimension: &dim, CostSummary: cost})
 	}
-
-	var buf bytes.Buffer
+	var b bytes.Buffer
 	if verbose {
-		printDetailedTrace(&buf, c.Name, reflexResult, baseFindings, c.Bugs(), &dim, cost, tol)
+		printWorkflowTrace(&b, c.Name, t, cost)
 	} else {
-		fmt.Fprintf(&buf, "%-16s bug=%d scale=%s scope=%s cost=%dtok baseline[F=%d hit=%d fp=%d] reflex[F=%d hit=%d fp=%d r=%d]\n",
-			c.Name, len(c.Bugs()), dim.ScaleLabel, dim.ScopeLabel, cost.TotalTokens,
-			b.Findings, b.Found, b.False,
-			r.Findings, r.Found, r.False,
-			len(reflexResult.Attempts))
+		fmt.Fprintf(&b, "%-20s bugs=%d findings=%d hit=%d fp=%d cost=%dtok\n", c.Name, len(c.Bugs()), m.Findings, m.Found, m.False, cost.TotalTokens)
 	}
-
-	return caseResult{name: c.Name, base: b, reflex: r, attrs: attrs, output: buf.String()}
+	return caseResult{name: c.Name, metrics: m, attrs: attrs, output: b.String()}
 }
 
-// lastAttempt 返回 Reflexion 的末轮 attempt（无则 nil）。归因以最终采纳的那轮为准。
-func lastAttempt(r *agent.Result) *agent.Attempt {
-	if r == nil || len(r.Attempts) == 0 {
-		return nil
-	}
-	return &r.Attempts[len(r.Attempts)-1]
-}
-
-// materialize 把用例写成临时仓库，返回仓库路径。
 func materialize(c *Case) (string, error) {
 	dir, err := os.MkdirTemp("", "cceval")
 	if err != nil {
 		return "", err
 	}
-	if err := os.WriteFile(filepath.Join(dir, "go.mod"), []byte("module example.com/eval\n\ngo 1.22\n"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "go.mod"), []byte("module example.com/eval\n\ngo 1.22\n"), 0644); err != nil {
 		return "", err
 	}
 	for name, content := range c.Repo {
 		full := filepath.Join(dir, name)
-		if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+		if err := os.MkdirAll(filepath.Dir(full), 0755); err != nil {
 			return "", err
 		}
-		if err := os.WriteFile(full, []byte(content), 0o644); err != nil {
+		if err := os.WriteFile(full, []byte(content), 0644); err != nil {
 			return "", err
 		}
 	}
 	return dir, nil
 }
-
 func pct(f float64) float64 { return f * 100 }
-
-// printDetailedTrace 打印详细的 Agent 执行轨迹（三层输出）到 w。
-func printDetailedTrace(w io.Writer, caseName string, result *agent.Result, baselineFindings []review.Finding, bugs []Bug, dim *CaseDimension, cost CostSummary, tol int) {
-	fmt.Fprintf(w, "\n=== Case: %s ===\n\n", caseName)
-
-	// Dimension & Cost
-	if dim != nil {
-		fmt.Fprintln(w, "=== Dimension ===")
-		fmt.Fprintf(w, "Scale:         %s (RepoLOC=%d, DiffLOC=%d)\n", dim.ScaleLabel, dim.RepoLOC, dim.DiffLOC)
-		fmt.Fprintf(w, "Scope:         %s (Files=%d, Packages=%d)\n\n", dim.ScopeLabel, dim.Files, dim.Packages)
-	}
-
-	fmt.Fprintln(w, "=== Cost ===")
-	fmt.Fprintf(w, "Total Tokens:  %d (prompt=%d, completion=%d)\n", cost.TotalTokens, cost.TotalPromptTokens, cost.TotalCompletionTokens)
-	fmt.Fprintf(w, "Rounds:        %d\n\n", cost.Rounds)
-
-	// Layer 2: Agent Trace
-	fmt.Fprintln(w, "\n=== Agent Trace ===")
-	for _, att := range result.Attempts {
-		fmt.Fprintf(w, "[Round %d] Duration: %v\n\n", att.Round, att.Duration)
-
-		// Tool Calls
-		if len(att.ToolCalls) > 0 {
-			fmt.Fprintln(w, "Tool Calls:")
-			for i, tc := range att.ToolCalls {
-				fmt.Fprintf(w, "  #%d %s\n", i+1, tc.Tool)
-				if len(tc.Args) > 0 {
-					fmt.Fprintf(w, "      args: %v\n", formatJSON(tc.Args, 100))
-				}
-				if tc.Result != nil {
-					fmt.Fprintf(w, "      result: %v\n", formatJSON(tc.Result, 100))
-				}
-				if tc.Error != "" {
-					fmt.Fprintf(w, "      error: %s\n", tc.Error)
-				}
-			}
-			fmt.Fprintln(w)
-		}
-
-		// Findings
-		fmt.Fprintf(w, "Findings: %d\n", len(att.Findings))
-		for i, f := range att.Findings {
-			fmt.Fprintf(w, "  F%d [%s] %s:%d\n", i+1, f.Severity, f.File, f.Line)
-			fmt.Fprintf(w, "      %s\n", truncate(f.Msg, 80))
-		}
-		fmt.Fprintln(w)
-
-		// Validations
-		fmt.Fprintf(w, "Validations: %d\n", len(att.Validations))
-		for _, v := range att.Validations {
-			status := "PASS"
-			if v.Confidence < agent.ConfidenceThreshold {
-				status = "REJECT"
-			}
-			fmt.Fprintf(w, "  F%d → %s (conf=%.2f)\n", v.FindingID+1, status, v.Confidence)
-			if len(v.Gaps) > 0 {
-				fmt.Fprintf(w, "      gaps: %s\n", truncate(fmt.Sprint(v.Gaps), 80))
-			}
-		}
-		fmt.Fprintln(w)
-
-		// Critiques
-		if len(att.Critiques) > 0 {
-			fmt.Fprintf(w, "Critiques: %d\n", len(att.Critiques))
-			for _, c := range att.Critiques {
-				fmt.Fprintf(w, "  F%d: %s\n", c.FindingID+1, truncate(c.Reason, 80))
-				fmt.Fprintf(w, "      suggestion: %s\n", truncate(c.Suggestion, 80))
-			}
-			fmt.Fprintln(w)
-		}
-
-		if att.Error != "" {
-			fmt.Fprintf(w, "Error: %s\n\n", att.Error)
-		}
-	}
-
-	// Layer 3: Runtime Metrics
-	fmt.Fprintln(w, "\n=== Runtime Metrics ===")
-
-	var totalTools int
-	toolCount := make(map[string]int)
-	for _, att := range result.Attempts {
-		totalTools += len(att.ToolCalls)
-		for _, tc := range att.ToolCalls {
-			toolCount[tc.Tool]++
-		}
-	}
-
-	fmt.Fprintf(w, "Rounds:        %d\n", len(result.Attempts))
-	fmt.Fprintf(w, "Converged:     %v (%s)\n", result.Converged, result.Reason)
-	fmt.Fprintf(w, "Total Time:    %v\n", result.TotalDuration)
-	fmt.Fprintf(w, "Tool Calls:    %d\n", totalTools)
-	if len(toolCount) > 0 {
-		fmt.Fprintln(w, "Tool Usage:")
-		for tool, count := range toolCount {
-			fmt.Fprintf(w, "  %-20s %d\n", tool, count)
-		}
+func printWorkflowTrace(w io.Writer, name string, t *workflow.Trace, cost CostSummary) {
+	fmt.Fprintf(w, "\n=== Case: %s ===\nStopReason: %s\nDuration: %v\nLLM Calls: %d\nTool Calls: %d\nTokens: %d\nPlan files=%v symbols=%v questions=%d keywords=%d\nFindings: %d Validations: %d\n", name, t.StopReason, t.Duration, len(t.LLMCalls), len(t.ToolCalls), cost.TotalTokens, t.Plan.TargetFiles, t.Plan.Symbols, len(t.Plan.Questions), len(t.Plan.Keywords), len(t.Findings), len(t.Validations))
+	for i, f := range t.Findings {
+		fmt.Fprintf(w, "  F%d [%s] %s:%d %s\n", i+1, f.Severity, f.File, f.Line, f.Msg)
 	}
 	fmt.Fprintln(w)
-
-	// Layer 1: Summary
-	fmt.Fprintln(w, "\n=== Summary ===")
-
-	baseMetrics := Compute(bugs, baselineFindings, tol)
-	reflexMetrics := Compute(bugs, result.FinalFindings, tol)
-
-	fmt.Fprintf(w, "Bug Count:     %d\n\n", len(bugs))
-
-	fmt.Fprintln(w, "Baseline:")
-	fmt.Fprintf(w, "  Findings:    %d\n", baseMetrics.Findings)
-	fmt.Fprintf(w, "  Hit:         %d\n", baseMetrics.Found)
-	fmt.Fprintf(w, "  FP:          %d\n", baseMetrics.False)
-	fmt.Fprintf(w, "  Recall:      %.0f%%\n", pct(baseMetrics.Recall()))
-	fmt.Fprintf(w, "  Precision:   %.0f%%\n\n", pct(baseMetrics.Precision()))
-
-	fmt.Fprintln(w, "Reflexion:")
-	fmt.Fprintf(w, "  Findings:    %d\n", reflexMetrics.Findings)
-	fmt.Fprintf(w, "  Hit:         %d\n", reflexMetrics.Found)
-	fmt.Fprintf(w, "  FP:          %d\n", reflexMetrics.False)
-	fmt.Fprintf(w, "  Recall:      %.0f%%\n", pct(reflexMetrics.Recall()))
-	fmt.Fprintf(w, "  Precision:   %.0f%%\n\n", pct(reflexMetrics.Precision()))
-
-	fmt.Fprintln(w, "Final Findings:")
-	for i, f := range result.FinalFindings {
-		isHit := false
-		for _, bug := range bugs {
-			if f.File == bug.File && abs(f.Line-bug.Line) <= tol {
-				isHit = true
-				break
-			}
-		}
-		marker := "FP"
-		if isHit {
-			marker = "HIT"
-		}
-		fmt.Fprintf(w, "  [%s] F%d %s:%d - %s\n", marker, i+1, f.File, f.Line, truncate(f.Msg, 60))
-	}
-	fmt.Fprintln(w)
-}
-
-func truncate(s string, max int) string {
-	if len(s) <= max {
-		return s
-	}
-	return s[:max] + "..."
-}
-
-func formatJSON(v interface{}, max int) string {
-	s := fmt.Sprintf("%v", v)
-	return truncate(s, max)
 }

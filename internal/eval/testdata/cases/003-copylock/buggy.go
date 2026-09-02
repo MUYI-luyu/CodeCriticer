@@ -1,14 +1,12 @@
 package main
 
-import "sync"
+import (
+	"fmt"
+	"sync"
+)
 
-type Config struct {
-	mu sync.Mutex
-	v  int
+func main() {
+	m := sync.Mutex{}
+	m2 := m // BUG: 按值复制锁会破坏互斥，应传指针
+	fmt.Println(m2)
 }
-
-func clone(c Config) Config { // BUG: 值传递拷贝了 sync.Mutex
-	return c
-}
-
-func main() {}

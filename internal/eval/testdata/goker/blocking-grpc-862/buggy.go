@@ -1,14 +1,3 @@
-
-
-
-
-
-
-
-
-
-
-
 package grpc862
 
 import (
@@ -85,14 +74,6 @@ func DialContext(ctx context.Context) (conn *ClientConn) {
 	}()
 	return conn
 }
-
-
-
-
-
-
-
-
 
 func TestGrpc862(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())

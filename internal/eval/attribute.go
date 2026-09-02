@@ -3,19 +3,19 @@ package eval
 import (
 	"path/filepath"
 
-	"github.com/MUYI-luyu/codecritic/internal/agent"
 	"github.com/MUYI-luyu/codecritic/internal/recall"
 	"github.com/MUYI-luyu/codecritic/internal/review"
+	"github.com/MUYI-luyu/codecritic/internal/workflow"
 )
 
-// BugStage 是一个 bug 在 Reflexion 流水线里的归因阶段。
+// BugStage 是一个 bug 在 Workflow 流水线里的归因阶段。
 type BugStage string
 
 const (
 	StageRecallMiss BugStage = "recall_miss" // 召回漏：召回上下文没覆盖 bug 行
-	StageLLMMiss    BugStage = "llm_miss"     // LLM漏：召回到了但 execute 阶段没报出
-	StageSelfHarm   BugStage = "self_harm"    // 自伤：execute 报了但被 validate 阈值丢弃
-	StageSuccess    BugStage = "success"      // 成功：execute 报了且 validate 保留
+	StageLLMMiss    BugStage = "llm_miss"    // LLM漏：召回到了但 execute 阶段没报出
+	StageSelfHarm   BugStage = "self_harm"   // 自伤：execute 报了但被 validate 阈值丢弃
+	StageSuccess    BugStage = "success"     // 成功：execute 报了且 validate 保留
 )
 
 // BugAttribution 是单个 bug 的阶段归因结果。
@@ -27,21 +27,25 @@ type BugAttribution struct {
 	ValidateKept bool     `json:"validate_kept"` // 命中的 finding 是否通过置信度阈值
 }
 
-// Attribute 用 ground-truth 对 Reflexion 某一轮 attempt 做阶段归因。
+// Attribute 用 ground-truth 对 Workflow trace 做阶段归因。
 // 对每个 bug 判定「召回是否覆盖 / execute 是否命中 / validate 是否保留」，
 // 机械地归类到 召回漏 / LLM漏 / 自伤 / 成功 四类。
-func Attribute(bugs []Bug, a *agent.Attempt, tol int) []BugAttribution {
+func Attribute(bugs []Bug, a *workflow.Trace, tol int) []BugAttribution {
 	out := make([]BugAttribution, 0, len(bugs))
 	for _, b := range bugs {
-		recallHit := recallCovers(a.RecalledDocs, b, tol)
+		var docs []recall.Doc
+		for _, e := range a.Evidence {
+			docs = append(docs, recall.Doc{File: e.File, Line: e.Line, Text: e.Content})
+		}
+		recallHit := recallCovers(docs, b, tol)
 		execIdx := executeHitIndex(b, a.Findings, tol)
 		execHit := execIdx >= 0
 
 		validateKept := false
 		if execHit {
 			for _, v := range a.Validations {
-				if v.FindingID == execIdx {
-					validateKept = v.Confidence >= agent.ConfidenceThreshold
+				if v.FindingIndex == execIdx {
+					validateKept = v.Accepted
 					break
 				}
 			}

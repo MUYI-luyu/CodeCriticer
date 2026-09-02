@@ -1,16 +1,3 @@
-
-
-
-
-
-
-
-
-
-
-
-
-
 package cockroach18101
 
 import (
@@ -40,18 +27,6 @@ func splitAndScatter(ctx context.Context, readyForImportCh chan bool) {
 		readyForImportCh <- (false || i != 0)
 	}
 }
-
-
-
-
-
-
-
-
-
-
-
-
 
 func TestCockroach18101(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())

@@ -1,1 +1,1 @@
-{"name": "ignored-error", "source": "忽略返回错误", "rule": "unusedresult"}
+{"name": "ignored-error", "source": "忽略 error 返回值", "rule": "unusedresult"}

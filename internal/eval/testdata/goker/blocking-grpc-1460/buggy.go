@@ -1,17 +1,3 @@
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 package grpc1460
 
 import (
@@ -49,15 +35,6 @@ func (t *http2Client) NewStream() {
 	}
 	t.mu.Unlock()
 }
-
-
-
-
-
-
-
-
-
 
 func TestGrpc1460(t *testing.T) {
 	client := &http2Client{

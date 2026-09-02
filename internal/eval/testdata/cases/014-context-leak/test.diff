@@ -1,0 +1,12 @@
+--- buggy.go	2026-08-23 01:21:45.524176848 +0800
++++ fixed.go	2026-08-22 22:41:21.964763077 +0800
+@@ -7,7 +7,8 @@
+ )
+ 
+ func Process(ctx context.Context) error {
+-	ctx, _ = context.WithTimeout(ctx, 5*time.Second) // BUG: 未调用 cancel
++	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
++	defer cancel()
+ 
+ 	result := make(chan string, 1)
+ 	go func() {

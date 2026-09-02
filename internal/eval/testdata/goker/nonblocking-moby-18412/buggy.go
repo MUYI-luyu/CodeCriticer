@@ -25,7 +25,6 @@ func RunCommandWithOutputForDuration(cmd *exec.Cmd, duration time.Duration) (out
 
 	done := make(chan error)
 
-
 	err = cmd.Start()
 	if err != nil {
 		err = fmt.Errorf("Fail to start command %v : %v", cmd, err)

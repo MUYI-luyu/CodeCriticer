@@ -1,16 +1,3 @@
-
-
-
-
-
-
-
-
-
-
-
-
-
 package moby28462
 
 import (
@@ -101,18 +88,6 @@ func NewDaemonAndContainer() (*Daemon, *Container) {
 	d := &Daemon{Store{c}}
 	return d, c
 }
-
-
-
-
-
-
-
-
-
-
-
-
 
 func TestMoby28462(t *testing.T) {
 	d, c := NewDaemonAndContainer()

@@ -1,12 +1,3 @@
-
-
-
-
-
-
-
-
-
 package cockroach7504
 
 import (
@@ -83,7 +74,6 @@ func (c *tableNameCache) get(id int) {
 
 	lease.mu.Lock()
 	defer lease.mu.Unlock()
-
 
 }
 
@@ -167,7 +157,6 @@ func TestCockroach7504(t *testing.T) {
 		mgr.AcquireByName(0)
 		wg.Done()
 	}()
-
 
 	go func() {
 

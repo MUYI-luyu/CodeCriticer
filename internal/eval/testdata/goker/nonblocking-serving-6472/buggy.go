@@ -98,10 +98,6 @@ func (m *Prober) IsReady() {
 	})
 	for _, ipWorkItems := range workItems {
 
-
-
-
-
 		for _, wi := range ipWorkItems {
 			m.workQueue.Add(wi)
 		}

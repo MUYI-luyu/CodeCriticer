@@ -1,15 +1,3 @@
-
-
-
-
-
-
-
-
-
-
-
-
 package kubernetes5316
 
 import (
@@ -36,15 +24,6 @@ func finishRequest(timeout time.Duration, fn func() error) {
 	case <-time.After(timeout):
 	}
 }
-
-
-
-
-
-
-
-
-
 
 func TestKubernetes5316(t *testing.T) {
 	fn := func() error {

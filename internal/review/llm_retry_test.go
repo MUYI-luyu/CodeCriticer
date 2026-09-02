@@ -23,7 +23,7 @@ func TestChatRetryOn429(t *testing.T) {
 	defer srv.Close()
 
 	l := NewLLMWithConfig(WithAPIKey("test"), WithBaseURL(srv.URL), WithReviewModel("test-model"))
-	if _, err := l.Review(context.Background(), "diff"); err != nil {
+	if _, _, err := l.Review(context.Background(), "diff"); err != nil {
 		t.Fatalf("期望重试后成功，得到: %v", err)
 	}
 	if attempts != 2 {
@@ -49,9 +49,8 @@ func TestChatNoRetryOn400(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	l := NewLLMWithConfig(WithAPIKey("test"), WithBaseURL(srv.URL),
-		WithReviewModel("review-model"), WithReflectModel("reflect-model"), WithPlanModel("plan-model"))
-	if _, err := l.Review(context.Background(), "diff"); err == nil {
+	l := NewLLMWithConfig(WithAPIKey("test"), WithBaseURL(srv.URL), WithReviewModel("review-model"), WithPlanModel("plan-model"))
+	if _, _, err := l.Review(context.Background(), "diff"); err == nil {
 		t.Fatal("期望失败，得到成功")
 	}
 	// 降级链依次尝试 3 个不同模型各 1 次，400 不重试
@@ -76,9 +75,8 @@ func TestChatFallbackDedup(t *testing.T) {
 	defer srv.Close()
 
 	// 三个模型设成同一个名字（等价 --model 统一设置）
-	l := NewLLMWithConfig(WithAPIKey("test"), WithBaseURL(srv.URL),
-		WithReviewModel("same-model"), WithReflectModel("same-model"), WithPlanModel("same-model"))
-	if _, err := l.Review(context.Background(), "diff"); err == nil {
+	l := NewLLMWithConfig(WithAPIKey("test"), WithBaseURL(srv.URL), WithReviewModel("same-model"), WithPlanModel("same-model"))
+	if _, _, err := l.Review(context.Background(), "diff"); err == nil {
 		t.Fatal("期望失败，得到成功")
 	}
 	// 去重后只尝试 1 个模型

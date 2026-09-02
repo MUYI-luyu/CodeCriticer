@@ -1,28 +1,3 @@
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 package grpc1353
 
 import (
@@ -135,23 +110,6 @@ func NewClientConn() *ClientConn {
 	cc.conns = append(cc.conns, ac1, ac2)
 	return cc
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 func TestGrpc1353(t *testing.T) {
 	HelpCh = make(chan struct{})

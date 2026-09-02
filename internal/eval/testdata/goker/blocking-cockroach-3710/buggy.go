@@ -1,14 +1,3 @@
-
-
-
-
-
-
-
-
-
-
-
 package cockroach3710
 
 import (
@@ -96,17 +85,6 @@ func NewStore() *Store {
 
 	return store
 }
-
-
-
-
-
-
-
-
-
-
-
 
 func TestCockroach3710(t *testing.T) {
 	store := NewStore()

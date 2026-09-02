@@ -1,10 +1,3 @@
-
-
-
-
-
-
-
 package kubernetes13135
 
 import (
@@ -134,31 +127,6 @@ func NewCacher() *Cacher {
 	cacher.initialized.Wait()
 	return cacher
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 func TestKubernetes13135(t *testing.T) {
 	StopChannel = make(chan struct{})

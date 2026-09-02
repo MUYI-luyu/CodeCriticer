@@ -1,21 +1,3 @@
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 package kubernetes1321
 
 import (
@@ -92,20 +74,6 @@ func testMuxWatcherClose() {
 	w := m.Watch()
 	w.Stop()
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 func TestKubernetes1321(t *testing.T) {
 	go testMuxWatcherClose()

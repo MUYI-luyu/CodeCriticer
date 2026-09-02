@@ -6,9 +6,8 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/MUYI-luyu/codecritic/internal/agent"
-	"github.com/MUYI-luyu/codecritic/internal/recall"
 	"github.com/MUYI-luyu/codecritic/internal/review"
+	"github.com/MUYI-luyu/codecritic/internal/workflow"
 )
 
 // TestAttributeStages 覆盖四类归因：成功 / 自伤 / LLM漏 / 召回漏。
@@ -20,13 +19,10 @@ func TestAttributeStages(t *testing.T) {
 		{File: "d.go", Line: 40}, // 召回漏：召回都没覆盖
 	}
 
-	att := &agent.Attempt{
+	att := &workflow.Trace{
 		// 召回：a/b/c 覆盖（绝对路径 basename 应能匹配相对 bug.File），d 不覆盖
-		RecalledDocs: []recall.Doc{
-			{File: "/tmp/repo/a.go", Line: 11},
-			{File: "/tmp/repo/b.go", Line: 20},
-			{File: "/tmp/repo/c.go", Line: 31},
-			{File: "/tmp/repo/z.go", Line: 40}, // 文件不同名，不覆盖 d
+		Evidence: []*workflow.Evidence{
+			{File: "/tmp/repo/a.go", Line: 11}, {File: "/tmp/repo/b.go", Line: 20}, {File: "/tmp/repo/c.go", Line: 31}, {File: "/tmp/repo/z.go", Line: 40},
 		},
 		// execute：a 命中(idx0)、b 命中(idx1)；c/d 未报
 		Findings: []review.Finding{
@@ -34,9 +30,9 @@ func TestAttributeStages(t *testing.T) {
 			{File: "b.go", Line: 21},
 		},
 		// validate：a 高置信保留，b 低置信丢弃
-		Validations: []agent.Validation{
-			{FindingID: 0, Confidence: 0.9},
-			{FindingID: 1, Confidence: 0.4},
+		Validations: []workflow.Validation{
+			{FindingIndex: 0, Accepted: true, Confidence: 0.9},
+			{FindingIndex: 1, Accepted: false, Confidence: 0.4},
 		},
 	}
 
@@ -66,14 +62,9 @@ func TestAttributeStages(t *testing.T) {
 func TestSaveTraceRoundtrip(t *testing.T) {
 	dir := t.TempDir()
 	tr := EvalTrace{
-		Name: "pkg/case-1", // 带分隔符，验证 safeName
-		Bugs: []Bug{{File: "a.go", Line: 10, Desc: "data race"}},
-		Reflex: &agent.Result{
-			Attempts: []agent.Attempt{{
-				Round:        1,
-				RecalledDocs: []recall.Doc{{File: "/tmp/a.go", Line: 10, Text: "go func() { x++ }()", Src: "symbol"}},
-			}},
-		},
+		Name:         "pkg/case-1", // 带分隔符，验证 safeName
+		Bugs:         []Bug{{File: "a.go", Line: 10, Desc: "data race"}},
+		Workflow:     &workflow.Trace{Evidence: []*workflow.Evidence{{File: "/tmp/a.go", Line: 10, Content: "go func() { x++ }()"}}},
 		Attributions: []BugAttribution{{Bug: Bug{File: "a.go", Line: 10}, Stage: StageSuccess}},
 	}
 	if err := SaveTrace(dir, tr); err != nil {
@@ -89,10 +80,10 @@ func TestSaveTraceRoundtrip(t *testing.T) {
 	if err := json.Unmarshal(data, &back); err != nil {
 		t.Fatalf("反序列化: %v", err)
 	}
-	if len(back.Reflex.Attempts) != 1 || len(back.Reflex.Attempts[0].RecalledDocs) != 1 {
-		t.Fatalf("召回轨迹丢失: %+v", back.Reflex)
+	if len(back.Workflow.Evidence) != 1 {
+		t.Fatalf("召回轨迹丢失: %+v", back.Workflow)
 	}
-	if txt := back.Reflex.Attempts[0].RecalledDocs[0].Text; txt != "go func() { x++ }()" {
+	if txt := back.Workflow.Evidence[0].Content; txt != "go func() { x++ }()" {
 		t.Errorf("召回全文未保留，got %q", txt)
 	}
 }

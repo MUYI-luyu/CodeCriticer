@@ -1,12 +1,3 @@
-
-
-
-
-
-
-
-
-
 package grpc1424
 
 import (
@@ -51,7 +42,6 @@ func (cc *ClientConn) lbWatcher(doneChan chan bool) {
 
 		}
 		var (
-
 			del []*addrConn
 		)
 		for _, a := range cc.conns {
@@ -60,7 +50,6 @@ func (cc *ClientConn) lbWatcher(doneChan chan bool) {
 		for _, c := range del {
 			c.tearDown()
 		}
-
 
 	}
 }
@@ -89,16 +78,6 @@ func DialContext() {
 
 	close(cc.dopts.balancer.(*roundRobin).addrCh)
 }
-
-
-
-
-
-
-
-
-
-
 
 func TestGrpc1424(t *testing.T) {
 	go DialContext()

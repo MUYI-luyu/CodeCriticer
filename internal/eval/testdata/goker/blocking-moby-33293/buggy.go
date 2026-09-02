@@ -1,10 +1,3 @@
-
-
-
-
-
-
-
 package moby33293
 
 import (
@@ -28,13 +21,6 @@ func containerWait() <-chan error {
 	}
 	return errC
 }
-
-
-
-
-
-
-
 
 func TestMoby33293(t *testing.T) {
 	go func() {

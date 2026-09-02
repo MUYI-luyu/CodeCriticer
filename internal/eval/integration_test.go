@@ -5,8 +5,8 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/MUYI-luyu/codecritic/internal/agent"
 	"github.com/MUYI-luyu/codecritic/internal/review"
+	"github.com/MUYI-luyu/codecritic/internal/workflow"
 )
 
 // TestEndToEndDimensionAndCost 端到端测试：验证从 case 到 trace 的完整流程。
@@ -66,19 +66,8 @@ func main() {
 	t.Logf("Dimension: Scale=%s (RepoLOC=%d), Scope=%s (Files=%d, Packages=%d)",
 		dim.ScaleLabel, dim.RepoLOC, dim.ScopeLabel, dim.Files, dim.Packages)
 
-	// 2. 验证 Cost 计算（模拟 agent.Result）
-	mockResult := &agent.Result{
-		Attempts: []agent.Attempt{
-			{
-				Round: 1,
-				LLMUsage: agent.LLMUsage{
-					PromptTokens:     100,
-					CompletionTokens: 50,
-					TotalTokens:      150,
-				},
-			},
-		},
-	}
+	// 2. 验证 Cost 计算（模拟 Workflow trace）
+	mockResult := &workflow.Trace{Usage: review.LLMUsage{PromptTokens: 100, CompletionTokens: 50, TotalTokens: 150}}
 
 	cost := ComputeCost(mockResult)
 	if cost.Rounds != 1 {
@@ -94,7 +83,7 @@ func main() {
 	trace := EvalTrace{
 		Name:         c.Name,
 		Bugs:         c.Bugs(),
-		Reflex:       mockResult,
+		Workflow:     mockResult,
 		Dimension:    &dim,
 		CostSummary:  cost,
 		Attributions: []BugAttribution{},

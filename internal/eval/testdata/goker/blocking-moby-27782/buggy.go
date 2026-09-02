@@ -1,10 +1,3 @@
-
-
-
-
-
-
-
 package moby27782
 
 import (
@@ -216,32 +209,6 @@ func (l *JSONFileLogger) Close() {
 		delete(l.readers, r)
 	}
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 func TestMoby27782(t *testing.T) {
 	c := &Container{}

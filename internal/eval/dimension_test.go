@@ -3,8 +3,8 @@ package eval
 import (
 	"testing"
 
-	"github.com/MUYI-luyu/codecritic/internal/agent"
 	"github.com/MUYI-luyu/codecritic/internal/review"
+	"github.com/MUYI-luyu/codecritic/internal/workflow"
 )
 
 func TestComputeDimension(t *testing.T) {
@@ -107,31 +107,12 @@ func main() {}
 }
 
 func TestComputeCost(t *testing.T) {
-	result := &agent.Result{
-		Attempts: []agent.Attempt{
-			{
-				Round: 1,
-				LLMUsage: agent.LLMUsage{
-					PromptTokens:     100,
-					CompletionTokens: 50,
-					TotalTokens:      150,
-				},
-			},
-			{
-				Round: 2,
-				LLMUsage: agent.LLMUsage{
-					PromptTokens:     200,
-					CompletionTokens: 100,
-					TotalTokens:      300,
-				},
-			},
-		},
-	}
+	result := &workflow.Trace{Usage: review.LLMUsage{PromptTokens: 300, CompletionTokens: 150, TotalTokens: 450}}
 
 	cost := ComputeCost(result)
 
-	if cost.Rounds != 2 {
-		t.Errorf("Rounds = %d, want 2", cost.Rounds)
+	if cost.Rounds != 1 {
+		t.Errorf("Rounds = %d, want 1", cost.Rounds)
 	}
 	if cost.TotalPromptTokens != 300 {
 		t.Errorf("TotalPromptTokens = %d, want 300", cost.TotalPromptTokens)

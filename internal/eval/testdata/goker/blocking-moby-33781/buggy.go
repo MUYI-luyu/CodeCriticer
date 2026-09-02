@@ -1,16 +1,3 @@
-
-
-
-
-
-
-
-
-
-
-
-
-
 package moby33781
 
 import (
@@ -47,19 +34,6 @@ func monitor(stop chan bool) {
 		}
 	}
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 func TestMoby33781(t *testing.T) {
 	stop := make(chan bool)

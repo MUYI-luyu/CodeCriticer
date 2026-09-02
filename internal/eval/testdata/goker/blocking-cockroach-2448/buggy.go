@@ -22,9 +22,7 @@ type MultiRaft struct {
 	callbackChan chan func()
 }
 
-
 func (m *MultiRaft) sendEvent(event interface{}) {
-
 
 	select {
 	case m.Events <- event:

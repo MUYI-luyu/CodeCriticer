@@ -1,29 +1,3 @@
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 package kubernetes58107
 
 import (
@@ -104,13 +78,6 @@ func startResourceQuotaController() {
 	go resourceQuotaController.Sync()
 	resourceQuotaController.HelperSignals()
 }
-
-
-
-
-
-
-
 
 func TestKubernetes58107(t *testing.T) {
 	startResourceQuotaController()
