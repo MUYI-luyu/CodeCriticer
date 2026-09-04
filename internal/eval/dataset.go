@@ -126,6 +126,12 @@ func loadCase(dir string) (*Case, error) {
 	if len(bugs) == 0 {
 		bugs = extractedBugs // 使用从注释提取的 bugs
 	}
+	lineCount := len(strings.Split(clean, "\n"))
+	for i := range bugs {
+		if bugs[i].Line > lineCount {
+			bugs[i].Line = 0
+		}
+	}
 	file := m.File
 	if file == "" {
 		file = "main.go"

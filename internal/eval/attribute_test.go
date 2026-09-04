@@ -20,9 +20,9 @@ func TestAttributeStages(t *testing.T) {
 	}
 
 	att := &workflow.Trace{
-		// 召回：a/b/c 覆盖（绝对路径 basename 应能匹配相对 bug.File），d 不覆盖
+		// 召回：a/b/c 覆盖，d 不覆盖
 		Evidence: []*workflow.Evidence{
-			{File: "/tmp/repo/a.go", Line: 11}, {File: "/tmp/repo/b.go", Line: 20}, {File: "/tmp/repo/c.go", Line: 31}, {File: "/tmp/repo/z.go", Line: 40},
+			{File: "a.go", Line: 11}, {File: "b.go", Line: 20}, {File: "c.go", Line: 31}, {File: "z.go", Line: 40},
 		},
 		// execute：a 命中(idx0)、b 命中(idx1)；c/d 未报
 		Findings: []review.Finding{
@@ -64,7 +64,7 @@ func TestSaveTraceRoundtrip(t *testing.T) {
 	tr := EvalTrace{
 		Name:         "pkg/case-1", // 带分隔符，验证 safeName
 		Bugs:         []Bug{{File: "a.go", Line: 10, Desc: "data race"}},
-		Workflow:     &workflow.Trace{Evidence: []*workflow.Evidence{{File: "/tmp/a.go", Line: 10, Content: "go func() { x++ }()"}}},
+		Workflow:     &workflow.Trace{Evidence: []*workflow.Evidence{{File: "a.go", Line: 10, Content: "go func() { x++ }()"}}},
 		Attributions: []BugAttribution{{Bug: Bug{File: "a.go", Line: 10}, Stage: StageSuccess}},
 	}
 	if err := SaveTrace(dir, tr); err != nil {

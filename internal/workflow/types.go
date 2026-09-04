@@ -31,14 +31,55 @@ type Plan struct {
 	Keywords    []string `json:"keywords"`
 }
 
-type Evidence struct {
-	ID      string `json:"id"`
-	Source  string `json:"source"`
-	Type    string `json:"type"`
-	File    string `json:"file,omitempty"`
-	Line    int    `json:"line,omitempty"`
-	Content string `json:"content"`
+// RiskSeed 表示由变更语法触发的有限风险入口。
+type RiskSeed struct {
+	Category string `json:"category"`
+	File     string `json:"file"`
+	Line     int    `json:"line"`
+	Symbol   string `json:"symbol,omitempty"`
+	Trigger  string `json:"trigger"`
 }
+
+// Hypothesis 表示一个需要通过代码事实调查的缺陷假设。
+type Hypothesis struct {
+	ID            string   `json:"id"`
+	Category      string   `json:"category"`
+	Claim         string   `json:"claim"`
+	TargetFile    string   `json:"target_file"`
+	TargetSymbol  string   `json:"target_symbol,omitempty"`
+	RequiredFacts []string `json:"required_facts,omitempty"`
+}
+
+// TraceStats 记录调查阶段的可观测计数。
+type TraceStats struct {
+	DecisionCount       int `json:"decision_count"`
+	SuccessfulToolCalls int `json:"successful_tool_calls"`
+	FailedToolCalls     int `json:"failed_tool_calls"`
+	DuplicateCalls      int `json:"duplicate_calls"`
+	NoNewEvidenceCalls  int `json:"no_new_evidence_calls"`
+}
+
+type Evidence struct {
+	ID              string `json:"id"`
+	Source          string `json:"source"`
+	Type            string `json:"type"`
+	File            string `json:"file,omitempty"`
+	Line            int    `json:"line,omitempty"`
+	EndLine         int    `json:"end_line,omitempty"`
+	Content         string `json:"content"`
+	Symbol          string `json:"symbol,omitempty"`
+	Relation        string `json:"relation,omitempty"`
+	QuestionIndexes []int  `json:"question_indexes,omitempty"`
+}
+
+type EvaluateStatus string
+
+const (
+	EvaluateSufficient   EvaluateStatus = "SUFFICIENT"
+	EvaluatePartial      EvaluateStatus = "PARTIAL"
+	EvaluateInsufficient EvaluateStatus = "INSUFFICIENT"
+	EvaluateConflict     EvaluateStatus = "CONFLICT"
+)
 
 type ToolCall struct {
 	Step        int                    `json:"step"`
@@ -57,30 +98,36 @@ type Validation struct {
 }
 
 type Trace struct {
-	ID          string           `json:"id"`
-	Request     Request          `json:"request"`
-	Plan        Plan             `json:"plan"`
-	Evidence    []*Evidence      `json:"evidence"`
-	ToolCalls   []ToolCall       `json:"tool_calls"`
-	Findings    []review.Finding `json:"findings"`
-	Validations []Validation     `json:"validations"`
-	LLMCalls    []review.LLMCall `json:"llm_calls"`
-	StopReason  string           `json:"stop_reason"`
-	Usage       review.LLMUsage  `json:"usage"`
-	Duration    time.Duration    `json:"duration"`
-	Errors      []string         `json:"errors,omitempty"`
+	ID           string           `json:"id"`
+	Request      Request          `json:"request"`
+	Plan         Plan             `json:"plan"`
+	RiskSeeds    []RiskSeed       `json:"risk_seeds,omitempty"`
+	Hypotheses   []Hypothesis     `json:"hypotheses,omitempty"`
+	Evidence     []*Evidence      `json:"evidence"`
+	ToolCalls    []ToolCall       `json:"tool_calls"`
+	Findings     []review.Finding `json:"findings"`
+	Validations  []Validation     `json:"validations"`
+	Evaluation   EvaluateStatus   `json:"evaluation"`
+	EvidenceGaps []string         `json:"evidence_gaps,omitempty"`
+	LLMCalls     []review.LLMCall `json:"llm_calls"`
+	StopReason   string           `json:"stop_reason"`
+	Usage        review.LLMUsage  `json:"usage"`
+	Duration     time.Duration    `json:"duration"`
+	Errors       []string         `json:"errors,omitempty"`
+	Stats        TraceStats       `json:"stats"`
 }
 
 const (
 	StopToolError       = "tool_error"
 	StopAgentDone       = "agent_done"
+	StopEvidenceEnough  = "evidence_sufficient"
 	StopMaxSteps        = "max_steps"
 	StopInvalidDecision = "invalid_decision"
 	StopContextCanceled = "context_canceled"
 	StopStageError      = "stage_error"
 )
 
-// Save writes a complete workflow trace with owner-only permissions.
+// 保存完整轨迹并限制文件权限。
 func (t *Trace) Save(path string) error {
 	if t == nil {
 		return fmt.Errorf("nil trace")

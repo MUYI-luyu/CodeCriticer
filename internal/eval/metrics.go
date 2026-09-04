@@ -1,6 +1,9 @@
 package eval
 
-import "github.com/MUYI-luyu/codecritic/internal/review"
+import (
+	"github.com/MUYI-luyu/codecritic/internal/review"
+	"github.com/MUYI-luyu/codecritic/internal/workflow"
+)
 
 // Metrics 汇总一次评测的命中情况。
 type Metrics struct {
@@ -55,6 +58,82 @@ func Compute(bugs []Bug, fs []review.Finding, tol int) Metrics {
 		}
 	}
 	return m
+}
+
+// ComputeTrace 将 Finding 引用的证据位置纳入匹配。
+func ComputeTrace(bugs []Bug, trace *workflow.Trace, tol int) Metrics {
+	if trace == nil {
+		return Metrics{Bugs: len(bugs), FN: len(bugs)}
+	}
+	byID := make(map[string]*workflow.Evidence, len(trace.Evidence))
+	for _, e := range trace.Evidence {
+		if e != nil {
+			byID[e.ID] = e
+		}
+	}
+	used := make([]bool, len(bugs))
+	accepted := make(map[int]bool, len(trace.Validations))
+	if len(trace.Validations) == 0 {
+		for i := range trace.Findings {
+			accepted[i] = true
+		}
+	} else {
+		for _, v := range trace.Validations {
+			if v.Accepted {
+				accepted[v.FindingIndex] = true
+			}
+		}
+	}
+	m := Metrics{Bugs: len(bugs), Findings: len(accepted)}
+	for i, f := range trace.Findings {
+		if !accepted[i] {
+			continue
+		}
+		best := matchingBug(bugs, used, f.File, f.Line, tol)
+		if best < 0 {
+			for _, id := range f.EvidenceIDs {
+				e := byID[id]
+				if e != nil {
+					best = matchingBug(bugs, used, e.File, e.Line, tol)
+				}
+				if best >= 0 {
+					break
+				}
+			}
+		}
+		if best >= 0 {
+			used[best] = true
+			m.True++
+			m.TP++
+		} else {
+			m.False++
+			m.FP++
+		}
+	}
+	for _, ok := range used {
+		if ok {
+			m.Found++
+		} else {
+			m.FN++
+		}
+	}
+	return m
+}
+
+func matchingBug(bugs []Bug, used []bool, file string, line, tol int) int {
+	best := -1
+	for i, b := range bugs {
+		if used[i] || b.File != file {
+			continue
+		}
+		if b.Line <= 0 {
+			return i
+		}
+		if abs(b.Line-line) <= tol && (best < 0 || abs(bugs[best].Line-line) > abs(b.Line-line)) {
+			best = i
+		}
+	}
+	return best
 }
 
 // ComputeMultiLocation 支持多位置 GT（Primary + Related）。

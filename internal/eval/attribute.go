@@ -1,8 +1,6 @@
 package eval
 
 import (
-	"path/filepath"
-
 	"github.com/MUYI-luyu/codecritic/internal/recall"
 	"github.com/MUYI-luyu/codecritic/internal/review"
 	"github.com/MUYI-luyu/codecritic/internal/workflow"
@@ -77,10 +75,10 @@ func classify(recallHit, execHit, validateKept bool) BugStage {
 }
 
 // recallCovers 判断召回片段里有没有覆盖 bug 行的。
-// docs 的 File 是绝对路径（rg/调用图产出），bug.File 是相对名，故按 basename 比对。
+// 路径均为仓库相对路径。
 func recallCovers(docs []recall.Doc, b Bug, tol int) bool {
 	for _, d := range docs {
-		if filepath.Base(d.File) != filepath.Base(b.File) {
+		if d.File != b.File {
 			continue
 		}
 		if b.Line <= 0 { // 文件级 ground-truth：同文件即算覆盖

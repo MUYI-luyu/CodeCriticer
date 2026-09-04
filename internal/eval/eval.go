@@ -97,10 +97,13 @@ func runCase(ctx context.Context, llm *review.LLM, c *Case, verbose bool, traceD
 	}
 	res, err := wf.Run(ctx, workflow.Request{Repo: repo, Diff: c.Diff})
 	if err != nil || res == nil || res.Trace == nil {
+		if traceDir != "" && res != nil && res.Trace != nil {
+			_ = SaveTrace(traceDir, EvalTrace{Name: c.Name, Bugs: c.Bugs(), Workflow: res.Trace})
+		}
 		return caseResult{name: c.Name, err: err, output: fmt.Sprintf("%-16s workflow 失败: %v", c.Name, err)}
 	}
 	t := res.Trace
-	m := Compute(c.Bugs(), t.Findings, tol)
+	m := ComputeTrace(c.Bugs(), t, tol)
 	attrs := Attribute(c.Bugs(), t, tol)
 	cost := ComputeCost(t)
 	dim := ComputeDimension(c)

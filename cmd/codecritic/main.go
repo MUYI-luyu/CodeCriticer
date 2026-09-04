@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 
@@ -83,6 +84,9 @@ func cmdReview(args []string) {
 		log.Fatalf("创建 Workflow: %v", err)
 	}
 	result, err := wf.Run(ctx, workflow.Request{Repo: repo, Diff: raw})
+	if tracePath == "" && result != nil && result.Trace != nil {
+		tracePath = filepath.Join("logs", result.Trace.ID+".json")
+	}
 	if err != nil {
 		if result != nil && result.Trace != nil && tracePath != "" {
 			_ = result.Trace.Save(tracePath)
@@ -105,7 +109,7 @@ func cmdEval(args []string) {
 	dataset := "internal/eval/testdata/cases"
 	var planModel, reviewModel string
 	var verbose bool
-	var traceDir string
+	traceDir := "logs"
 	concurrency := eval.DefaultConcurrency
 
 	for i := 0; i < len(args); i++ {

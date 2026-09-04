@@ -30,11 +30,17 @@ func Build(repoDir string) (*Index, error) {
 		Mode: packages.NeedName | packages.NeedFiles | packages.NeedCompiledGoFiles |
 			packages.NeedImports | packages.NeedDeps | packages.NeedTypes |
 			packages.NeedSyntax | packages.NeedTypesInfo | packages.NeedTypesSizes,
-		Dir: repoDir,
+		Dir:   repoDir,
+		Tests: true,
 	}
 	pkgs, err := packages.Load(cfg, "./...")
 	if err != nil {
 		return nil, err
+	}
+	for _, p := range pkgs {
+		if len(p.Errors) > 0 {
+			return nil, p.Errors[0]
+		}
 	}
 	prog, _ := ssautil.Packages(pkgs, ssa.BuilderMode(0))
 	prog.Build()
