@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -33,7 +34,13 @@ func New(llm LLMClient, repo string) (*Workflow, error) {
 	if repo == "" {
 		return nil, fmt.Errorf("empty repository")
 	}
-	return &Workflow{llm: llm, repo: repo, maxSteps: 8, model: "claude-sonnet-5", logger: slog.Default()}, nil
+	model := "gpt-5.4"
+	if provider, ok := llm.(interface{ InvestigatorModel() string }); ok {
+		if configured := strings.TrimSpace(provider.InvestigatorModel()); configured != "" {
+			model = configured
+		}
+	}
+	return &Workflow{llm: llm, repo: repo, maxSteps: 8, model: model, logger: slog.Default()}, nil
 }
 func (w *Workflow) SetLogger(logger *slog.Logger) {
 	if logger != nil {
@@ -225,27 +232,32 @@ func (w *Workflow) investigate(ctx context.Context, tr *Trace, ts *toolset) erro
 			}
 			return err
 		}
-		var a struct {
-			Done      bool                   `json:"done"`
-			Tool      string                 `json:"tool"`
-			Args      map[string]interface{} `json:"args"`
-			Questions []int                  `json:"question_indexes"`
-		}
-		if err := json.Unmarshal([]byte(stripJSON(text)), &a); err != nil {
-			tr.StopReason = StopInvalidDecision
-			return fmt.Errorf("decision JSON: %w", err)
+		a, decisionErr := parseInvestigatorDecision(text)
+		if decisionErr != nil {
+			tr.Errors = append(tr.Errors, fmt.Sprintf("调查决策格式错误，已请求纠正: %v", decisionErr))
+			repairPrompt := buildDecisionRepairPrompt(tr, text, decisionErr)
+			text, _, err = w.llm.ChatWithUsage(ctx, "你是代码审查调查员，只纠正工具决策 JSON。", repairPrompt, w.model)
+			if err != nil {
+				if ctx.Err() != nil {
+					tr.StopReason = StopContextCanceled
+				} else {
+					tr.StopReason = StopStageError
+				}
+				return err
+			}
+			a, decisionErr = parseInvestigatorDecision(text)
+			if decisionErr != nil {
+				tr.StopReason = StopInvalidDecision
+				return fmt.Errorf("decision JSON: %w", decisionErr)
+			}
 		}
 		if a.Done {
 			if !questionsCovered(tr) {
-				tr.EvidenceGaps = append(tr.EvidenceGaps, "计划问题尚未关联到证据")
+				tr.EvidenceGaps = append(tr.EvidenceGaps, "计划问题尚未获得非 Diff 调查证据，请继续调用工具")
 				continue
 			}
 			tr.StopReason = StopAgentDone
 			return nil
-		}
-		if strings.TrimSpace(a.Tool) == "" {
-			tr.StopReason = StopInvalidDecision
-			return fmt.Errorf("decision JSON: missing tool")
 		}
 		key := fmt.Sprintf("%s:%v", a.Tool, a.Args)
 		if history[key] {
@@ -354,6 +366,42 @@ func (w *Workflow) investigate(ctx context.Context, tr *Trace, ts *toolset) erro
 	return nil
 }
 
+type investigatorDecision struct {
+	Done      bool                   `json:"done"`
+	Tool      string                 `json:"tool"`
+	Args      map[string]interface{} `json:"args"`
+	Questions []int                  `json:"question_indexes"`
+}
+
+func parseInvestigatorDecision(text string) (investigatorDecision, error) {
+	var decision investigatorDecision
+	decoder := json.NewDecoder(strings.NewReader(stripJSON(text)))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&decision); err != nil {
+		return decision, err
+	}
+	var extra interface{}
+	if err := decoder.Decode(&extra); err != io.EOF {
+		if err == nil {
+			return decision, fmt.Errorf("multiple JSON values")
+		}
+		return decision, err
+	}
+	if !decision.Done && strings.TrimSpace(decision.Tool) == "" {
+		return decision, fmt.Errorf("missing tool")
+	}
+	return decision, nil
+}
+
+func buildDecisionRepairPrompt(tr *Trace, response string, decisionErr error) string {
+	const maxResponseRunes = 4000
+	runes := []rune(response)
+	if len(runes) > maxResponseRunes {
+		runes = runes[:maxResponseRunes]
+	}
+	return fmt.Sprintf("上一次工具决策不符合协议。错误：%v\n目标文件：%s\n待调查问题：%s\n上一次响应：%s\n请只返回一个 JSON 对象，不要返回 findings、解释、Markdown 或多个对象。继续调查时必须从 read_code、search_code、find_callers、run_static_rules、dataflow 中选择一个工具，提供该工具必需的完整 args 和 question_indexes；确实完成时只返回 {\"done\":true}。", decisionErr, strings.Join(tr.Plan.TargetFiles, ", "), formatQuestions(tr.Plan.Questions), string(runes))
+}
+
 func maxEvidenceLine(e *Evidence) int {
 	if e.EndLine > e.Line {
 		return e.EndLine
@@ -362,10 +410,62 @@ func maxEvidenceLine(e *Evidence) int {
 }
 
 func buildDecisionPrompt(tr *Trace) string {
-	return fmt.Sprintf("假设：%s\n目标文件：%s\n目标符号：%s\n风险种子：%s\n调查假设：%s\n问题：%s\n已有证据：%s\n已有发现：%s\n验收结果：%s\n证据缺口：%s\n工具历史：%s\n可用工具：read_code(file,start_line,end_line), search_code(keyword,file可选), find_callers(symbol,file), run_static_rules(), dataflow(symbol,file)。工具参数规则：dataflow 只接受函数或方法名；字段名、结构体字段和局部变量必须使用 search_code 或 read_code；调用关系使用 find_callers；DataFlow 失败后切换到 read_code/search_code，不要重复失败调用。必须优先调查目标文件和变更行，并围绕调查假设的 RequiredFacts 收集证据；返回 done 前，必须确认每个计划问题都有对应证据。工具决策可附 question_indexes 数组，只返回 {\"done\":false,\"tool\":\"...\",\"args\":{},\"question_indexes\":[0]}。", tr.Plan.Concern, strings.Join(tr.Plan.TargetFiles, ", "), strings.Join(tr.Plan.Symbols, ", "), encodeRiskSeeds(tr.RiskSeeds), encodeHypotheses(tr.Hypotheses), formatQuestions(tr.Plan.Questions), encodeEvidence(tr.Evidence), encodeFindings(tr.Findings), encodeValidations(tr.Validations), strings.Join(tr.EvidenceGaps, "; "), summarizeCalls(tr.ToolCalls))
+	return fmt.Sprintf("%s\n目标文件：%s\n目标符号：%s\n风险摘要：%s\n调查假设：%s\n调查问题：%s\n变更附近代码：%s\n已获得的非 Diff 证据：%s\n已有发现：%s\n验收结果：%s\n证据缺口：%s\n工具历史：%s\n可用工具：read_code(file,start_line,end_line), search_code(keyword,file可选), find_callers(symbol,file), run_static_rules(), dataflow(symbol,file)。工具参数规则：dataflow 只接受函数或方法名；字段名、结构体字段和局部变量必须使用 search_code 或 read_code；调用关系使用 find_callers；DataFlow 失败后切换到 read_code/search_code，不要重复失败调用。必须优先调查目标文件和变更行，并围绕调查假设的 RequiredFacts 收集证据；返回 done 前，必须确认每个计划问题都有对应证据。工具决策可附 question_indexes 数组，只返回 {\"done\":false,\"tool\":\"...\",\"args\":{},\"question_indexes\":[0]}。", tr.Plan.Concern, strings.Join(tr.Plan.TargetFiles, ", "), strings.Join(tr.Plan.Symbols, ", "), buildInvestigatorContext(tr), encodeHypotheses(tr.Hypotheses), formatQuestions(tr.Plan.Questions), encodeChangedContext(tr), encodeInvestigatorEvidence(tr), encodeFindings(tr.Findings), encodeValidations(tr.Validations), strings.Join(tr.EvidenceGaps, "; "), summarizeCalls(tr.ToolCalls))
+}
+
+// buildInvestigatorContext 提取调查阶段首轮所需的紧凑风险摘要，完整证据仍保留在 Trace。
+func buildInvestigatorContext(tr *Trace) string {
+	type seedView struct {
+		Category string `json:"category"`
+		File     string `json:"file"`
+		Line     int    `json:"line"`
+		Symbol   string `json:"symbol,omitempty"`
+		Trigger  string `json:"trigger,omitempty"`
+	}
+	seeds := make([]seedView, 0, len(tr.RiskSeeds))
+	for _, seed := range tr.RiskSeeds {
+		seeds = append(seeds, seedView{seed.Category, seed.File, seed.Line, seed.Symbol, seed.Trigger})
+	}
+	b, _ := json.Marshal(seeds)
+	return string(b)
+}
+
+func encodeChangedContext(tr *Trace) string {
+	type lineView struct {
+		File string `json:"file"`
+		Line int    `json:"line"`
+		Text string `json:"text"`
+	}
+	lines := make([]lineView, 0, 24)
+	seen := make(map[string]bool)
+	for _, seed := range tr.RiskSeeds {
+		for _, evidence := range tr.Evidence {
+			if evidence == nil || evidence.Source != "diff" || evidence.File != seed.File || abs(evidence.Line-seed.Line) > 2 {
+				continue
+			}
+			key := fmt.Sprintf("%s:%d", evidence.File, evidence.Line)
+			if seen[key] {
+				continue
+			}
+			seen[key] = true
+			lines = append(lines, lineView{evidence.File, evidence.Line, evidence.Content})
+		}
+	}
+	b, _ := json.Marshal(lines)
+	return string(b)
+}
+
+func encodeInvestigatorEvidence(tr *Trace) string {
+	filtered := make([]*Evidence, 0)
+	for _, evidence := range tr.Evidence {
+		if evidence != nil && evidence.Source != "diff" {
+			filtered = append(filtered, evidence)
+		}
+	}
+	return encodeEvidence(filtered)
 }
 func buildReviewPrompt(d []byte, p Plan, e []*Evidence) string {
-	return fmt.Sprintf("审查 diff 并只输出 JSON {\"findings\":[{\"file\":\"...\",\"line\":0,\"severity\":\"error|warning|info\",\"msg\":\"...\",\"evidence\":\"...\",\"evidence_ids\":[\"e1\"]}]}。每条发现必须引用真正支持结论的证据编号。一个根因只输出一条发现；只报告当前代码可达、可复现的问题，不报告未来扩展风险或仅存在的编码风格问题。行号必须落在证据或变更代码附近；无法定位或证据不足时不要输出。计划：%+v\n证据：%s\nDiff：\n%s", p, encodeEvidence(e), d)
+	return fmt.Sprintf("审查 diff 并只输出 JSON {\"findings\":[{\"file\":\"...\",\"line\":0,\"severity\":\"error|warning|info\",\"msg\":\"...\",\"evidence\":\"...\",\"evidence_ids\":[\"e1\"]}]}。每条发现必须引用真正支持结论的证据编号。一个根因只输出一条发现；只报告当前代码可达、可复现的问题，不报告未来扩展风险或仅存在的编码风格问题。行号必须锚定引入根因的代码，不得只指向后续触发点或症状位置；例如锁初始化或配置错误应锚定初始化/配置行。无法定位或证据不足时不要输出。计划：%+v\n证据：%s\nDiff：\n%s", p, encodeEvidence(e), d)
 }
 func evaluateFindings(fs []review.Finding, e []*Evidence) ([]Validation, EvaluateStatus, []string) {
 	out := make([]Validation, 0, len(fs))
@@ -392,7 +492,7 @@ func evaluateFindings(fs []review.Finding, e []*Evidence) ([]Validation, Evaluat
 		duplicate := false
 		speculative := containsSpeculativeLanguage(f.Msg)
 		for _, prior := range accepted {
-			if sameFile(prior.File, f.File) && ((absLine(prior.Line, f.Line) <= 8 && sameFindingTopic(prior.Msg, f.Msg)) || sharedEvidence(prior, f) >= 2) {
+			if sameFile(prior.File, f.File) && sameFindingTopic(prior.Msg, f.Msg) && sharedEvidence(prior, f) >= 2 {
 				duplicate = true
 				break
 			}
@@ -419,12 +519,20 @@ func evaluateFindings(fs []review.Finding, e []*Evidence) ([]Validation, Evaluat
 					matched = true
 				}
 			}
-			ok = matched && !missing && !conflict && !duplicate && !speculative && evidenceTextSupports(f, byID)
+			factsSupported := requiredFactsSupportFinding(f, byID)
+			anchorSupported := anchorSupportsClaim(f, byID)
+			ok = matched && !missing && !conflict && !duplicate && !speculative && evidenceTextSupports(f, byID) && factsSupported && anchorSupported
 			if !matched && !missing && !conflict {
 				gaps = append(gaps, fmt.Sprintf("发现 %s:%d 缺少当前位置附近的支持证据", f.File, f.Line))
 			}
 			if matched && !evidenceTextSupports(f, byID) {
 				gaps = append(gaps, fmt.Sprintf("发现 %s:%d 的证据描述未与引用事实形成实质对应", f.File, f.Line))
+			}
+			if !factsSupported {
+				gaps = append(gaps, fmt.Sprintf("发现 %s:%d 缺少问题类型所需的参与路径或时序事实", f.File, f.Line))
+			}
+			if !anchorSupported {
+				gaps = append(gaps, fmt.Sprintf("发现 %s:%d 的锚点未落在其声称的根因位置", f.File, f.Line))
 			}
 		}
 		if conflict {
@@ -501,6 +609,51 @@ func sharedEvidence(a, b review.Finding) int {
 	return n
 }
 
+func requiredFactsSupportFinding(f review.Finding, byID map[string]*Evidence) bool {
+	msg := strings.ToLower(f.Msg)
+	if !strings.Contains(msg, "死锁") && !strings.Contains(msg, "数据竞争") && !strings.Contains(msg, "竞态") && !strings.Contains(msg, "goroutine") {
+		return true
+	}
+	symbols := make(map[string]bool)
+	content := strings.Builder{}
+	for _, id := range f.EvidenceIDs {
+		e := byID[id]
+		if e == nil {
+			continue
+		}
+		if e.Symbol != "" {
+			symbols[e.Symbol] = true
+		}
+		content.WriteString(strings.ToLower(e.Content))
+		content.WriteByte('\n')
+	}
+	if strings.Contains(msg, "死锁") || strings.Contains(msg, "数据竞争") || strings.Contains(msg, "竞态") {
+		return len(symbols) >= 2
+	}
+	text := content.String()
+	started := strings.Contains(text, "go ") || strings.Contains(text, "runworker")
+	blocked := strings.Contains(text, "<-") || strings.Contains(text, ".wait(") || strings.Contains(text, " <- ")
+	return started && blocked
+}
+
+func anchorSupportsClaim(f review.Finding, byID map[string]*Evidence) bool {
+	msg := strings.ToLower(f.Msg)
+	requiredToken := ""
+	if strings.Contains(msg, "rlocker") {
+		requiredToken = "rlocker"
+	}
+	if requiredToken == "" {
+		return true
+	}
+	for _, id := range f.EvidenceIDs {
+		e := byID[id]
+		if e != nil && maxEvidenceLine(e)-e.Line <= 10 && sameFile(e.File, f.File) && f.Line >= e.Line-3 && f.Line <= maxEvidenceLine(e)+3 && strings.Contains(strings.ToLower(e.Content), requiredToken) {
+			return true
+		}
+	}
+	return false
+}
+
 func evidenceTextSupports(f review.Finding, byID map[string]*Evidence) bool {
 	if strings.TrimSpace(f.Evidence) == "" {
 		for _, id := range f.EvidenceIDs {
@@ -553,7 +706,7 @@ func questionsCovered(tr *Trace) bool {
 	if len(tr.Plan.Questions) == 0 {
 		return hasSubstantiveEvidence(tr.Evidence)
 	}
-	covered := make(map[int]bool, len(tr.Plan.Questions))
+	covered := make(map[int]map[string]bool, len(tr.Plan.Questions))
 	hasIndexes := false
 	for _, e := range tr.Evidence {
 		if !isSubstantiveEvidence(e) {
@@ -562,7 +715,10 @@ func questionsCovered(tr *Trace) bool {
 		for _, q := range e.QuestionIndexes {
 			hasIndexes = true
 			if q >= 0 && q < len(tr.Plan.Questions) {
-				covered[q] = true
+				if covered[q] == nil {
+					covered[q] = make(map[string]bool)
+				}
+				covered[q][e.ID] = true
 			}
 		}
 	}
@@ -575,7 +731,16 @@ func questionsCovered(tr *Trace) bool {
 		}
 		return count >= len(tr.Plan.Questions)
 	}
-	return len(covered) == len(tr.Plan.Questions)
+	required := 2
+	if len(tr.Plan.Questions) == 1 {
+		required = 1
+	}
+	for i := range tr.Plan.Questions {
+		if len(covered[i]) < required {
+			return false
+		}
+	}
+	return true
 }
 
 func hasSubstantiveEvidence(evs []*Evidence) bool {
@@ -589,6 +754,9 @@ func hasSubstantiveEvidence(evs []*Evidence) bool {
 
 func isSubstantiveEvidence(e *Evidence) bool {
 	if e == nil || e.ID == "" || e.File == "" || e.Line <= 0 {
+		return false
+	}
+	if e.Source == "diff" {
 		return false
 	}
 	content := strings.TrimSpace(e.Content)
@@ -606,8 +774,8 @@ func evidenceMatchesFinding(e *Evidence, f review.Finding) bool {
 	if sameFile(e.File, f.File) && f.Line >= e.Line-3 && f.Line <= end+3 {
 		return true
 	}
-	// 调用链和数据流是跨位置证据，位置不同是预期行为。
-	return e.Relation == "supports" && (e.Type == "call_chain" || e.Type == "call" || e.Type == "return" || e.Type == "dataflow")
+	// 跨位置证据只能解释根因，不能替代 Finding 自身的代码锚点。
+	return false
 }
 func normalizeEvidencePath(repo string, e *Evidence) error {
 	if e == nil || e.File == "" || e.Line <= 0 {

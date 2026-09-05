@@ -8,10 +8,14 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/MUYI-luyu/codecritic/internal/recall"
 	"github.com/MUYI-luyu/codecritic/internal/review"
 )
 
-type scriptedLLM struct{ decisions []string }
+type scriptedLLM struct {
+	decisions       []string
+	configuredModel string
+}
 
 type gapLoopLLM struct {
 	decisions []string
@@ -43,6 +47,21 @@ func (s *gapLoopLLM) Review(context.Context, string) ([]review.Finding, review.L
 
 func (s *scriptedLLM) Plan(context.Context, string) ([]review.Point, review.LLMUsage, error) {
 	return []review.Point{{Desc: "检查修改函数的调用关系", Kw: []string{"Run"}}}, review.LLMUsage{}, nil
+}
+
+func (s *scriptedLLM) InvestigatorModel() string {
+	return s.configuredModel
+}
+
+func TestWorkflowUsesConfiguredInvestigatorModel(t *testing.T) {
+	llm := &scriptedLLM{configuredModel: "gpt-5.4"}
+	wf, err := New(llm, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if wf.model != "gpt-5.4" {
+		t.Fatalf("调查模型 = %q，期望 gpt-5.4", wf.model)
+	}
 }
 
 func TestTraceSave(t *testing.T) {
@@ -208,7 +227,7 @@ func TestInvestigatorStopsAfterCoveredQuestionsAndStaleResults(t *testing.T) {
 	llm := &scriptedLLM{decisions: []string{
 		`{"done":false,"tool":"read_code","args":{"file":"main.go","start_line":1,"end_line":5},"question_indexes":[0]}`,
 		`{"done":false,"tool":"read_code","args":{"file":"main.go","start_line":3,"end_line":4},"question_indexes":[0]}`,
-		`{"done":false,"tool":"search_code","args":{"file":"main.go","keyword":"not-present"},"question_indexes":[0]}`,
+		`{"done":false,"tool":"read_code","args":{"file":"main.go","start_line":2,"end_line":3},"question_indexes":[0]}`,
 	}}
 	wf, err := New(llm, repo)
 	if err != nil {
@@ -249,8 +268,20 @@ func TestEvaluateAcceptsCrossLocationSupportEvidence(t *testing.T) {
 	evidence := []*Evidence{{ID: "e1", Source: "find_callers", Type: "call_chain", Relation: "supports", File: "caller.go", Line: 20, Content: "caller -> Changed"}}
 	findings := []review.Finding{{File: "changed.go", Line: 10, EvidenceIDs: []string{"e1"}}}
 	validations, status, _ := evaluateFindings(findings, evidence)
-	if status != EvaluateSufficient || len(validations) != 1 || !validations[0].Accepted {
-		t.Fatalf("跨位置支持证据应通过验收: status=%s validations=%+v", status, validations)
+	if status != EvaluateInsufficient || len(validations) != 1 || validations[0].Accepted {
+		t.Fatalf("仅有跨位置证据时不应替代 Finding 锚点: status=%s validations=%+v", status, validations)
+	}
+}
+
+func TestEvaluateAcceptsAnchorWithCrossLocationSupport(t *testing.T) {
+	evidence := []*Evidence{
+		{ID: "e1", Source: "diff", Type: "changed_line", Relation: "supports", File: "changed.go", Line: 10, Content: "return Changed()", Symbol: "Run"},
+		{ID: "e2", Source: "find_callers", Type: "call_chain", Relation: "supports", File: "caller.go", Line: 20, Content: "caller -> Changed", Symbol: "caller"},
+	}
+	findings := []review.Finding{{File: "changed.go", Line: 10, Msg: "调用关系错误", Evidence: "return Changed()", EvidenceIDs: []string{"e1", "e2"}}}
+	validations, status, _ := evaluateFindings(findings, evidence)
+	if status != EvaluateSufficient || !validations[0].Accepted {
+		t.Fatalf("直接锚点和跨位置支持应通过验收: status=%s validations=%+v", status, validations)
 	}
 }
 
@@ -308,6 +339,115 @@ func TestQuestionIndexesDoNotProveCoverage(t *testing.T) {
 	}
 }
 
+func TestDiffEvidenceDoesNotProveInvestigationCoverage(t *testing.T) {
+	tr := &Trace{
+		Plan: Plan{Questions: []string{"检查锁路径"}},
+		Evidence: []*Evidence{{
+			ID: "e1", Source: "diff", Type: "changed_line", File: "main.go", Line: 10,
+			Content: "mu.Lock()", QuestionIndexes: []int{0},
+		}},
+	}
+	if questionsCovered(tr) {
+		t.Fatal("Diff 证据不能替代 Investigator 调查证据")
+	}
+}
+
+func TestInvestigatorRepairsMalformedDecisionOnce(t *testing.T) {
+	repo := t.TempDir()
+	if err := os.WriteFile(filepath.Join(repo, "main.go"), []byte("package main\n\nfunc Run() {}\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repo, "go.mod"), []byte("module example.com/test\n\ngo 1.22\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	diff := []byte("diff --git a/main.go b/main.go\n--- a/main.go\n+++ b/main.go\n@@ -2,2 +2,2 @@\n-func Run() {}\n+func Run() { }\n")
+	llm := &scriptedLLM{decisions: []string{
+		`{"done":false,"tool":"read_code","args":{"file":"main.go"}}{"done":true}`,
+		`{"done":false,"tool":"read_code","args":{"file":"main.go"},"question_indexes":[0]}`,
+		`{"done":true}`,
+	}}
+	wf, err := New(llm, repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := wf.Run(context.Background(), Request{Repo: repo, Diff: diff})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Trace.ToolCalls) != 1 || result.Trace.ToolCalls[0].Tool != "read_code" {
+		t.Fatalf("格式纠正后未执行预期工具: %+v", result.Trace.ToolCalls)
+	}
+	if result.Trace.StopReason != StopAgentDone {
+		t.Fatalf("停止原因 = %s，期望 %s", result.Trace.StopReason, StopAgentDone)
+	}
+	if len(result.Trace.Errors) == 0 || !strings.Contains(result.Trace.Errors[0], "调查决策格式错误") {
+		t.Fatalf("Trace 未记录格式纠正: %+v", result.Trace.Errors)
+	}
+}
+
+func TestParseInvestigatorDecisionRejectsFindingPayload(t *testing.T) {
+	_, err := parseInvestigatorDecision(`{"findings":[{"file":"main.go","line":1}]}`)
+	if err == nil {
+		t.Fatalf("Finding 响应不应被当成工具决策: %v", err)
+	}
+}
+
+func TestParseInvestigatorDecisionRejectsExtraFields(t *testing.T) {
+	_, err := parseInvestigatorDecision(`{"done":true,"findings":[]}`)
+	if err == nil {
+		t.Fatal("带 findings 的 done 响应不应被当成合法工具决策")
+	}
+}
+
+func TestSingleEvidenceDoesNotCoverMultipleQuestions(t *testing.T) {
+	tr := &Trace{
+		Plan:     Plan{Questions: []string{"问题一", "问题二"}},
+		Evidence: []*Evidence{{ID: "e1", Type: "code", File: "main.go", Line: 1, Content: "func Run() {}", QuestionIndexes: []int{0, 1}}},
+	}
+	if questionsCovered(tr) {
+		t.Fatal("单个大段代码证据不能覆盖多个调查问题")
+	}
+}
+
+func TestEvaluateRejectsDeadlockWithoutSecondParticipant(t *testing.T) {
+	evidence := []*Evidence{
+		{ID: "e1", File: "main.go", Line: 10, Content: "s.mu.Lock()", Symbol: "Stop"},
+		{ID: "e2", File: "main.go", Line: 11, Content: "close(s.stopped)", Symbol: "Stop"},
+	}
+	findings := []review.Finding{{File: "main.go", Line: 10, Msg: "死锁：等待者被唤醒后会获取同一把锁", Evidence: "s.mu.Lock()", EvidenceIDs: []string{"e1", "e2"}}}
+	validations, status, gaps := evaluateFindings(findings, evidence)
+	if status != EvaluateInsufficient || validations[0].Accepted || len(gaps) == 0 {
+		t.Fatalf("缺少第二参与路径的死锁不应通过: status=%s validations=%+v gaps=%v", status, validations, gaps)
+	}
+}
+
+func TestEvaluateKeepsDifferentRootCausesWithSharedEvidence(t *testing.T) {
+	evidence := []*Evidence{
+		{ID: "e1", File: "main.go", Line: 10, Content: "read shared map", Symbol: "Read"},
+		{ID: "e2", File: "main.go", Line: 11, Content: "write shared map", Symbol: "Write"},
+	}
+	findings := []review.Finding{
+		{File: "main.go", Line: 10, Msg: "数据竞争：并发读写 map", Evidence: "read shared map", EvidenceIDs: []string{"e1", "e2"}},
+		{File: "main.go", Line: 11, Msg: "逻辑错误：把 map 当作连续索引访问", Evidence: "write shared map", EvidenceIDs: []string{"e1", "e2"}},
+	}
+	validations, status, _ := evaluateFindings(findings, evidence)
+	if status != EvaluateSufficient || !validations[0].Accepted || !validations[1].Accepted {
+		t.Fatalf("共享证据但根因不同的 Finding 都应保留: status=%s validations=%+v", status, validations)
+	}
+}
+
+func TestEvaluateRejectsRootCauseAtWrongAnchor(t *testing.T) {
+	evidence := []*Evidence{
+		{ID: "e1", File: "main.go", Line: 10, Content: "cond.L.Lock()", Symbol: "Run"},
+		{ID: "e2", File: "main.go", Line: 30, Content: "sync.NewCond(mu.RLocker())", Symbol: "Setup"},
+	}
+	finding := review.Finding{File: "main.go", Line: 10, Msg: "死锁：RLocker 初始化配置导致重入等待", Evidence: "sync.NewCond(mu.RLocker())", EvidenceIDs: []string{"e1", "e2"}}
+	validations, status, gaps := evaluateFindings([]review.Finding{finding}, evidence)
+	if status != EvaluateInsufficient || validations[0].Accepted || len(gaps) == 0 {
+		t.Fatalf("RLocker 根因必须锚定配置位置: status=%s validations=%+v gaps=%v", status, validations, gaps)
+	}
+}
+
 func TestDataflowRejectsFieldSymbol(t *testing.T) {
 	tool := &toolset{repo: t.TempDir()}
 	_, err := tool.dataflow(map[string]interface{}{"symbol": "Stopper.draining", "file": "main.go"})
@@ -316,11 +456,26 @@ func TestDataflowRejectsFieldSymbol(t *testing.T) {
 	}
 }
 
+func TestSearchCodeRecordsScopedAbsence(t *testing.T) {
+	repo := t.TempDir()
+	if err := os.WriteFile(filepath.Join(repo, "main.go"), []byte("package main\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	tool := &toolset{repo: repo, store: recall.New(repo, nil)}
+	evidence, err := tool.searchCode(map[string]interface{}{"file": "main.go", "keyword": "drain.Done"})
+	if err != nil || len(evidence) != 1 || evidence[0].Type != "search_absence" {
+		t.Fatalf("限定文件的空搜索应形成负面证据: evidence=%+v err=%v", evidence, err)
+	}
+}
+
 func TestEvaluateRejectsDuplicateAndSpeculativeFindings(t *testing.T) {
-	evidence := []*Evidence{{ID: "e1", File: "main.go", Line: 10, Content: "lock"}}
+	evidence := []*Evidence{
+		{ID: "e1", File: "main.go", Line: 10, Content: "lock", Symbol: "Read"},
+		{ID: "e2", File: "main.go", Line: 11, Content: "lock", Symbol: "Write"},
+	}
 	findings := []review.Finding{
-		{File: "main.go", Line: 10, Msg: "数据竞争：共享状态未同步", EvidenceIDs: []string{"e1"}},
-		{File: "main.go", Line: 12, Msg: "数据竞争：同一问题的重复描述", EvidenceIDs: []string{"e1"}},
+		{File: "main.go", Line: 10, Msg: "数据竞争：共享状态未同步", EvidenceIDs: []string{"e1", "e2"}},
+		{File: "main.go", Line: 12, Msg: "数据竞争：同一问题的重复描述", EvidenceIDs: []string{"e1", "e2"}},
 		{File: "main.go", Line: 20, Msg: "未来扩展可能导致死锁", EvidenceIDs: []string{"e1"}},
 	}
 	validations, status, gaps := evaluateFindings(findings, evidence)

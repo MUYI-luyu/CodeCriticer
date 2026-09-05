@@ -23,6 +23,8 @@ const planPrompt = `你是代码审查规划者。读下面的 unified diff，�
 只输出 JSON：
 {"points":[{"desc":"要点描述","kw":["关键词"]}]}`
 
+const findingRepairPrompt = `你是 JSON 修复器。将输入修复为合法 JSON，只能修复格式，不能增加、删除或改写 finding 的语义。只输出 {"findings":[]} 结构，不要其他文字。`
+
 /* const validatePrompt = `你是代码审查证据校验员。给出一个 finding 与召回的证据，评估该 finding 的可信度。
 
 Finding:
@@ -105,6 +107,8 @@ type LLM struct {
 	observer LLMObserver
 }
 
+const llmRequestTimeout = 120 * time.Second
+
 // LLMCall describes one completed HTTP attempt. It is intentionally a callback
 // so callers can route it to slog, a trace, or both without coupling this
 // package to a logging backend.
@@ -119,6 +123,7 @@ type LLMCall struct {
 	Attempt      int
 	Status       int
 	Duration     time.Duration
+	RequestBytes int `json:"request_bytes,omitempty"`
 	Error        string
 }
 
@@ -149,7 +154,7 @@ func NewLLMWithConfig(opts ...Option) *LLM {
 	}
 	return &LLM{
 		config:  cfg,
-		client:  &http.Client{Timeout: 30 * time.Second},
+		client:  &http.Client{Timeout: llmRequestTimeout},
 		metrics: newMetrics(),
 	}
 }
@@ -241,6 +246,7 @@ func (l *LLM) chat(ctx context.Context, system, user, model string) (string, err
 // chatOnce 发送单次 HTTP 请求，返回文本与 token 用量。
 func (l *LLM) chatOnce(ctx context.Context, system, user, model string, attempt int) (string, usage, error) {
 	started := time.Now()
+	requestBytes := 0
 	observer := observerFromContext(ctx)
 	if observer == nil {
 		observer = l.observer
@@ -259,7 +265,7 @@ func (l *LLM) chatOnce(ctx context.Context, system, user, model string, attempt 
 		if err != nil {
 			msg = err.Error()
 		}
-		observer.OnLLMCall(LLMCall{Model: model, SystemPrompt: system, UserPrompt: user,
+		observer.OnLLMCall(LLMCall{Model: model, SystemPrompt: system, UserPrompt: user, RequestBytes: requestBytes,
 			Response: response, Usage: LLMUsage{PromptTokens: u.Input, CompletionTokens: u.Output, TotalTokens: u.Input + u.Output},
 			Attempt: attempt, Status: status, Duration: time.Since(started), Error: msg})
 	}
@@ -274,6 +280,7 @@ func (l *LLM) chatOnce(ctx context.Context, system, user, model string, attempt 
 		record("", usage{}, 0, err)
 		return "", usage{}, err
 	}
+	requestBytes = len(raw)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, l.config.BaseURL+"/chat/completions", bytes.NewReader(raw))
 	if err != nil {
 		record("", usage{}, 0, err)
@@ -297,8 +304,9 @@ func (l *LLM) chatOnce(ctx context.Context, system, user, model string, attempt 
 	}
 	var out chatResp
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-		record("", usage{}, resp.StatusCode, err)
-		return "", usage{}, err
+		decodeErr := fmt.Errorf("llm: 响应不是合法 JSON (content-type=%q): %w", resp.Header.Get("Content-Type"), err)
+		record("", usage{}, resp.StatusCode, decodeErr)
+		return "", usage{}, decodeErr
 	}
 	if len(out.Choices) == 0 {
 		err := fmt.Errorf("llm: 空响应")
@@ -360,7 +368,22 @@ func (l *LLM) Review(ctx context.Context, diffText string) ([]Finding, LLMUsage,
 		return nil, usage, err
 	}
 	findings, err := parseFindings(text)
-	return findings, usage, err
+	if err == nil {
+		return findings, usage, nil
+	}
+	// 结构化输出错误只修复一次，避免一次格式问题直接造成 Recall 为零。
+	repaired, repairUsage, repairErr := l.chatWithFallback(ctx, findingRepairPrompt, text, l.config.ReviewModel, l.config.PlanModel)
+	usage.PromptTokens += repairUsage.PromptTokens
+	usage.CompletionTokens += repairUsage.CompletionTokens
+	usage.TotalTokens += repairUsage.TotalTokens
+	if repairErr != nil {
+		return nil, usage, fmt.Errorf("%v；修复 findings 格式失败: %w", err, repairErr)
+	}
+	findings, repairErr = parseFindings(repaired)
+	if repairErr != nil {
+		return nil, usage, fmt.Errorf("%v；修复后仍无法解析: %w", err, repairErr)
+	}
+	return findings, usage, nil
 }
 
 // Plan 规划审查要点，返回要点 + token 用量。

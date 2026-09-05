@@ -22,8 +22,8 @@ func DefaultConfig() *Config {
 		// OpenAI-compatible gateway; the native Anthropic endpoint is not the
 		// same protocol as this client.
 		BaseURL:     "",
-		PlanModel:   "claude-sonnet-5",
-		ReviewModel: "claude-sonnet-5",
+		PlanModel:   "gpt-5.4",
+		ReviewModel: "gpt-5.4",
 	}
 }
 
@@ -58,4 +58,9 @@ func WithPlanModel(model string) Option {
 // WithReviewModel 设置审查模型。
 func WithReviewModel(model string) Option {
 	return func(c *Config) { c.ReviewModel = model }
+}
+
+// InvestigatorModel 返回调查阶段使用的模型。
+func (l *LLM) InvestigatorModel() string {
+	return l.config.ReviewModel
 }

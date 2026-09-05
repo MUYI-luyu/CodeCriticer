@@ -4,8 +4,17 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"testing"
+	"time"
 )
+
+func TestDefaultRequestTimeoutSupportsReasoningModels(t *testing.T) {
+	l := NewLLMWithConfig(WithAPIKey("test"), WithBaseURL("https://example.com/v1"))
+	if l.client.Timeout != 120*time.Second {
+		t.Fatalf("请求超时 = %v，期望 120s", l.client.Timeout)
+	}
+}
 
 // TestChatRetryOn429 验证：429 限流会重试，成功后 metrics 正确统计 token 与重试次数。
 func TestChatRetryOn429(t *testing.T) {
@@ -53,9 +62,9 @@ func TestChatNoRetryOn400(t *testing.T) {
 	if _, _, err := l.Review(context.Background(), "diff"); err == nil {
 		t.Fatal("期望失败，得到成功")
 	}
-	// 降级链依次尝试 3 个不同模型各 1 次，400 不重试
-	if attempts != 3 {
-		t.Fatalf("期望 3 次尝试（3 个不同模型各 1 次，不重试），得到 %d", attempts)
+	// 降级链依次尝试 Review 与 Plan 两个不同模型，400 不重试。
+	if attempts != 2 {
+		t.Fatalf("期望 2 次尝试（2 个不同模型各 1 次，不重试），得到 %d", attempts)
 	}
 
 	s := l.Metrics()["review-model"]
@@ -82,5 +91,25 @@ func TestChatFallbackDedup(t *testing.T) {
 	// 去重后只尝试 1 个模型
 	if attempts != 1 {
 		t.Fatalf("期望 1 次尝试（重复模型被去重），得到 %d", attempts)
+	}
+}
+
+func TestReviewRepairsMalformedJSONOnce(t *testing.T) {
+	attempts := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempts++
+		content := `{"findings":[{"file":"main.go",,"line":10}]}`
+		if attempts == 2 {
+			content = `{"findings":[{"file":"main.go","line":10,"severity":"error","msg":"错误"}]}`
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"choices":[{"message":{"content":` + strconv.Quote(content) + `}}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`))
+	}))
+	defer srv.Close()
+
+	l := NewLLMWithConfig(WithAPIKey("test"), WithBaseURL(srv.URL), WithReviewModel("test-model"), WithPlanModel("test-model"))
+	findings, _, err := l.Review(context.Background(), "diff")
+	if err != nil || attempts != 2 || len(findings) != 1 || findings[0].Line != 10 {
+		t.Fatalf("格式修复结果异常: attempts=%d findings=%+v err=%v", attempts, findings, err)
 	}
 }
