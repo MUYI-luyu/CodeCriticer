@@ -421,18 +421,172 @@ func TestEvaluateRejectsDeadlockWithoutSecondParticipant(t *testing.T) {
 	}
 }
 
+func TestEvaluateAcceptsLockLeakAtEarlyReturn(t *testing.T) {
+	evidence := []*Evidence{
+		{ID: "e1", File: "main.go", Line: 10, Content: "ccc.mu.Lock()", Symbol: "Remove"},
+		{ID: "e2", File: "main.go", Line: 11, Content: "if entry.abort {", Symbol: "Remove"},
+		{ID: "e3", File: "main.go", Line: 12, Content: "return", Symbol: "Remove"},
+	}
+	finding := review.Finding{File: "main.go", Line: 12, Msg: "提前退出后互斥量一直处于占用状态，导致死锁", Evidence: "ccc.mu.Lock(); return", EvidenceIDs: []string{"e1", "e2", "e3"}}
+	validations, status, gaps := evaluateFindings([]review.Finding{finding}, evidence)
+	if status != EvaluateSufficient || !validations[0].Accepted || len(gaps) != 0 {
+		t.Fatalf("提前退出前未释放锁的事实已经闭合: status=%s validations=%+v gaps=%v", status, validations, gaps)
+	}
+}
+
+func TestEvaluateRejectsCondWaitAsLockMismatch(t *testing.T) {
+	evidence := []*Evidence{
+		{ID: "e1", File: "main.go", Line: 10, Content: "p.lock.Lock()", Symbol: "add"},
+		{ID: "e2", File: "main.go", Line: 20, Content: "p.lock.Lock()", Symbol: "pop"},
+		{ID: "e3", File: "main.go", Line: 21, Content: "p.cond.Wait()", Symbol: "pop"},
+		{ID: "e4", File: "main.go", Line: 30, Content: "p.cond.L = &p.lock", Symbol: "setup"},
+	}
+	finding := review.Finding{File: "main.go", Line: 21, Msg: "sync.Cond 与 RWMutex 的锁类型不匹配，会造成并发错误", Evidence: "p.lock.Lock(); p.cond.Wait(); p.cond.L = &p.lock", EvidenceIDs: []string{"e1", "e2", "e3", "e4"}}
+	validations, status, gaps := evaluateFindings([]review.Finding{finding}, evidence)
+	if status != EvaluateInsufficient || validations[0].Accepted || len(gaps) == 0 {
+		t.Fatalf("没有锁泄漏、重入或锁顺序环的结论不应通过: status=%s validations=%+v gaps=%v", status, validations, gaps)
+	}
+}
+
+func TestEvaluateRejectsAsyncRelockWithoutWait(t *testing.T) {
+	evidence := []*Evidence{
+		{ID: "e1", File: "main.go", Line: 10, Content: "s.mu.Lock()", Symbol: "Start"},
+		{ID: "e2", File: "main.go", Line: 11, Content: "s.workers.Run(func() {", Symbol: "Start"},
+		{ID: "e3", File: "main.go", Line: 20, Content: "s.mu.Lock()", Symbol: "worker"},
+	}
+	finding := review.Finding{File: "main.go", Line: 10, Msg: "持锁启动 goroutine，goroutine 再获取同一把锁导致死锁", Evidence: "s.mu.Lock(); Run; s.mu.Lock()", EvidenceIDs: []string{"e1", "e2", "e3"}}
+	validations, status, gaps := evaluateFindings([]review.Finding{finding}, evidence)
+	if status != EvaluateInsufficient || validations[0].Accepted || len(gaps) == 0 {
+		t.Fatalf("缺少并发启动和等待关系的异步重锁结论不应通过: status=%s validations=%+v gaps=%v", status, validations, gaps)
+	}
+}
+
+func TestEvaluateAcceptsRecursiveLockEvidence(t *testing.T) {
+	evidence := []*Evidence{
+		{ID: "e1", File: "main.go", Line: 10, Content: "c.Lock()", Symbol: "Sync"},
+		{ID: "e2", File: "main.go", Line: 11, Content: "c.Do()", Symbol: "Sync"},
+		{ID: "e3", File: "main.go", Line: 20, Content: "c.RLock()", Symbol: "Do"},
+	}
+	finding := review.Finding{File: "main.go", Line: 10, Msg: "同一 goroutine 外层持有写锁时同步调用 Do，Do 再获取同一把读锁导致死锁", Evidence: "c.Lock(); c.Do(); c.RLock()", EvidenceIDs: []string{"e1", "e2", "e3"}}
+	validations, status, gaps := evaluateFindings([]review.Finding{finding}, evidence)
+	if status != EvaluateSufficient || !validations[0].Accepted || len(gaps) != 0 {
+		t.Fatalf("同一把锁的同步重入事实已经闭合: status=%s validations=%+v gaps=%v", status, validations, gaps)
+	}
+}
+
+func TestEvaluateAcceptsLockChannelCycleEvidence(t *testing.T) {
+	evidence := []*Evidence{
+		{ID: "e1", File: "main.go", Line: 10, Content: "rr.mu.Lock()", Symbol: "send"},
+		{ID: "e2", File: "main.go", Line: 11, Content: "rr.ch <- value", Symbol: "send"},
+		{ID: "e3", File: "main.go", Line: 20, Content: "rr.mu.Lock()", Symbol: "consume"},
+	}
+	finding := review.Finding{File: "main.go", Line: 11, Msg: "持锁向无缓冲 channel 发送，消费者回到同一把锁导致死锁", Evidence: "rr.mu.Lock(); rr.ch <- value; rr.mu.Lock()", EvidenceIDs: []string{"e1", "e2", "e3"}}
+	validations, status, gaps := evaluateFindings([]review.Finding{finding}, evidence)
+	if status != EvaluateSufficient || !validations[0].Accepted || len(gaps) != 0 {
+		t.Fatalf("锁内 channel 操作和消费者回锁的事实已经闭合: status=%s validations=%+v gaps=%v", status, validations, gaps)
+	}
+}
+
+func TestEvaluateRejectsNilChannelClaimWithoutOperation(t *testing.T) {
+	evidence := []*Evidence{
+		{ID: "e1", File: "main.go", Line: 10, Content: "func Start() {", Symbol: "Start"},
+		{ID: "e2", File: "main.go", Line: 20, Content: "return func() { down() }", Symbol: "Up"},
+	}
+	finding := review.Finding{File: "main.go", Line: 20, Msg: "Up 返回闭包时 channel 尚未初始化，可能导致 nil channel 错误", Evidence: "Start 尚未执行；Up 返回闭包", EvidenceIDs: []string{"e1", "e2"}}
+	validations, status, gaps := evaluateFindings([]review.Finding{finding}, evidence)
+	if status != EvaluateInsufficient || validations[0].Accepted || len(gaps) == 0 {
+		t.Fatalf("没有 channel 实际操作的 nil 结论不应通过: status=%s validations=%+v gaps=%v", status, validations, gaps)
+	}
+}
+
+func TestEvaluateAcceptsNilChannelClaimWithOperation(t *testing.T) {
+	evidence := []*Evidence{
+		{ID: "e1", File: "main.go", Line: 10, Content: "var ch chan bool", Symbol: "Start"},
+		{ID: "e2", File: "main.go", Line: 20, Content: "ch <- true", Symbol: "send"},
+	}
+	finding := review.Finding{File: "main.go", Line: 20, Msg: "向未初始化的 nil channel 发送会永久阻塞", Evidence: "var ch chan bool; ch <- true", EvidenceIDs: []string{"e1", "e2"}}
+	validations, status, gaps := evaluateFindings([]review.Finding{finding}, evidence)
+	if status != EvaluateSufficient || !validations[0].Accepted || len(gaps) != 0 {
+		t.Fatalf("存在 channel 实际发送操作的 nil 结论应通过: status=%s validations=%+v gaps=%v", status, validations, gaps)
+	}
+}
+
+func TestEvaluateAcceptsLockOrderCycleEvidence(t *testing.T) {
+	evidence := []*Evidence{
+		{ID: "e1", File: "main.go", Line: 10, Content: "a.mu.Lock()", Symbol: "first"},
+		{ID: "e2", File: "main.go", Line: 11, Content: "b.mu.Lock()", Symbol: "first"},
+		{ID: "e3", File: "main.go", Line: 20, Content: "b.mu.Lock()", Symbol: "second"},
+		{ID: "e4", File: "main.go", Line: 21, Content: "a.mu.Lock()", Symbol: "second"},
+	}
+	finding := review.Finding{File: "main.go", Line: 10, Msg: "两条路径以相反锁顺序形成 AB-BA 死锁", Evidence: "a.mu -> b.mu; b.mu -> a.mu", EvidenceIDs: []string{"e1", "e2", "e3", "e4"}}
+	validations, status, gaps := evaluateFindings([]review.Finding{finding}, evidence)
+	if status != EvaluateSufficient || !validations[0].Accepted || len(gaps) != 0 {
+		t.Fatalf("反向锁顺序的两条参与路径已经闭合: status=%s validations=%+v gaps=%v", status, validations, gaps)
+	}
+}
+
+func TestEvaluateRejectsDuplicateRepresentationOfOneLock(t *testing.T) {
+	evidence := []*Evidence{
+		{ID: "e1", Type: "changed_line", File: "main.go", Line: 10, Content: "s.mu.Lock()", Symbol: "Stop"},
+		{ID: "e2", Type: "call", File: "main.go", Line: 10, Content: "s.mu.Lock()", Symbol: "Stop"},
+	}
+	finding := review.Finding{File: "main.go", Line: 10, Msg: "同一把锁被重复获取导致死锁", Evidence: "s.mu.Lock()", EvidenceIDs: []string{"e1", "e2"}}
+	validations, status, gaps := evaluateFindings([]review.Finding{finding}, evidence)
+	if status != EvaluateInsufficient || validations[0].Accepted || len(gaps) == 0 {
+		t.Fatalf("同一位置的多种 Evidence 表示不能充当两次加锁: status=%s validations=%+v gaps=%v", status, validations, gaps)
+	}
+}
+
+func TestEvaluateRejectsLockOrderClaimFromOneFunction(t *testing.T) {
+	evidence := []*Evidence{
+		{ID: "e1", File: "main.go", Line: 10, Content: "r.client.mu.RLock()", Symbol: "acquire"},
+		{ID: "e2", File: "main.go", Line: 11, Content: "r.mu.Lock()", Symbol: "acquire"},
+		{ID: "e3", Type: "call", File: "main.go", Line: 10, Content: "r.client.mu.RLock()", Symbol: "(*example.remoteClient).acquire"},
+	}
+	finding := review.Finding{File: "main.go", Line: 10, Msg: "两个锁形成 AB-BA 锁顺序死锁", Evidence: "r.client.mu.RLock(); r.mu.Lock()", EvidenceIDs: []string{"e1", "e2", "e3"}}
+	validations, status, gaps := evaluateFindings([]review.Finding{finding}, evidence)
+	if status != EvaluateInsufficient || validations[0].Accepted || len(gaps) == 0 {
+		t.Fatalf("同一函数的源码和 SSA 表示不能充当两条反向锁路径: status=%s validations=%+v gaps=%v", status, validations, gaps)
+	}
+}
+
 func TestEvaluateKeepsDifferentRootCausesWithSharedEvidence(t *testing.T) {
 	evidence := []*Evidence{
-		{ID: "e1", File: "main.go", Line: 10, Content: "read shared map", Symbol: "Read"},
-		{ID: "e2", File: "main.go", Line: 11, Content: "write shared map", Symbol: "Write"},
+		{ID: "e1", File: "main.go", Line: 10, Content: "value := shared[key]", Symbol: "Read"},
+		{ID: "e2", File: "main.go", Line: 11, Content: "shared[key] = value", Symbol: "Write"},
+		{ID: "e3", File: "main.go", Line: 20, Content: "go Write()", Symbol: "Start"},
 	}
 	findings := []review.Finding{
-		{File: "main.go", Line: 10, Msg: "数据竞争：并发读写 map", Evidence: "read shared map", EvidenceIDs: []string{"e1", "e2"}},
+		{File: "main.go", Line: 10, Msg: "数据竞争：并发读写 map", Evidence: "value := shared[key]", EvidenceIDs: []string{"e1", "e2", "e3"}},
 		{File: "main.go", Line: 11, Msg: "逻辑错误：把 map 当作连续索引访问", Evidence: "write shared map", EvidenceIDs: []string{"e1", "e2"}},
 	}
 	validations, status, _ := evaluateFindings(findings, evidence)
 	if status != EvaluateSufficient || !validations[0].Accepted || !validations[1].Accepted {
 		t.Fatalf("共享证据但根因不同的 Finding 都应保留: status=%s validations=%+v", status, validations)
+	}
+}
+
+func TestEvaluateRejectsRaceWithoutWritePath(t *testing.T) {
+	evidence := []*Evidence{
+		{ID: "e1", File: "main.go", Line: 10, Content: "existing, ok := m.tables[0]", Symbol: "findTableState"},
+		{ID: "e2", File: "main.go", Line: 20, Content: "go m.Release()", Symbol: "Release"},
+	}
+	finding := review.Finding{File: "main.go", Line: 10, Msg: "数据竞争：m.tables 存在无锁并发读写", Evidence: "existing, ok := m.tables[0]", EvidenceIDs: []string{"e1", "e2"}}
+	validations, status, gaps := evaluateFindings([]review.Finding{finding}, evidence)
+	if status != EvaluateInsufficient || validations[0].Accepted || len(gaps) == 0 {
+		t.Fatalf("没有共享写路径的竞态不应通过: status=%s validations=%+v gaps=%v", status, validations, gaps)
+	}
+}
+
+func TestEvaluateAcceptsRangeVariableCapture(t *testing.T) {
+	evidence := []*Evidence{
+		{ID: "e1", File: "main.go", Line: 10, Content: "for _, item := range items {", Symbol: "Run"},
+		{ID: "e2", File: "main.go", Line: 11, Content: "go func() { use(&item.Name) }()", Symbol: "Run"},
+	}
+	finding := review.Finding{File: "main.go", Line: 10, Msg: "数据竞争：goroutine 闭包捕获 range 变量 item", Evidence: "for _, item := range items; go func() { use(&item.Name) }", EvidenceIDs: []string{"e1", "e2"}}
+	validations, status, gaps := evaluateFindings([]review.Finding{finding}, evidence)
+	if status != EvaluateSufficient || !validations[0].Accepted || len(gaps) != 0 {
+		t.Fatalf("闭包捕获的竞态事实已闭合: status=%s validations=%+v gaps=%v", status, validations, gaps)
 	}
 }
 
@@ -470,8 +624,8 @@ func TestSearchCodeRecordsScopedAbsence(t *testing.T) {
 
 func TestEvaluateRejectsDuplicateAndSpeculativeFindings(t *testing.T) {
 	evidence := []*Evidence{
-		{ID: "e1", File: "main.go", Line: 10, Content: "lock", Symbol: "Read"},
-		{ID: "e2", File: "main.go", Line: 11, Content: "lock", Symbol: "Write"},
+		{ID: "e1", File: "main.go", Line: 10, Content: "shared = value", Symbol: "Write"},
+		{ID: "e2", File: "main.go", Line: 11, Content: "go Write()", Symbol: "Start"},
 	}
 	findings := []review.Finding{
 		{File: "main.go", Line: 10, Msg: "数据竞争：共享状态未同步", EvidenceIDs: []string{"e1", "e2"}},
@@ -481,5 +635,21 @@ func TestEvaluateRejectsDuplicateAndSpeculativeFindings(t *testing.T) {
 	validations, status, gaps := evaluateFindings(findings, evidence)
 	if status != EvaluatePartial || !validations[0].Accepted || validations[1].Accepted || validations[2].Accepted || len(gaps) < 2 {
 		t.Fatalf("应拒绝重复和推测 Finding: status=%s validations=%+v gaps=%v", status, validations, gaps)
+	}
+}
+
+func TestEvaluateDeduplicatesDifferentDescriptionsOfSameLockRootCause(t *testing.T) {
+	evidence := []*Evidence{
+		{ID: "e1", File: "main.go", Line: 10, Content: "s.mu.Lock()", Symbol: "Stop"},
+		{ID: "e2", File: "main.go", Line: 12, Content: "return", Symbol: "Stop"},
+		{ID: "e3", File: "main.go", Line: 20, Content: "s.mu.Lock()", Symbol: "Stop"},
+	}
+	findings := []review.Finding{
+		{File: "main.go", Line: 10, Msg: "持锁后提前 return 未释放，导致锁泄漏", Evidence: "s.mu.Lock(); return", EvidenceIDs: []string{"e1", "e2", "e3"}},
+		{File: "main.go", Line: 10, Msg: "重复获取同一把锁导致死锁", Evidence: "s.mu.Lock(); s.mu.Lock()", EvidenceIDs: []string{"e1", "e2", "e3"}},
+	}
+	validations, status, _ := evaluateFindings(findings, evidence)
+	if status != EvaluatePartial || !validations[0].Accepted || validations[1].Accepted {
+		t.Fatalf("同一锁根因的不同描述应只保留一条: status=%s validations=%+v", status, validations)
 	}
 }

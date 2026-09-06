@@ -151,6 +151,7 @@ func (t *toolset) searchCode(args map[string]interface{}) ([]*Evidence, error) {
 		return nil, fmt.Errorf("search_code unavailable: recall store is nil")
 	}
 	docs := t.store.Keyword(word)
+	limitedFile := ""
 	if file, ok := args["file"].(string); ok && file != "" {
 		file, err := repoRelativePath(t.repo, file)
 		if err != nil {
@@ -163,6 +164,10 @@ func (t *toolset) searchCode(args map[string]interface{}) ([]*Evidence, error) {
 			}
 		}
 		docs = filtered
+		limitedFile = file
+	}
+	if len(docs) == 0 && limitedFile != "" {
+		return []*Evidence{{Source: "search_code", Type: "search_absence", Relation: "supports", File: limitedFile, Line: 1, Content: fmt.Sprintf("文件 %s 中未找到 %q", limitedFile, word)}}, nil
 	}
 	out := make([]*Evidence, 0, len(docs))
 	for _, d := range docs {

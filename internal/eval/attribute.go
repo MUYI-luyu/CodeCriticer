@@ -1,113 +1,117 @@
 package eval
 
 import (
-	"github.com/MUYI-luyu/codecritic/internal/recall"
 	"github.com/MUYI-luyu/codecritic/internal/review"
 	"github.com/MUYI-luyu/codecritic/internal/workflow"
 )
 
-// BugStage 是一个 bug 在 Workflow 流水线里的归因阶段。
+// BugStage 表示 Ground Truth 首个未闭合的流水线阶段。
 type BugStage string
 
 const (
-	StageRecallMiss BugStage = "recall_miss" // 召回漏：召回上下文没覆盖 bug 行
-	StageLLMMiss    BugStage = "llm_miss"    // LLM漏：召回到了但 execute 阶段没报出
-	StageSelfHarm   BugStage = "self_harm"   // 自伤：execute 报了但被 validate 阈值丢弃
-	StageSuccess    BugStage = "success"     // 成功：execute 报了且 validate 保留
+	StageInputMiss          BugStage = "input_miss"
+	StageInvestigationMiss  BugStage = "investigation_miss"
+	StageReviewMiss         BugStage = "review_miss"
+	StageEvaluationSelfHarm BugStage = "evaluation_self_harm"
+	StageSuccess            BugStage = "success"
 )
 
-// BugAttribution 是单个 bug 的阶段归因结果。
+// BugAttribution 记录 Primary 在四个阶段的命中状态和 Related 的调查覆盖。
 type BugAttribution struct {
-	Bug          Bug      `json:"bug"`
-	Stage        BugStage `json:"stage"`
-	RecallHit    bool     `json:"recall_hit"`    // 召回是否覆盖 bug 行
-	ExecuteHit   bool     `json:"execute_hit"`   // execute 原始 findings 是否命中
-	ValidateKept bool     `json:"validate_kept"` // 命中的 finding 是否通过置信度阈值
+	Bug                    Bug      `json:"bug"`
+	Stage                  BugStage `json:"stage"`
+	InputHit               bool     `json:"input_hit"`
+	InvestigationHit       bool     `json:"investigation_hit"`
+	RawFindingHit          bool     `json:"raw_finding_hit"`
+	AcceptedFindingHit     bool     `json:"accepted_finding_hit"`
+	RelatedEvidenceCovered int      `json:"related_evidence_covered"`
+	RelatedEvidenceTotal   int      `json:"related_evidence_total"`
 }
 
-// Attribute 用 ground-truth 对 Workflow trace 做阶段归因。
-// 对每个 bug 判定「召回是否覆盖 / execute 是否命中 / validate 是否保留」，
-// 机械地归类到 召回漏 / LLM漏 / 自伤 / 成功 四类。
-func Attribute(bugs []Bug, a *workflow.Trace, tol int) []BugAttribution {
-	out := make([]BugAttribution, 0, len(bugs))
-	for _, b := range bugs {
-		var docs []recall.Doc
-		for _, e := range a.Evidence {
-			docs = append(docs, recall.Doc{File: e.File, Line: e.Line, Text: e.Content})
-		}
-		recallHit := recallCovers(docs, b, tol)
-		execIdx := executeHitIndex(b, a.Findings, tol)
-		execHit := execIdx >= 0
-
-		validateKept := false
-		if execHit {
-			for _, v := range a.Validations {
-				if v.FindingIndex == execIdx {
-					validateKept = v.Accepted
-					break
-				}
-			}
-		}
-
-		out = append(out, BugAttribution{
-			Bug:          b,
-			Stage:        classify(recallHit, execHit, validateKept),
-			RecallHit:    recallHit,
-			ExecuteHit:   execHit,
-			ValidateKept: validateKept,
-		})
+// Attribute 对一个 Case 的 Primary 做阶段归因，Related 仅用于调查覆盖统计。
+func Attribute(c *Case, trace *workflow.Trace, tol int) []BugAttribution {
+	primary := c.GT.Primary
+	bug := Bug{File: primary.File, Line: primary.Line, Desc: c.GT.Description}
+	if trace == nil {
+		return []BugAttribution{{
+			Bug:                  bug,
+			Stage:                StageInputMiss,
+			RelatedEvidenceTotal: len(c.GT.Related),
+		}}
 	}
-	return out
+
+	inputHit := evidenceSourceCovers(trace.Evidence, primary, tol, true)
+	investigationHit := evidenceSourceCovers(trace.Evidence, primary, tol, false)
+	rawFindingHit := findingsCover(trace.Findings, primary, tol)
+	acceptedFindingHit := findingsCover(acceptedFindings(trace), primary, tol)
+	relatedCovered := 0
+	for _, related := range c.GT.Related {
+		if evidenceSourceCovers(trace.Evidence, related, tol, false) {
+			relatedCovered++
+		}
+	}
+
+	return []BugAttribution{{
+		Bug:                    bug,
+		Stage:                  classify(inputHit, investigationHit, rawFindingHit, acceptedFindingHit),
+		InputHit:               inputHit,
+		InvestigationHit:       investigationHit,
+		RawFindingHit:          rawFindingHit,
+		AcceptedFindingHit:     acceptedFindingHit,
+		RelatedEvidenceCovered: relatedCovered,
+		RelatedEvidenceTotal:   len(c.GT.Related),
+	}}
 }
 
-// classify 由三个二值信号定位阶段。execute 命中优先（一旦报出，就只可能是成功或自伤）。
-func classify(recallHit, execHit, validateKept bool) BugStage {
+func classify(inputHit, investigationHit, rawFindingHit, acceptedFindingHit bool) BugStage {
 	switch {
-	case execHit && validateKept:
+	case acceptedFindingHit:
 		return StageSuccess
-	case execHit && !validateKept:
-		return StageSelfHarm
-	case recallHit:
-		return StageLLMMiss
+	case rawFindingHit:
+		return StageEvaluationSelfHarm
+	case investigationHit:
+		return StageReviewMiss
+	case inputHit:
+		return StageInvestigationMiss
 	default:
-		return StageRecallMiss
+		return StageInputMiss
 	}
 }
 
-// recallCovers 判断召回片段里有没有覆盖 bug 行的。
-// 路径均为仓库相对路径。
-func recallCovers(docs []recall.Doc, b Bug, tol int) bool {
-	for _, d := range docs {
-		if d.File != b.File {
+func evidenceSourceCovers(evidence []*workflow.Evidence, location Location, tol int, input bool) bool {
+	for _, item := range evidence {
+		if item == nil || (item.Source == "diff") != input {
 			continue
 		}
-		if b.Line <= 0 { // 文件级 ground-truth：同文件即算覆盖
-			return true
-		}
-		if abs(d.Line-b.Line) <= tol {
+		if evidenceCovers(item, location, tol) {
 			return true
 		}
 	}
 	return false
 }
 
-// executeHitIndex 返回命中 bug b 的 finding 下标（无则 -1）。
-// 匹配语义与 Compute 保持一致（精确同文件 + 容差行内，取最近）。
-func executeHitIndex(b Bug, fs []review.Finding, tol int) int {
-	best := -1
-	for i, f := range fs {
-		if b.File != f.File {
+func evidenceCovers(evidence *workflow.Evidence, location Location, tol int) bool {
+	if evidence.File != location.File {
+		return false
+	}
+	if location.Line <= 0 {
+		return true
+	}
+	end := evidence.EndLine
+	if end < evidence.Line {
+		end = evidence.Line
+	}
+	return location.Line >= evidence.Line-tol && location.Line <= end+tol
+}
+
+func findingsCover(findings []review.Finding, location Location, tol int) bool {
+	for _, finding := range findings {
+		if finding.File != location.File {
 			continue
 		}
-		if b.Line <= 0 { // 文件级：同文件首个 finding
-			return i
-		}
-		if abs(b.Line-f.Line) > tol {
-			continue
-		}
-		if best == -1 || abs(b.Line-fs[best].Line) > abs(b.Line-f.Line) {
-			best = i
+		if location.Line <= 0 || abs(location.Line-finding.Line) <= tol {
+			return true
 		}
 	}
-	return best
+	return false
 }

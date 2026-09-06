@@ -120,44 +120,6 @@ func main() {
 	t.Logf("✅ Trace saved successfully with dimension and cost")
 }
 
-// TestComputeMultiLocationIntegration 验证多位置 GT 的集成。
-func TestComputeMultiLocationIntegration(t *testing.T) {
-	c := &Case{
-		Name: "multi-loc-test",
-		GT: GroundTruth{
-			Primary: Location{File: "main.go", Line: 10},
-			Related: []Location{
-				{File: "main.go", Line: 20},
-				{File: "util.go", Line: 5},
-			},
-		},
-	}
-
-	// Primary 命中 -> 覆盖率 50%
-	findings1 := []review.Finding{
-		{File: "main.go", Line: 10},
-	}
-	m1 := ComputeMultiLocation(c, findings1, 3, 0.5)
-	if m1.Found != 1 {
-		t.Errorf("Primary hit: Found=%d, want 1", m1.Found)
-	}
-
-	// Primary + 1 Related 命中 -> 覆盖率 75%
-	findings2 := []review.Finding{
-		{File: "main.go", Line: 10},
-		{File: "main.go", Line: 20},
-	}
-	m2 := ComputeMultiLocation(c, findings2, 3, 0.5)
-	if m2.Found != 1 {
-		t.Errorf("Primary + 1 Related: Found=%d, want 1", m2.Found)
-	}
-	if m2.True != 2 {
-		t.Errorf("True findings=%d, want 2", m2.True)
-	}
-
-	t.Logf("✅ Multi-location GT attribution works correctly")
-}
-
 func contains(s, substr string) bool {
 	return len(s) >= len(substr) && (s == substr || len(s) > len(substr) && containsHelper(s, substr))
 }

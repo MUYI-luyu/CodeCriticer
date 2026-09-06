@@ -26,11 +26,12 @@ type Location struct {
 
 // GroundTruth 是缺陷的完整标注（单一事实来源）。
 type GroundTruth struct {
-	Primary  Location   `json:"primary"`             // 主缺陷位置
-	Related  []Location `json:"related,omitempty"`   // 相关位置（多位置证据链）
-	Symbols  []string   `json:"symbols,omitempty"`   // 涉及的符号（函数/变量名）
-	BugTypes []string   `json:"bug_types,omitempty"` // Bug 类型（可多标签）
-	Evidence string     `json:"evidence,omitempty"`  // 人工标注的关键证据
+	Primary     Location   `json:"primary"`               // 主缺陷位置
+	Related     []Location `json:"related,omitempty"`     // 相关位置（多位置证据链）
+	Description string     `json:"description,omitempty"` // 数据集提供的缺陷描述
+	Symbols     []string   `json:"symbols,omitempty"`     // 涉及的符号（函数/变量名）
+	BugTypes    []string   `json:"bug_types,omitempty"`   // Bug 类型（可多标签）
+	Evidence    string     `json:"evidence,omitempty"`    // 人工标注的关键证据
 }
 
 // Metadata 是数据集原始提供的元信息（不可变事实）。
@@ -56,20 +57,13 @@ type Case struct {
 	Metadata *Metadata `json:"metadata,omitempty"`
 }
 
-// Bugs 返回向后兼容的 Bug[] 视图（从 GT 转换）。
+// Bugs 返回以 Primary 为唯一 Bug 单位的兼容视图。
 func (c *Case) Bugs() []Bug {
-	var bugs []Bug
-	bugs = append(bugs, Bug{
+	return []Bug{{
 		File: c.GT.Primary.File,
 		Line: c.GT.Primary.Line,
-	})
-	for _, loc := range c.GT.Related {
-		bugs = append(bugs, Bug{
-			File: loc.File,
-			Line: loc.Line,
-		})
-	}
-	return bugs
+		Desc: c.GT.Description,
+	}}
 }
 
 // Load 加载数据集目录，每个子目录是一个用例。
@@ -148,6 +142,7 @@ func loadCase(dir string) (*Case, error) {
 			File: bugs[0].File,
 			Line: bugs[0].Line,
 		}
+		gt.Description = bugs[0].Desc
 		for i := 1; i < len(bugs); i++ {
 			gt.Related = append(gt.Related, Location{
 				File: bugs[i].File,

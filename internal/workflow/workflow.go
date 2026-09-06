@@ -465,7 +465,7 @@ func encodeInvestigatorEvidence(tr *Trace) string {
 	return encodeEvidence(filtered)
 }
 func buildReviewPrompt(d []byte, p Plan, e []*Evidence) string {
-	return fmt.Sprintf("审查 diff 并只输出 JSON {\"findings\":[{\"file\":\"...\",\"line\":0,\"severity\":\"error|warning|info\",\"msg\":\"...\",\"evidence\":\"...\",\"evidence_ids\":[\"e1\"]}]}。每条发现必须引用真正支持结论的证据编号。一个根因只输出一条发现；只报告当前代码可达、可复现的问题，不报告未来扩展风险或仅存在的编码风格问题。行号必须锚定引入根因的代码，不得只指向后续触发点或症状位置；例如锁初始化或配置错误应锚定初始化/配置行。无法定位或证据不足时不要输出。计划：%+v\n证据：%s\nDiff：\n%s", p, encodeEvidence(e), d)
+	return fmt.Sprintf("审查 diff 并只输出 JSON {\"findings\":[{\"file\":\"...\",\"line\":0,\"severity\":\"error|warning|info\",\"msg\":\"...\",\"evidence\":\"...\",\"evidence_ids\":[\"e1\"]}]}。每条发现必须只对应一个明确的 Primary Root Cause，多个症状、触发位置或修复建议不能拆成多条发现，也不能把多个根因拼成一条。Evidence 必须闭合“触发点 → 关键机制 → 后果”因果链，分别引用直接定位根因的代码、必要的调用/状态/时序事实以及可达后果；缺少任一关键环节时不要依靠相邻代码、关键词或推测补全。只报告当前代码可达、可复现的问题，不报告未来扩展风险或仅存在的编码风格问题。行号必须锚定引入根因的代码，不得只指向后续触发点或症状位置；例如锁初始化或配置错误应锚定初始化/配置行。同一根因共享主要 Evidence 时只输出一条、更完整的发现。无法定位或证据不足时不要输出。计划：%+v\n证据：%s\nDiff：\n%s", p, encodeEvidence(e), d)
 }
 func evaluateFindings(fs []review.Finding, e []*Evidence) ([]Validation, EvaluateStatus, []string) {
 	out := make([]Validation, 0, len(fs))
@@ -592,7 +592,13 @@ func sameFindingTopic(a, b string) bool {
 			return true
 		}
 	}
-	return false
+	lockTerms := []string{"锁", "lock", "mutex", "死锁"}
+	hasLockA, hasLockB := false, false
+	for _, term := range lockTerms {
+		hasLockA = hasLockA || strings.Contains(strings.ToLower(a), strings.ToLower(term))
+		hasLockB = hasLockB || strings.Contains(strings.ToLower(b), strings.ToLower(term))
+	}
+	return hasLockA && hasLockB
 }
 
 func sharedEvidence(a, b review.Finding) int {
@@ -611,29 +617,290 @@ func sharedEvidence(a, b review.Finding) int {
 
 func requiredFactsSupportFinding(f review.Finding, byID map[string]*Evidence) bool {
 	msg := strings.ToLower(f.Msg)
-	if !strings.Contains(msg, "死锁") && !strings.Contains(msg, "数据竞争") && !strings.Contains(msg, "竞态") && !strings.Contains(msg, "goroutine") {
-		return true
-	}
-	symbols := make(map[string]bool)
+	evidence := make([]*Evidence, 0, len(f.EvidenceIDs))
 	content := strings.Builder{}
 	for _, id := range f.EvidenceIDs {
 		e := byID[id]
 		if e == nil {
 			continue
 		}
-		if e.Symbol != "" {
-			symbols[e.Symbol] = true
-		}
+		evidence = append(evidence, e)
 		content.WriteString(strings.ToLower(e.Content))
 		content.WriteByte('\n')
 	}
-	if strings.Contains(msg, "死锁") || strings.Contains(msg, "数据竞争") || strings.Contains(msg, "竞态") {
-		return len(symbols) >= 2
+	if strings.Contains(msg, "数据竞争") || strings.Contains(msg, "竞态") {
+		return raceEvidenceClosed(content.String())
+	}
+	if strings.Contains(msg, "死锁") || lockRelatedFinding(msg, evidence) {
+		return deadlockEvidenceClosed(f, byID)
+	}
+	if channelLifecycleFinding(msg) {
+		return channelLifecycleEvidenceClosed(evidence)
+	}
+	if !strings.Contains(msg, "goroutine") {
+		return true
 	}
 	text := content.String()
 	started := strings.Contains(text, "go ") || strings.Contains(text, "runworker")
 	blocked := strings.Contains(text, "<-") || strings.Contains(text, ".wait(") || strings.Contains(text, " <- ")
 	return started && blocked
+}
+
+func channelLifecycleFinding(msg string) bool {
+	return containsAnyPhrase(msg, "nil channel", "nil 通道", "未初始化", "空 channel", "关闭 channel", "channel")
+}
+
+func channelLifecycleEvidenceClosed(evidence []*Evidence) bool {
+	for _, e := range evidence {
+		content := strings.ToLower(e.Content)
+		if strings.Contains(content, "<-") || strings.Contains(content, "close(") || strings.Contains(content, "make(chan") {
+			return true
+		}
+	}
+	return false
+}
+
+func lockRelatedFinding(msg string, evidence []*Evidence) bool {
+	mentionsLock := containsAnyPhrase(msg, "锁", "mutex", "sync.cond", "lock", "unlock")
+	if !mentionsLock {
+		return false
+	}
+	for _, e := range evidence {
+		content := strings.ToLower(e.Content)
+		if lockReceiver(content) != "" || isUnlock(content) || strings.Contains(content, ".wait(") {
+			return true
+		}
+	}
+	return false
+}
+
+// deadlockEvidenceClosed 按锁泄漏、锁重入和锁顺序环分别检查最小因果事实。
+func deadlockEvidenceClosed(f review.Finding, byID map[string]*Evidence) bool {
+	msg := strings.ToLower(f.Msg)
+	evidence := make([]*Evidence, 0, len(f.EvidenceIDs))
+	var content strings.Builder
+	for _, id := range f.EvidenceIDs {
+		e := byID[id]
+		if e == nil {
+			continue
+		}
+		evidence = append(evidence, e)
+		content.WriteString(strings.ToLower(e.Content))
+		content.WriteByte('\n')
+	}
+	text := content.String()
+
+	// 声称跨函数异步任务参与死锁时，必须引用真实的并发启动事实，函数名不能代替该事实。
+	if strings.Contains(msg, "goroutine") && !strings.Contains(msg, "同一 goroutine") && distinctEvidenceSymbols(evidence) >= 2 && !containsConcurrentStart(text) {
+		return false
+	}
+	if containsAnyPhrase(msg, "ab-ba", "锁顺序", "反向锁", "顺序相反", "环路", "循环等待") {
+		return distinctEvidenceSymbols(evidence) >= 2 && len(lockReceivers(evidence)) >= 2
+	}
+	if lockExitEvidenceClosed(evidence) {
+		return true
+	}
+	if lockChannelCycleEvidenceClosed(evidence) {
+		return true
+	}
+	return repeatedLockEvidenceClosed(evidence)
+}
+
+func distinctEvidenceSymbols(evidence []*Evidence) int {
+	symbols := make(map[string]bool)
+	for _, e := range evidence {
+		symbol := strings.TrimSpace(strings.ToLower(e.Symbol))
+		if index := strings.LastIndex(symbol, "."); index >= 0 {
+			symbol = symbol[index+1:]
+		}
+		symbol = strings.Trim(symbol, "()* ")
+		if symbol != "" {
+			symbols[symbol] = true
+		}
+	}
+	return len(symbols)
+}
+
+func containsConcurrentStart(text string) bool {
+	return strings.Contains(text, "go ") || strings.Contains(text, "time.afterfunc(")
+}
+
+func containsAnyPhrase(text string, values ...string) bool {
+	for _, value := range values {
+		if strings.Contains(text, value) {
+			return true
+		}
+	}
+	return false
+}
+
+func lockExitEvidenceClosed(evidence []*Evidence) bool {
+	for _, lock := range evidence {
+		if lock.Symbol == "" || lock.Line <= 0 || lockReceiver(lock.Content) == "" {
+			continue
+		}
+		for _, exit := range evidence {
+			if !sameFile(lock.File, exit.File) || lock.Symbol != exit.Symbol || exit.Line <= lock.Line || !isEarlyExit(exit.Content) {
+				continue
+			}
+			unlocked := false
+			for _, candidate := range evidence {
+				if sameFile(lock.File, candidate.File) && lock.Symbol == candidate.Symbol && candidate.Line > lock.Line && candidate.Line <= exit.Line && isUnlock(candidate.Content) {
+					unlocked = true
+					break
+				}
+			}
+			if !unlocked {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func isEarlyExit(content string) bool {
+	line := strings.TrimSpace(strings.ToLower(content))
+	return line == "return" || strings.HasPrefix(line, "return ") || line == "break" || strings.HasPrefix(line, "break ")
+}
+
+func isUnlock(content string) bool {
+	line := strings.ToLower(content)
+	return strings.Contains(line, ".unlock(") || strings.Contains(line, ".runlock(")
+}
+
+func repeatedLockEvidenceClosed(evidence []*Evidence) bool {
+	positions := make(map[string]map[string]bool)
+	symbols := make(map[string]map[string]bool)
+	for _, e := range evidence {
+		if receiver := lockReceiver(e.Content); receiver != "" {
+			if positions[receiver] == nil {
+				positions[receiver] = make(map[string]bool)
+				symbols[receiver] = make(map[string]bool)
+			}
+			positions[receiver][fmt.Sprintf("%s:%d", filepath.Clean(e.File), e.Line)] = true
+			if symbol := normalizeEvidenceSymbol(e.Symbol); symbol != "" {
+				symbols[receiver][symbol] = true
+			}
+		}
+	}
+	for receiver, receiverPositions := range positions {
+		if len(receiverPositions) < 2 {
+			continue
+		}
+		if len(symbols[receiver]) <= 1 || hasSynchronousCallEvidence(evidence, symbols[receiver]) {
+			return true
+		}
+	}
+	return false
+}
+
+func lockChannelCycleEvidenceClosed(evidence []*Evidence) bool {
+	hasChannelOperation := false
+	symbols := make(map[string]map[string]bool)
+	for _, e := range evidence {
+		if strings.Contains(e.Content, "<-") {
+			hasChannelOperation = true
+		}
+		if receiver := lockReceiver(e.Content); receiver != "" {
+			if symbols[receiver] == nil {
+				symbols[receiver] = make(map[string]bool)
+			}
+			if symbol := normalizeEvidenceSymbol(e.Symbol); symbol != "" {
+				symbols[receiver][symbol] = true
+			}
+		}
+	}
+	if !hasChannelOperation {
+		return false
+	}
+	for _, receiverSymbols := range symbols {
+		if len(receiverSymbols) >= 2 {
+			return true
+		}
+	}
+	return false
+}
+
+func hasSynchronousCallEvidence(evidence []*Evidence, lockSymbols map[string]bool) bool {
+	for _, e := range evidence {
+		if !lockSymbols[normalizeEvidenceSymbol(e.Symbol)] {
+			continue
+		}
+		line := strings.TrimSpace(strings.ToLower(e.Content))
+		if lockReceiver(line) != "" || isUnlock(line) || strings.Contains(line, ".wait(") {
+			continue
+		}
+		if strings.Contains(line, "(") && strings.Contains(line, ")") && !strings.HasPrefix(line, "func ") {
+			return true
+		}
+	}
+	return false
+}
+
+func normalizeEvidenceSymbol(symbol string) string {
+	symbol = strings.TrimSpace(strings.ToLower(symbol))
+	if index := strings.LastIndex(symbol, "."); index >= 0 {
+		symbol = symbol[index+1:]
+	}
+	return strings.Trim(symbol, "()* ")
+}
+
+func lockReceivers(evidence []*Evidence) map[string]bool {
+	receivers := make(map[string]bool)
+	for _, e := range evidence {
+		if receiver := lockReceiver(e.Content); receiver != "" {
+			receivers[receiver] = true
+		}
+	}
+	return receivers
+}
+
+func lockReceiver(content string) string {
+	line := strings.TrimSpace(strings.ToLower(content))
+	for _, call := range []string{".rlock()", ".lock()"} {
+		if index := strings.Index(line, call); index > 0 {
+			return strings.TrimSpace(line[:index])
+		}
+	}
+	return ""
+}
+
+// raceEvidenceClosed 检查竞态结论是否同时具备共享写入和并发入口。
+func raceEvidenceClosed(text string) bool {
+	text = strings.ToLower(text)
+	concurrent := containsConcurrentStart(text)
+	if !concurrent {
+		return false
+	}
+	// range 变量由循环隐式反复赋值，闭包异步引用即可形成独立的竞态事实组合。
+	loopCapture := strings.Contains(text, "range ") && strings.Contains(text, "go func") && strings.Contains(text, "&")
+	return loopCapture || containsConcreteWrite(text)
+}
+
+func containsConcreteWrite(text string) bool {
+	for _, line := range strings.Split(text, "\n") {
+		line = strings.TrimSpace(line)
+		for i := 0; i < len(line); i++ {
+			if line[i] != '=' {
+				continue
+			}
+			previous := byte(0)
+			if i > 0 {
+				previous = line[i-1]
+			}
+			next := byte(0)
+			if i+1 < len(line) {
+				next = line[i+1]
+			}
+			if previous == ':' || previous == '=' || previous == '!' || previous == '<' || previous == '>' || next == '=' {
+				continue
+			}
+			if strings.TrimSpace(line[:i]) != "" {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func anchorSupportsClaim(f review.Finding, byID map[string]*Evidence) bool {
