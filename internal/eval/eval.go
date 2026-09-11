@@ -56,14 +56,23 @@ func RunConcurrent(ctx context.Context, llm *review.LLM, datasetDir string, verb
 		go func() {
 			defer wg.Done()
 			for c := range jobs {
-				results <- runCase(ctx, llm, c, verbose, traceDir)
+				r := runCase(ctx, llm, c, verbose, traceDir)
+				select {
+				case results <- r:
+				case <-ctx.Done():
+					return
+				}
 			}
 		}()
 	}
 	go func() {
 		defer close(jobs)
 		for _, c := range cases {
-			jobs <- c
+			select {
+			case jobs <- c:
+			case <-ctx.Done():
+				return
+			}
 		}
 	}()
 	go func() { wg.Wait(); close(results) }()
@@ -128,15 +137,14 @@ func runCase(ctx context.Context, llm *review.LLM, c *Case, verbose bool, traceD
 	dim := ComputeDimension(c)
 	if traceDir != "" {
 		_ = SaveTrace(traceDir, EvalTrace{
-			Name:             c.Name,
-			Bugs:             c.Bugs(),
-			GroundTruth:      c.GT,
-			BaselineFindings: trace.Findings,
-			Workflow:         trace,
-			Attributions:     attrs,
-			Metrics:          metrics,
-			Dimension:        &dim,
-			CostSummary:      cost,
+			Name:         c.Name,
+			Bugs:         c.Bugs(),
+			GroundTruth:  c.GT,
+			Workflow:     trace,
+			Attributions: attrs,
+			Metrics:      metrics,
+			Dimension:    &dim,
+			CostSummary:  cost,
 		})
 	}
 
@@ -174,22 +182,17 @@ func failedCase(c *Case, trace *workflow.Trace, stage string, err error, traceDi
 	}
 	if traceDir != "" {
 		dim := ComputeDimension(c)
-		var rawFindings []review.Finding
-		if trace != nil {
-			rawFindings = trace.Findings
-		}
 		_ = SaveTrace(traceDir, EvalTrace{
-			Name:             c.Name,
-			Bugs:             c.Bugs(),
-			GroundTruth:      c.GT,
-			BaselineFindings: rawFindings,
-			Workflow:         trace,
-			Attributions:     attrs,
-			Metrics:          metrics,
-			FailureStage:     stage,
-			Failure:          message,
-			Dimension:        &dim,
-			CostSummary:      ComputeCost(trace),
+			Name:         c.Name,
+			Bugs:         c.Bugs(),
+			GroundTruth:  c.GT,
+			Workflow:     trace,
+			Attributions: attrs,
+			Metrics:      metrics,
+			FailureStage: stage,
+			Failure:      message,
+			Dimension:    &dim,
+			CostSummary:  ComputeCost(trace),
 		})
 	}
 	return caseResult{

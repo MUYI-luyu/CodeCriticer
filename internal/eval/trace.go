@@ -8,7 +8,6 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/MUYI-luyu/codecritic/internal/review"
 	"github.com/MUYI-luyu/codecritic/internal/workflow"
 )
 
@@ -16,17 +15,16 @@ import (
 // 它把「ground-truth、Workflow 产出、阶段归因」聚在一份 JSON 里，
 // 让 31 例自伤 / 19 例真漏这类问题可以事后逐阶段回看，而不是黑盒。
 type EvalTrace struct {
-	Name             string           `json:"name"`
-	Bugs             []Bug            `json:"bugs"` // ground-truth
-	GroundTruth      GroundTruth      `json:"ground_truth"`
-	BaselineFindings []review.Finding `json:"baseline_findings"`
-	Workflow         *workflow.Trace  `json:"workflow"`
-	Attributions     []BugAttribution `json:"attributions"` // 对末轮 attempt 的阶段归因
-	Metrics          TraceMetrics     `json:"metrics"`
-	FailureStage     string           `json:"failure_stage,omitempty"`
-	Failure          string           `json:"failure,omitempty"`
-	Dimension        *CaseDimension   `json:"dimension"`    // 运行时计算的维度（Scale/Scope）
-	CostSummary      CostSummary      `json:"cost_summary"` // 本 case 的 token 成本汇总
+	Name         string           `json:"name"`
+	Bugs         []Bug            `json:"bugs"` // ground-truth
+	GroundTruth  GroundTruth      `json:"ground_truth"`
+	Workflow     *workflow.Trace  `json:"workflow"`
+	Attributions []BugAttribution `json:"attributions"` // 对末轮 attempt 的阶段归因
+	Metrics      TraceMetrics     `json:"metrics"`
+	FailureStage string           `json:"failure_stage,omitempty"`
+	Failure      string           `json:"failure,omitempty"`
+	Dimension    *CaseDimension   `json:"dimension"`    // 运行时计算的维度（Scale/Scope）
+	CostSummary  CostSummary      `json:"cost_summary"` // 本 case 的 token 成本汇总
 }
 
 // SaveTrace 把一份 EvalTrace 持久化成 <dir>/<name>.json。
@@ -37,7 +35,7 @@ func SaveTrace(dir string, t EvalTrace) error {
 		return err
 	}
 	path := filepath.Join(dir, safeName(t.Name)+".json")
-	return os.WriteFile(path, data, 0o644)
+	return os.WriteFile(path, data, 0o600)
 }
 
 // safeName 把用例名里的路径分隔符换成下划线，避免写到子目录/越界。

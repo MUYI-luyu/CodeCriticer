@@ -135,7 +135,21 @@ func (w *Workflow) Run(ctx context.Context, req Request) (*Result, error) {
 		}
 	} else {
 		tr.Errors = append(tr.Errors, fmt.Sprintf("plan: %v", planErr))
-		// 降级到确定性的文件和符号计划。
+		// LLM 规划失败时仍保留确定性的调查目标，避免空计划过早收敛。
+		for _, seed := range tr.RiskSeeds {
+			if seed.File != "" && !containsString(tr.Plan.TargetFiles, seed.File) {
+				tr.Plan.TargetFiles = append(tr.Plan.TargetFiles, seed.File)
+			}
+			if seed.Symbol != "" && !containsString(tr.Plan.Symbols, seed.Symbol) {
+				tr.Plan.Symbols = append(tr.Plan.Symbols, seed.Symbol)
+			}
+			if trigger := strings.TrimSpace(seed.Trigger); trigger != "" {
+				tr.Plan.Questions = append(tr.Plan.Questions, "检查"+trigger+"是否由变更引入")
+			}
+		}
+		if len(tr.Plan.Questions) == 0 {
+			tr.Plan.Questions = []string{"检查变更点及其直接影响范围是否存在可证实的问题"}
+		}
 	}
 	idx, graphErr := graph.Build(w.repo)
 	if graphErr != nil {
@@ -969,6 +983,15 @@ func hasRejected(vs []Validation) bool {
 	}
 	return false
 }
+func containsString(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
+}
+
 func questionsCovered(tr *Trace) bool {
 	if len(tr.Plan.Questions) == 0 {
 		return hasSubstantiveEvidence(tr.Evidence)

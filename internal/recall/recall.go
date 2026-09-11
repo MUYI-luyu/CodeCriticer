@@ -106,7 +106,7 @@ type match struct {
 }
 
 func rgSearch(root, word string) []match {
-	out, err := exec.Command("rg", "-n", "--no-heading", word, root).Output()
+	out, err := exec.Command("rg", "-n", "--no-heading", "--glob", "*.go", "--glob", "!.git/**", "--glob", "!logs/**", "--glob", "!参考项目/**", "--glob", "!文档/**", "--glob", "!重构codecritic/**", "--max-count", "200", word, root).Output()
 	if err == nil {
 		return parseRg(out)
 	}

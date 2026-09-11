@@ -25,75 +25,6 @@ const planPrompt = `你是代码审查规划者。读下面的 unified diff，�
 
 const findingRepairPrompt = `你是 JSON 修复器。将输入修复为合法 JSON，只能修复格式，不能增加、删除或改写 finding 的语义。只输出 {"findings":[]} 结构，不要其他文字。`
 
-/* const validatePrompt = `你是代码审查证据校验员。给出一个 finding 与召回的证据，评估该 finding 的可信度。
-
-Finding:
-文件: %s
-行号: %d
-严重程度: %s
-问题: %s
-声称证据: %s
-
-召回的证据：
-函数体上下文:
-%s
-
-变量定义:
-%s
-
-调用关系:
-%s
-
-注意：召回的证据可能来自 Plan 阶段（包含跨函数/跨文件的上下文），也可能来自局部提取（仅函数体）。
-如果证据中包含多个代码片段（不同文件或行号），说明是跨函数证据，应优先利用这些跨函数关系进行评估。
-
-输出 JSON：
-{
-  "confidence": 0.0-1.0,
-  "evidence": "支持该 finding 的关键证据（代码片段）",
-  "gaps": ["证据缺口1", "证据缺口2"]
-}
-
-评分标准：
-- 0.9-1.0：有明确代码证据，必然导致 bug（如：确实 nil check 缺失且后续解引用）
-- 0.7-0.9：有间接证据，很可能是 bug（如：并发访问共享变量但无锁保护）
-- 0.4-0.7：证据不足，可能是误报（如：声称 panic 但没看到触发路径）
-- 0.0-0.4：明显误报（如：声称 nil panic 但代码已有 if x != nil 检查）
-
-如果 confidence < 0.7，必须在 gaps 中列出缺失的证据。
-只输出 JSON，不要其他文字。`
-
-const critiquePrompt = `你是代码审查批评者。给出一个低可信度的 finding 及其 validation 结果，分析为什么可信度低，并给出改进建议。
-
-Finding: [%s] %s:%d - %s
-
-Validation 结果:
-置信度: %.1f%%
-证据: %s
-缺口: %s
-
-输出 JSON：
-{
-  "reason": "为什么可信度低（一句话）",
-  "evidence": "反驳的证据（从 validation 的证据中提取关键部分）",
-  "suggestion": "下次审查时应该做什么（具体的行动建议）"
-}
-
-示例：
-Finding: "Variable x may be nil, potential panic"
-Validation Confidence: 0.3
-Validation Evidence: "Line 10: if x != nil { x.Method() }"
-Validation Gaps: ["未检查所有 x 的使用点", "未追踪 x 的定义"]
-
-输出：
-{
-  "reason": "声称 nil panic，但第 10 行已有 if x != nil 检查保护",
-  "evidence": "if x != nil { x.Method() }",
-  "suggestion": "下次审查前，先检索变量的所有赋值语句和 nil 检查，确认是否有未保护的使用点"
-}
-
-只输出 JSON，不要其他文字。` */
-
 // Config 返回 LLM 的配置（公开给 agent 包使用）。
 func (l *LLM) Config() *Config {
 	return l.config
@@ -235,12 +166,6 @@ func (l *LLM) chatWithUsage(ctx context.Context, system, user, model string) (st
 	}
 	l.metrics.recordFail(model)
 	return "", totalUsage, lastErr
-}
-
-// chat 发送一轮对话（带指数退避重试），返回助手文本。
-func (l *LLM) chat(ctx context.Context, system, user, model string) (string, error) {
-	text, _, err := l.chatWithUsage(ctx, system, user, model)
-	return text, err
 }
 
 // chatOnce 发送单次 HTTP 请求，返回文本与 token 用量。
