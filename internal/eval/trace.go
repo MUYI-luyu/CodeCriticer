@@ -15,16 +15,18 @@ import (
 // 它把「ground-truth、Workflow 产出、阶段归因」聚在一份 JSON 里，
 // 让 31 例自伤 / 19 例真漏这类问题可以事后逐阶段回看，而不是黑盒。
 type EvalTrace struct {
-	Name         string           `json:"name"`
-	Bugs         []Bug            `json:"bugs"` // ground-truth
-	GroundTruth  GroundTruth      `json:"ground_truth"`
-	Workflow     *workflow.Trace  `json:"workflow"`
-	Attributions []BugAttribution `json:"attributions"` // 对末轮 attempt 的阶段归因
-	Metrics      TraceMetrics     `json:"metrics"`
-	FailureStage string           `json:"failure_stage,omitempty"`
-	Failure      string           `json:"failure,omitempty"`
-	Dimension    *CaseDimension   `json:"dimension"`    // 运行时计算的维度（Scale/Scope）
-	CostSummary  CostSummary      `json:"cost_summary"` // 本 case 的 token 成本汇总
+	Name         string              `json:"name"`
+	Bugs         []Bug               `json:"bugs"` // ground-truth
+	GroundTruth  GroundTruth         `json:"ground_truth"`
+	Workflow     *workflow.Trace     `json:"workflow"`
+	Attributions []BugAttribution    `json:"attributions"` // 对末轮 attempt 的阶段归因
+	Metrics      TraceMetrics        `json:"metrics"`
+	Axes         EvaluationAxes      `json:"axes"`
+	Semantic     *SemanticEvaluation `json:"semantic,omitempty"`
+	FailureStage string              `json:"failure_stage,omitempty"`
+	Failure      string              `json:"failure,omitempty"`
+	Dimension    *CaseDimension      `json:"dimension"`    // 运行时计算的维度（Scale/Scope）
+	CostSummary  CostSummary         `json:"cost_summary"` // 本 case 的 token 成本汇总
 }
 
 // SaveTrace 把一份 EvalTrace 持久化成 <dir>/<name>.json。
@@ -46,17 +48,17 @@ func safeName(name string) string {
 
 // AttributionCounts 汇总各阶段的 bug 计数，用于末尾分布表。
 type AttributionCounts struct {
-	InputMiss           int
-	InvestigationMiss   int
-	ReviewMiss          int
-	EvaluationSelfHarm  int
-	Success             int
-	InputHits           int
-	InvestigationHits   int
-	RawFindingHits      int
-	AcceptedFindingHits int
-	RelatedCovered      int
-	RelatedTotal        int
+	InputMiss         int
+	InvestigationMiss int
+	ClaimMiss         int
+	VerdictSelfHarm   int
+	Success           int
+	InputHits         int
+	InvestigationHits int
+	RawClaimHits      int
+	AcceptedClaimHits int
+	RelatedCovered    int
+	RelatedTotal      int
 }
 
 // Add 把一个 case 的归因结果累加进分布。
@@ -68,11 +70,11 @@ func (c AttributionCounts) Add(attrs []BugAttribution) AttributionCounts {
 		if a.InvestigationHit {
 			c.InvestigationHits++
 		}
-		if a.RawFindingHit {
-			c.RawFindingHits++
+		if a.RawClaimHit {
+			c.RawClaimHits++
 		}
-		if a.AcceptedFindingHit {
-			c.AcceptedFindingHits++
+		if a.AcceptedClaimHit {
+			c.AcceptedClaimHits++
 		}
 		c.RelatedCovered += a.RelatedEvidenceCovered
 		c.RelatedTotal += a.RelatedEvidenceTotal
@@ -81,10 +83,10 @@ func (c AttributionCounts) Add(attrs []BugAttribution) AttributionCounts {
 			c.InputMiss++
 		case StageInvestigationMiss:
 			c.InvestigationMiss++
-		case StageReviewMiss:
-			c.ReviewMiss++
-		case StageEvaluationSelfHarm:
-			c.EvaluationSelfHarm++
+		case StageClaimMiss:
+			c.ClaimMiss++
+		case StageVerdictSelfHarm:
+			c.VerdictSelfHarm++
 		case StageSuccess:
 			c.Success++
 		}
@@ -94,7 +96,7 @@ func (c AttributionCounts) Add(attrs []BugAttribution) AttributionCounts {
 
 // Total 是各归因类别之和（应等于参与归因的 bug 总数）。
 func (c AttributionCounts) Total() int {
-	return c.InputMiss + c.InvestigationMiss + c.ReviewMiss + c.EvaluationSelfHarm + c.Success
+	return c.InputMiss + c.InvestigationMiss + c.ClaimMiss + c.VerdictSelfHarm + c.Success
 }
 
 // Print 打印阶段归因分布表到 w。
@@ -108,8 +110,8 @@ func (c AttributionCounts) Print(w io.Writer) {
 	}{
 		{"Input / Primary", c.InputHits},
 		{"Investigation / Primary", c.InvestigationHits},
-		{"Raw Finding / Primary", c.RawFindingHits},
-		{"Accepted Finding / Primary", c.AcceptedFindingHits},
+		{"Raw Claim / Primary", c.RawClaimHits},
+		{"Accepted Claim / Primary", c.AcceptedClaimHits},
 	}
 	for _, hit := range hits {
 		fmt.Fprintf(w, "%-24s %8d %7.0f%%\n", hit.label, hit.n, ratio(hit.n, total)*100)
@@ -125,8 +127,8 @@ func (c AttributionCounts) Print(w io.Writer) {
 		n     int
 	}{
 		{"成功", c.Success},
-		{"Evaluate误杀", c.EvaluationSelfHarm},
-		{"Review漏", c.ReviewMiss},
+		{"Verdict误杀", c.VerdictSelfHarm},
+		{"Claim漏", c.ClaimMiss},
 		{"调查漏", c.InvestigationMiss},
 		{"输入漏", c.InputMiss},
 	}

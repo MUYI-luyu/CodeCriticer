@@ -9,7 +9,7 @@ import (
 
 func TestComputeExactMatch(t *testing.T) {
 	bugs := []Bug{{File: "main.go", Line: 7}}
-	fs := []review.Finding{{File: "main.go", Line: 7}}
+	fs := []review.CandidateClaim{{File: "main.go", Line: 7}}
 	m := Compute(bugs, fs, 3)
 	if m.True != 1 || m.False != 0 || m.Found != 1 {
 		t.Fatalf("应精确命中: %+v", m)
@@ -21,7 +21,7 @@ func TestComputeExactMatch(t *testing.T) {
 
 func TestComputeToleranceAndFP(t *testing.T) {
 	bugs := []Bug{{File: "main.go", Line: 7}}
-	fs := []review.Finding{
+	fs := []review.CandidateClaim{
 		{File: "main.go", Line: 9},  // 容差内命中
 		{File: "main.go", Line: 20}, // 误报
 	}
@@ -36,7 +36,7 @@ func TestComputeToleranceAndFP(t *testing.T) {
 
 func TestComputeGreedyOnePerBug(t *testing.T) {
 	bugs := []Bug{{File: "main.go", Line: 7}}
-	fs := []review.Finding{
+	fs := []review.CandidateClaim{
 		{File: "main.go", Line: 7},
 		{File: "main.go", Line: 8},
 	}
@@ -48,7 +48,7 @@ func TestComputeGreedyOnePerBug(t *testing.T) {
 
 func TestComputeWrongFile(t *testing.T) {
 	bugs := []Bug{{File: "main.go", Line: 7}}
-	fs := []review.Finding{{File: "other.go", Line: 7}}
+	fs := []review.CandidateClaim{{File: "other.go", Line: 7}}
 	m := Compute(bugs, fs, 3)
 	if m.True != 0 || m.False != 1 {
 		t.Fatalf("文件不符应判误报: %+v", m)
@@ -58,40 +58,44 @@ func TestComputeWrongFile(t *testing.T) {
 func TestComputeTraceDoesNotUseEvidenceLocation(t *testing.T) {
 	c := &Case{GT: GroundTruth{Primary: Location{File: "main.go", Line: 14}}}
 	trace := &workflow.Trace{
-		Findings:    []review.Finding{{File: "main.go", Line: 9, EvidenceIDs: []string{"e1"}}},
-		Evidence:    []*workflow.Evidence{{ID: "e1", File: "main.go", Line: 14, Content: "write"}},
-		Validations: []workflow.Validation{{FindingIndex: 0, Accepted: true}},
+		Evidence: []*workflow.Evidence{{ID: "e1", File: "main.go", Line: 14, Content: "write"}},
+		FinalReport: workflow.FinalReport{
+			Claims:   []review.CandidateClaim{{ID: "c1", File: "main.go", Line: 9, EvidenceIDs: []string{"e1"}}},
+			Verdicts: []workflow.Verdict{{ClaimID: "c1", Status: workflow.VerdictAccepted}},
+		},
 	}
 	m := ComputeTrace(c, trace, 3)
 	if m.RawLine.Found != 0 || m.RawLine.False != 1 || m.AcceptedLine.Found != 0 {
-		t.Fatalf("Evidence 位置不得替代 Finding 命中: %+v", m)
+		t.Fatalf("Evidence 位置不得替代 CandidateClaim 命中: %+v", m)
 	}
 }
 
 func TestComputeTraceSplitsRawAndAcceptedFindings(t *testing.T) {
 	c := &Case{GT: GroundTruth{Primary: Location{File: "main.go", Line: 10}}}
 	trace := &workflow.Trace{
-		Findings: []review.Finding{
-			{File: "main.go", Line: 10},
-			{File: "other.go", Line: 20},
-		},
-		Validations: []workflow.Validation{
-			{FindingIndex: 0, Accepted: true},
-			{FindingIndex: 1, Accepted: false},
+		FinalReport: workflow.FinalReport{
+			Claims: []review.CandidateClaim{
+				{ID: "c1", File: "main.go", Line: 10},
+				{ID: "c2", File: "other.go", Line: 20},
+			},
+			Verdicts: []workflow.Verdict{
+				{ClaimID: "c1", Status: workflow.VerdictAccepted},
+				{ClaimID: "c2", Status: workflow.VerdictRejected},
+			},
 		},
 	}
 	m := ComputeTrace(c, trace, 3)
-	if m.RawLine.Findings != 2 || m.RawLine.Found != 1 || m.RawLine.False != 1 {
-		t.Fatalf("Raw 指标应包含全部 Finding: %+v", m.RawLine)
+	if m.RawLine.Claims != 2 || m.RawLine.Found != 1 || m.RawLine.False != 1 {
+		t.Fatalf("Raw 指标应包含全部 CandidateClaim: %+v", m.RawLine)
 	}
-	if m.AcceptedLine.Findings != 1 || m.AcceptedLine.Found != 1 || m.AcceptedLine.False != 0 {
-		t.Fatalf("Accepted 指标应只包含接受的 Finding: %+v", m.AcceptedLine)
+	if m.AcceptedLine.Claims != 1 || m.AcceptedLine.Found != 1 || m.AcceptedLine.False != 0 {
+		t.Fatalf("Accepted 指标应只包含通过边界的 CandidateClaim: %+v", m.AcceptedLine)
 	}
 }
 
-func TestComputeTraceRequiresExplicitValidation(t *testing.T) {
+func TestComputeTraceRequiresExplicitVerdict(t *testing.T) {
 	c := &Case{GT: GroundTruth{Primary: Location{File: "main.go", Line: 10}}}
-	trace := &workflow.Trace{Findings: []review.Finding{{File: "main.go", Line: 10}}}
+	trace := &workflow.Trace{FinalReport: workflow.FinalReport{Claims: []review.CandidateClaim{{ID: "c1", File: "main.go", Line: 10}}}}
 	m := ComputeTrace(c, trace, 3)
 	if m.RawLine.Found != 1 || m.AcceptedLine.Found != 0 || m.AcceptedLine.FN != 1 {
 		t.Fatalf("缺少 Evaluate 记录时不得默认接受: %+v", m)
@@ -101,8 +105,10 @@ func TestComputeTraceRequiresExplicitValidation(t *testing.T) {
 func TestComputeTraceSeparatesFileGroundTruth(t *testing.T) {
 	c := &Case{GT: GroundTruth{Primary: Location{File: "main.go", Line: 0}}}
 	trace := &workflow.Trace{
-		Findings:    []review.Finding{{File: "main.go", Line: 30}},
-		Validations: []workflow.Validation{{FindingIndex: 0, Accepted: true}},
+		FinalReport: workflow.FinalReport{
+			Claims:   []review.CandidateClaim{{ID: "c1", File: "main.go", Line: 30}},
+			Verdicts: []workflow.Verdict{{ClaimID: "c1", Status: workflow.VerdictAccepted}},
+		},
 	}
 	m := ComputeTrace(c, trace, 3)
 	if m.RawLine.Bugs != 0 || m.AcceptedLine.Bugs != 0 {
@@ -119,8 +125,10 @@ func TestComputeTraceUsesOnlyPrimaryAsBug(t *testing.T) {
 		Related: []Location{{File: "main.go", Line: 20}},
 	}}
 	trace := &workflow.Trace{
-		Findings:    []review.Finding{{File: "main.go", Line: 20}},
-		Validations: []workflow.Validation{{FindingIndex: 0, Accepted: true}},
+		FinalReport: workflow.FinalReport{
+			Claims:   []review.CandidateClaim{{ID: "c1", File: "main.go", Line: 20}},
+			Verdicts: []workflow.Verdict{{ClaimID: "c1", Status: workflow.VerdictAccepted}},
+		},
 	}
 	m := ComputeTrace(c, trace, 3)
 	if m.RawLine.Bugs != 1 || m.RawLine.Found != 0 {

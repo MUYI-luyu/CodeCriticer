@@ -60,12 +60,12 @@ func TestLoadGoker(t *testing.T) {
 // TestComputeFileLevel 验证 line=0 的文件级 ground truth：同文件即命中，异文件即误报。
 func TestComputeFileLevel(t *testing.T) {
 	bugs := []Bug{{File: "a.go", Line: 0}}
-	fs := []review.Finding{{File: "a.go", Line: 100}}
+	fs := []review.CandidateClaim{{File: "a.go", Line: 100}}
 	if m := Compute(bugs, fs, 3); m.True != 1 || m.False != 0 || m.Found != 1 {
 		t.Fatalf("文件级应命中: %+v", m)
 	}
 
-	m := Compute([]Bug{{File: "a.go", Line: 0}}, []review.Finding{{File: "b.go", Line: 100}}, 3)
+	m := Compute([]Bug{{File: "a.go", Line: 0}}, []review.CandidateClaim{{File: "b.go", Line: 100}}, 3)
 	if m.True != 0 || m.False != 1 {
 		t.Fatalf("文件不符应误报: %+v", m)
 	}

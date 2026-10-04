@@ -10,7 +10,7 @@ import (
 	"github.com/MUYI-luyu/codecritic/internal/workflow"
 )
 
-// TestAttributeStages 覆盖输入、调查、Review、Evaluate 四段信号。
+// TestAttributeStages 覆盖输入、调查、Claim、Verdict 四段信号。
 func TestAttributeStages(t *testing.T) {
 	c := &Case{GT: GroundTruth{
 		Primary: Location{File: "a.go", Line: 10},
@@ -22,8 +22,10 @@ func TestAttributeStages(t *testing.T) {
 			{Source: "read_code", File: "a.go", Line: 8, EndLine: 12},
 			{Source: "find_callers", File: "b.go", Line: 20},
 		},
-		Findings:    []review.Finding{{File: "a.go", Line: 10}},
-		Validations: []workflow.Validation{{FindingIndex: 0, Accepted: true}},
+		FinalReport: workflow.FinalReport{
+			Claims:   []review.CandidateClaim{{ID: "c1", File: "a.go", Line: 10}},
+			Verdicts: []workflow.Verdict{{ClaimID: "c1", Status: workflow.VerdictAccepted}},
+		},
 	}
 	got := Attribute(c, trace, tol)
 	if len(got) != 1 {
@@ -31,7 +33,7 @@ func TestAttributeStages(t *testing.T) {
 	}
 	attr := got[0]
 	if attr.Stage != StageSuccess || !attr.InputHit || !attr.InvestigationHit ||
-		!attr.RawFindingHit || !attr.AcceptedFindingHit {
+		!attr.RawClaimHit || !attr.AcceptedClaimHit {
 		t.Fatalf("四阶段信号不完整: %+v", attr)
 	}
 	if attr.RelatedEvidenceCovered != 1 || attr.RelatedEvidenceTotal != 1 {
@@ -52,8 +54,8 @@ func TestClassifyFirstUnclosedStage(t *testing.T) {
 	}{
 		{"输入漏", false, false, false, false, StageInputMiss},
 		{"调查漏", true, false, false, false, StageInvestigationMiss},
-		{"Review漏", true, true, false, false, StageReviewMiss},
-		{"Evaluate误杀", true, true, true, false, StageEvaluationSelfHarm},
+		{"Claim漏", true, true, false, false, StageClaimMiss},
+		{"Verdict误杀", true, true, true, false, StageVerdictSelfHarm},
 		{"成功", true, true, true, true, StageSuccess},
 	}
 	for _, test := range tests {

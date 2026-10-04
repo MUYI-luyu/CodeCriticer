@@ -26,12 +26,13 @@ type Location struct {
 
 // GroundTruth 是缺陷的完整标注（单一事实来源）。
 type GroundTruth struct {
-	Primary     Location   `json:"primary"`               // 主缺陷位置
-	Related     []Location `json:"related,omitempty"`     // 相关位置（多位置证据链）
-	Description string     `json:"description,omitempty"` // 数据集提供的缺陷描述
-	Symbols     []string   `json:"symbols,omitempty"`     // 涉及的符号（函数/变量名）
-	BugTypes    []string   `json:"bug_types,omitempty"`   // Bug 类型（可多标签）
-	Evidence    string     `json:"evidence,omitempty"`    // 人工标注的关键证据
+	Primary             Location   `json:"primary"`                        // 主缺陷位置
+	AcceptableLocations []Location `json:"acceptable_locations,omitempty"` // 其他合理报告位置
+	Related             []Location `json:"related,omitempty"`              // 相关位置（多位置证据链）
+	Description         string     `json:"description,omitempty"`          // 数据集提供的缺陷描述
+	Symbols             []string   `json:"symbols,omitempty"`              // 涉及的符号（函数/变量名）
+	BugTypes            []string   `json:"bug_types,omitempty"`            // Bug 类型（可多标签）
+	Evidence            string     `json:"evidence,omitempty"`             // 人工标注的关键证据
 }
 
 // Metadata 是数据集原始提供的元信息（不可变事实）。
@@ -87,11 +88,12 @@ func Load(dir string) ([]*Case, error) {
 }
 
 type meta struct {
-	Name   string `json:"name"`
-	Source string `json:"source"`
-	Rule   string `json:"rule,omitempty"`
-	File   string `json:"file,omitempty"`
-	Bugs   []Bug  `json:"bugs,omitempty"`
+	Name        string       `json:"name"`
+	Source      string       `json:"source"`
+	Rule        string       `json:"rule,omitempty"`
+	File        string       `json:"file,omitempty"`
+	Bugs        []Bug        `json:"bugs,omitempty"`
+	GroundTruth *GroundTruth `json:"ground_truth,omitempty"`
 }
 
 func loadCase(dir string) (*Case, error) {
@@ -153,6 +155,19 @@ func loadCase(dir string) (*Case, error) {
 
 	// 从 Rule 推断 BugType（不假设）
 	gt.BugTypes = inferBugTypesFromRule(m.Rule, m.Name)
+	if m.GroundTruth != nil {
+		explicit := *m.GroundTruth
+		if explicit.Primary.File == "" {
+			explicit.Primary = gt.Primary
+		}
+		if explicit.Description == "" {
+			explicit.Description = gt.Description
+		}
+		if len(explicit.BugTypes) == 0 {
+			explicit.BugTypes = gt.BugTypes
+		}
+		gt = explicit
+	}
 
 	return &Case{
 		Name:   m.Name,
@@ -162,6 +177,19 @@ func loadCase(dir string) (*Case, error) {
 		Diff:   diff,
 		GT:     gt,
 	}, nil
+}
+
+func acceptableLocations(gt GroundTruth) []Location {
+	locations := make([]Location, 0, len(gt.AcceptableLocations)+1)
+	if gt.Primary.File != "" {
+		locations = append(locations, gt.Primary)
+	}
+	for _, location := range gt.AcceptableLocations {
+		if location.File != "" {
+			locations = append(locations, location)
+		}
+	}
+	return locations
 }
 
 // inferBugTypesFromRule 从 Rule 字段推断 BugType（不假设，无法推断时返回 unknown）。

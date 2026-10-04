@@ -2,114 +2,86 @@ package review
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
-	"strconv"
 	"testing"
 	"time"
 )
 
+func TestNativeToolCallingRequestAndResponse(t *testing.T) {
+	var request chatReq
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Fatal(err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"role":"assistant","tool_calls":[{"id":"call-1","type":"function","function":{"name":"read_code","arguments":"{\"file\":\"main.go\"}"}}]}}],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}`))
+	}))
+	defer srv.Close()
+
+	l := NewLLMWithConfig(WithAPIKey("test"), WithBaseURL(srv.URL))
+	tools := []ToolDefinition{{Type: "function", Function: ToolFunction{Name: "read_code", Strict: true, Parameters: map[string]any{"type": "object"}}}}
+	message, _, err := l.CompleteToolsWithUsage(context.Background(), "system", []ToolMessage{{Role: "user", Content: "inspect"}}, tools, "test-model")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if request.ToolChoice != "required" || request.ParallelToolCalls == nil || *request.ParallelToolCalls {
+		t.Fatalf("request does not enforce one native tool call: %+v", request)
+	}
+	if len(message.ToolCalls) != 1 || message.ToolCalls[0].Function.Name != "read_code" {
+		t.Fatalf("message=%+v", message)
+	}
+}
+
 func TestDefaultRequestTimeoutSupportsReasoningModels(t *testing.T) {
 	l := NewLLMWithConfig(WithAPIKey("test"), WithBaseURL("https://example.com/v1"))
 	if l.client.Timeout != 120*time.Second {
-		t.Fatalf("请求超时 = %v，期望 120s", l.client.Timeout)
+		t.Fatalf("timeout=%v", l.client.Timeout)
 	}
 }
 
-// TestChatRetryOn429 验证：429 限流会重试，成功后 metrics 正确统计 token 与重试次数。
-func TestChatRetryOn429(t *testing.T) {
+func TestToolCompletionRetriesOn429(t *testing.T) {
 	attempts := 0
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		attempts++
 		if attempts == 1 {
 			w.WriteHeader(http.StatusTooManyRequests)
-			w.Write([]byte(`{"error":"rate limited"}`))
+			_, _ = w.Write([]byte(`{"error":"rate limited"}`))
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
-		w.Write([]byte(`{"choices":[{"message":{"content":"{\"findings\":[]}"}}],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}`))
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"role":"assistant","tool_calls":[{"id":"call-1","type":"function","function":{"name":"submit_claims","arguments":"{\"claims\":[]}"}}]}}],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}`))
 	}))
 	defer srv.Close()
 
-	l := NewLLMWithConfig(WithAPIKey("test"), WithBaseURL(srv.URL), WithReviewModel("test-model"))
-	if _, _, err := l.Review(context.Background(), "diff"); err != nil {
-		t.Fatalf("期望重试后成功，得到: %v", err)
+	l := NewLLMWithConfig(WithAPIKey("test"), WithBaseURL(srv.URL), WithModel("test-model"))
+	if _, _, err := l.CompleteToolsWithUsage(context.Background(), "system", []ToolMessage{{Role: "user", Content: "prompt"}}, []ToolDefinition{{Type: "function", Function: ToolFunction{Name: "submit_claims"}}}, "test-model"); err != nil {
+		t.Fatal(err)
 	}
 	if attempts != 2 {
-		t.Fatalf("期望 2 次尝试（1 次失败 + 1 次重试成功），得到 %d", attempts)
+		t.Fatalf("attempts=%d", attempts)
 	}
-
-	s := l.Metrics()["test-model"]
-	if s.Calls != 1 || s.Success != 1 || s.Fail != 0 || s.Retries != 1 {
-		t.Fatalf("metrics 计数错误: %+v", s)
-	}
-	if s.InputTokens != 10 || s.OutputTokens != 5 {
-		t.Fatalf("token 统计错误: %+v", s)
+	stat := l.Metrics()["test-model"]
+	if stat.Calls != 1 || stat.Success != 1 || stat.Retries != 1 || stat.InputTokens != 10 || stat.OutputTokens != 5 {
+		t.Fatalf("metrics=%+v", stat)
 	}
 }
 
-// TestChatNoRetryOn400 验证：400 属于不可重试错误，不重试但会沿降级链依次尝试各模型。
-func TestChatNoRetryOn400(t *testing.T) {
+func TestToolCompletionDoesNotRetry400(t *testing.T) {
 	attempts := 0
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		attempts++
 		w.WriteHeader(http.StatusBadRequest)
-		w.Write([]byte(`{"error":"bad request"}`))
+		_, _ = w.Write([]byte(`{"error":"bad request"}`))
 	}))
 	defer srv.Close()
 
-	l := NewLLMWithConfig(WithAPIKey("test"), WithBaseURL(srv.URL), WithReviewModel("review-model"), WithPlanModel("plan-model"))
-	if _, _, err := l.Review(context.Background(), "diff"); err == nil {
-		t.Fatal("期望失败，得到成功")
+	l := NewLLMWithConfig(WithAPIKey("test"), WithBaseURL(srv.URL), WithModel("test-model"))
+	if _, _, err := l.CompleteToolsWithUsage(context.Background(), "system", []ToolMessage{{Role: "user", Content: "prompt"}}, []ToolDefinition{{Type: "function", Function: ToolFunction{Name: "submit_claims"}}}, "test-model"); err == nil {
+		t.Fatal("expected error")
 	}
-	// 降级链依次尝试 Review 与 Plan 两个不同模型，400 不重试。
-	if attempts != 2 {
-		t.Fatalf("期望 2 次尝试（2 个不同模型各 1 次，不重试），得到 %d", attempts)
-	}
-
-	s := l.Metrics()["review-model"]
-	if s.Calls != 1 || s.Success != 0 || s.Fail != 1 || s.Retries != 0 {
-		t.Fatalf("ReviewModel metrics 错误: %+v", s)
-	}
-}
-
-// TestChatFallbackDedup 验证：降级链跳过重复模型，避免 --model 统一设置时对同一模型重复调用。
-func TestChatFallbackDedup(t *testing.T) {
-	attempts := 0
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		attempts++
-		w.WriteHeader(http.StatusBadRequest)
-		w.Write([]byte(`{"error":"bad request"}`))
-	}))
-	defer srv.Close()
-
-	// 三个模型设成同一个名字（等价 --model 统一设置）
-	l := NewLLMWithConfig(WithAPIKey("test"), WithBaseURL(srv.URL), WithReviewModel("same-model"), WithPlanModel("same-model"))
-	if _, _, err := l.Review(context.Background(), "diff"); err == nil {
-		t.Fatal("期望失败，得到成功")
-	}
-	// 去重后只尝试 1 个模型
 	if attempts != 1 {
-		t.Fatalf("期望 1 次尝试（重复模型被去重），得到 %d", attempts)
-	}
-}
-
-func TestReviewRepairsMalformedJSONOnce(t *testing.T) {
-	attempts := 0
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		attempts++
-		content := `{"findings":[{"file":"main.go",,"line":10}]}`
-		if attempts == 2 {
-			content = `{"findings":[{"file":"main.go","line":10,"severity":"error","msg":"错误"}]}`
-		}
-		w.Header().Set("Content-Type", "application/json")
-		w.Write([]byte(`{"choices":[{"message":{"content":` + strconv.Quote(content) + `}}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`))
-	}))
-	defer srv.Close()
-
-	l := NewLLMWithConfig(WithAPIKey("test"), WithBaseURL(srv.URL), WithReviewModel("test-model"), WithPlanModel("test-model"))
-	findings, _, err := l.Review(context.Background(), "diff")
-	if err != nil || attempts != 2 || len(findings) != 1 || findings[0].Line != 10 {
-		t.Fatalf("格式修复结果异常: attempts=%d findings=%+v err=%v", attempts, findings, err)
+		t.Fatalf("attempts=%d", attempts)
 	}
 }

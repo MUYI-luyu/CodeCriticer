@@ -3,6 +3,8 @@ package recall
 
 import (
 	"bufio"
+	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -56,18 +58,26 @@ func (s *Store) Symbol(name, file string) []Doc {
 
 // Keyword 用 rg 搜索关键词，返回匹配片段。
 func (s *Store) Keyword(word string) []Doc {
+	docs, _ := s.Search(word)
+	return docs
+}
+
+// Search performs a literal Go-source search. It distinguishes a valid empty
+// result from an operational failure so callers never turn tool failure into
+// false absence evidence.
+func (s *Store) Search(word string) ([]Doc, error) {
 	if word == "" {
-		return nil
+		return nil, fmt.Errorf("empty search keyword")
 	}
-	ms := rgSearch(s.root, word)
+	ms, err := rgSearch(s.root, word)
+	if err != nil {
+		return nil, err
+	}
 	docs := make([]Doc, 0, len(ms))
 	for _, m := range ms {
-		docs = append(docs, Doc{File: m.file, Line: m.no, Text: m.text, Src: "keyword"})
-		if len(docs) >= limit {
-			break
-		}
+		docs = append(docs, Doc{File: m.file, Line: m.no, Text: ReadLines(s.root, m.file, m.no), Src: "keyword"})
 	}
-	return docs
+	return docs, nil
 }
 
 func (s *Store) readAt(file string, line int) string {
@@ -105,12 +115,22 @@ type match struct {
 	text string
 }
 
-func rgSearch(root, word string) []match {
-	out, err := exec.Command("rg", "-n", "--no-heading", "--glob", "*.go", "--glob", "!.git/**", "--glob", "!logs/**", "--glob", "!参考项目/**", "--glob", "!文档/**", "--glob", "!重构codecritic/**", "--max-count", "200", word, root).Output()
+func rgSearch(root, word string) ([]match, error) {
+	out, err := exec.Command("rg", "-n", "--fixed-strings", "--no-heading", "--glob", "*.go", "--glob", "!.git/**", "--glob", "!logs/**", "--glob", "!参考项目/**", "--glob", "!文档/**", "--glob", "!重构codecritic/**", "--max-count", "200", "--", word, root).Output()
 	if err == nil {
-		return parseRg(out)
+		return parseRg(out), nil
 	}
-	return walkSearch(root, word)
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) {
+		if exitErr.ExitCode() == 1 {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("rg search failed: %w", err)
+	}
+	if errors.Is(err, exec.ErrNotFound) {
+		return walkSearch(root, word), nil
+	}
+	return nil, fmt.Errorf("start rg: %w", err)
 }
 
 func parseRg(out []byte) []match {

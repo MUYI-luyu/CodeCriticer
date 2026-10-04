@@ -13,41 +13,20 @@ import (
 )
 
 type LLMClient interface {
-	Plan(context.Context, string) ([]review.Point, review.LLMUsage, error)
-	Review(context.Context, string) ([]review.Finding, review.LLMUsage, error)
-	ChatWithUsage(context.Context, string, string, string) (string, review.LLMUsage, error)
+	CompleteToolsWithUsage(context.Context, string, []review.ToolMessage, []review.ToolDefinition, string) (review.ToolMessage, review.LLMUsage, error)
 }
 
 type Request struct {
-	Repo string
-	Diff []byte
+	Repo           string
+	Diff           []byte
+	AllowExecution bool
 }
 
-type Plan struct {
+// ReviewScope 是由变更确定性导出的调查范围，不包含另一套 Agent 计划。
+type ReviewScope struct {
 	TargetFiles []string `json:"target_files"`
 	Symbols     []string `json:"symbols"`
 	Concern     string   `json:"concern"`
-	Questions   []string `json:"questions"`
-	Keywords    []string `json:"keywords"`
-}
-
-// RiskSeed 表示由变更语法触发的有限风险入口。
-type RiskSeed struct {
-	Category string `json:"category"`
-	File     string `json:"file"`
-	Line     int    `json:"line"`
-	Symbol   string `json:"symbol,omitempty"`
-	Trigger  string `json:"trigger"`
-}
-
-// Hypothesis 表示一个需要通过代码事实调查的缺陷假设。
-type Hypothesis struct {
-	ID            string   `json:"id"`
-	Category      string   `json:"category"`
-	Claim         string   `json:"claim"`
-	TargetFile    string   `json:"target_file"`
-	TargetSymbol  string   `json:"target_symbol,omitempty"`
-	RequiredFacts []string `json:"required_facts,omitempty"`
 }
 
 // TraceStats 记录调查阶段的可观测计数。
@@ -59,68 +38,95 @@ type TraceStats struct {
 	NoNewEvidenceCalls  int `json:"no_new_evidence_calls"`
 }
 
-type Evidence struct {
-	ID              string `json:"id"`
-	Source          string `json:"source"`
-	Type            string `json:"type"`
-	File            string `json:"file,omitempty"`
-	Line            int    `json:"line,omitempty"`
-	EndLine         int    `json:"end_line,omitempty"`
-	Content         string `json:"content"`
-	Symbol          string `json:"symbol,omitempty"`
-	Relation        string `json:"relation,omitempty"`
-	QuestionIndexes []int  `json:"question_indexes,omitempty"`
+// ContextProjectionStats describes only the latest model-facing projection.
+// Conversation remains the complete, unmodified transcript.
+type ContextProjectionStats struct {
+	Enabled                    bool `json:"enabled"`
+	Applications               int  `json:"applications"`
+	FullBytes                  int  `json:"full_bytes"`
+	ProjectedBytes             int  `json:"projected_bytes"`
+	DuplicateResultsCompacted  int  `json:"duplicate_results_compacted"`
+	DominatedReadCodeCompacted int  `json:"dominated_read_code_compacted"`
 }
 
-type EvaluateStatus string
+type Evidence struct {
+	ID      string `json:"id"`
+	Source  string `json:"source"`
+	Type    string `json:"type"`
+	File    string `json:"file,omitempty"`
+	Line    int    `json:"line,omitempty"`
+	EndLine int    `json:"end_line,omitempty"`
+	Content string `json:"content"`
+	Symbol  string `json:"symbol,omitempty"`
+	StepID  string `json:"step_id,omitempty"`
+}
+
+// InvestigationStep 是一次完整的 action/result 记录。
+// Evidence 通过 StepID 追溯到这里，不再另存一份 Observation 状态。
+type InvestigationStep struct {
+	ID       string        `json:"id"`
+	Tool     string        `json:"tool"`
+	Args     any           `json:"args,omitempty"`
+	Error    string        `json:"error,omitempty"`
+	Duration time.Duration `json:"duration"`
+}
+
+type VerdictStatus string
 
 const (
-	EvaluateSufficient   EvaluateStatus = "SUFFICIENT"
-	EvaluatePartial      EvaluateStatus = "PARTIAL"
-	EvaluateInsufficient EvaluateStatus = "INSUFFICIENT"
-	EvaluateConflict     EvaluateStatus = "CONFLICT"
+	VerdictAccepted   VerdictStatus = "accepted"
+	VerdictRejected   VerdictStatus = "rejected"
+	VerdictUnresolved VerdictStatus = "unresolved"
 )
 
-type ToolCall struct {
-	Step        int                    `json:"step"`
-	Tool        string                 `json:"tool"`
-	Args        map[string]interface{} `json:"args,omitempty"`
-	EvidenceIDs []string               `json:"evidence_ids,omitempty"`
-	Error       string                 `json:"error,omitempty"`
-	Duration    time.Duration          `json:"duration"`
+// Verdict 是系统对一个 CandidateClaim 的唯一裁决状态。
+type Verdict struct {
+	ClaimID         string        `json:"claim_id"`
+	Status          VerdictStatus `json:"status"`
+	Reason          string        `json:"reason"`
+	MissingEvidence []string      `json:"missing_evidence,omitempty"`
 }
 
-type Validation struct {
-	FindingIndex int     `json:"finding_index"`
-	Accepted     bool    `json:"accepted"`
-	Confidence   float64 `json:"confidence"`
-	Reason       string  `json:"reason"`
+// FinalReport 是候选结论和裁决的唯一持久化位置。
+type FinalReport struct {
+	Claims   []review.CandidateClaim `json:"claims"`
+	Verdicts []Verdict               `json:"verdicts"`
 }
 
 type Trace struct {
-	ID           string           `json:"id"`
-	Request      Request          `json:"request"`
-	Plan         Plan             `json:"plan"`
-	RiskSeeds    []RiskSeed       `json:"risk_seeds,omitempty"`
-	Hypotheses   []Hypothesis     `json:"hypotheses,omitempty"`
-	Evidence     []*Evidence      `json:"evidence"`
-	ToolCalls    []ToolCall       `json:"tool_calls"`
-	Findings     []review.Finding `json:"findings"`
-	Validations  []Validation     `json:"validations"`
-	Evaluation   EvaluateStatus   `json:"evaluation"`
-	EvidenceGaps []string         `json:"evidence_gaps,omitempty"`
-	LLMCalls     []review.LLMCall `json:"llm_calls"`
-	StopReason   string           `json:"stop_reason"`
-	Usage        review.LLMUsage  `json:"usage"`
-	Duration     time.Duration    `json:"duration"`
-	Errors       []string         `json:"errors,omitempty"`
-	Stats        TraceStats       `json:"stats"`
+	ID            string                 `json:"id"`
+	Request       Request                `json:"request"`
+	Snapshot      *ReviewSnapshot        `json:"snapshot,omitempty"`
+	Scope         ReviewScope            `json:"scope"`
+	Evidence      []*Evidence            `json:"evidence"`
+	Investigation []InvestigationStep    `json:"investigation"`
+	FinalReport   FinalReport            `json:"final_report,omitempty"`
+	Conversation  []review.ToolMessage   `json:"conversation,omitempty"`
+	LLMCalls      []review.LLMCall       `json:"llm_calls"`
+	StopReason    string                 `json:"stop_reason"`
+	Usage         review.LLMUsage        `json:"usage"`
+	Duration      time.Duration          `json:"duration"`
+	Errors        []string               `json:"errors,omitempty"`
+	Stats         TraceStats             `json:"stats"`
+	Projection    ContextProjectionStats `json:"context_projection"`
+}
+
+func (r FinalReport) ClaimsWithStatus(status VerdictStatus) []review.CandidateClaim {
+	statuses := make(map[string]VerdictStatus, len(r.Verdicts))
+	for _, verdict := range r.Verdicts {
+		statuses[verdict.ClaimID] = verdict.Status
+	}
+	out := make([]review.CandidateClaim, 0)
+	for _, claim := range r.Claims {
+		if statuses[claim.ID] == status {
+			out = append(out, claim)
+		}
+	}
+	return out
 }
 
 const (
-	StopToolError       = "tool_error"
 	StopAgentDone       = "agent_done"
-	StopEvidenceEnough  = "evidence_sufficient"
 	StopMaxSteps        = "max_steps"
 	StopInvalidDecision = "invalid_decision"
 	StopContextCanceled = "context_canceled"

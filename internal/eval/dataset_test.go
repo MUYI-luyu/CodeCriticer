@@ -58,10 +58,10 @@ func TestRuleCatches(t *testing.T) {
 	}
 }
 
-// hitRule 判断 findings 里存在指定规则且位置命中任一 bug。
-func hitRule(fs []review.Finding, rule string, bugs []Bug, tol int) bool {
+// hitRule 判断 diagnostics 里存在指定规则且位置命中任一 bug。
+func hitRule(fs []review.StaticDiagnostic, rule string, bugs []Bug, tol int) bool {
 	for _, f := range fs {
-		if f.Symbol != rule {
+		if f.Analyzer != rule {
 			continue
 		}
 		for _, b := range bugs {

@@ -8,29 +8,16 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"strings"
 	"sync"
 	"time"
 )
-
-const reviewPrompt = `你是资深 Go 代码审查员。审查下面 unified diff，找出真实 bug 与风险（并发、错误处理、边界、资源泄漏、逻辑错误）。
-只输出 JSON，不要任何其他文字，格式：
-{"findings":[{"file":"文件路径","line":行号或0,"severity":"error|warning|info","msg":"问题描述","evidence":"相关代码片段"}]}
-没有问题时输出 {"findings":[]}。`
-
-const planPrompt = `你是代码审查规划者。读下面的 unified diff，规划 3-6 个审查要点，每个要点聚焦一类风险（并发、错误处理、边界、资源泄漏、逻辑）。
-为每个要点给 1-3 个召回关键词（符号名/类型名/关键术语），用于检索相关代码。
-只输出 JSON：
-{"points":[{"desc":"要点描述","kw":["关键词"]}]}`
-
-const findingRepairPrompt = `你是 JSON 修复器。将输入修复为合法 JSON，只能修复格式，不能增加、删除或改写 finding 的语义。只输出 {"findings":[]} 结构，不要其他文字。`
 
 // Config 返回 LLM 的配置（公开给 agent 包使用）。
 func (l *LLM) Config() *Config {
 	return l.config
 }
 
-// LLM 是 OpenAI 兼容的聊天客户端，支持分级模型配置。
+// LLM 是 OpenAI 兼容的聊天客户端。
 type LLM struct {
 	config   *Config
 	client   *http.Client
@@ -91,31 +78,62 @@ func NewLLMWithConfig(opts ...Option) *LLM {
 }
 
 type chatMsg struct {
-	Role    string `json:"role"`
-	Content string `json:"content"`
+	Role       string     `json:"role"`
+	Content    string     `json:"content,omitempty"`
+	ToolCalls  []ToolCall `json:"tool_calls,omitempty"`
+	ToolCallID string     `json:"tool_call_id,omitempty"`
 }
 
 type chatReq struct {
-	Model    string    `json:"model"`
-	Messages []chatMsg `json:"messages"`
-	Format   respFmt   `json:"response_format"`
-}
-
-type respFmt struct {
-	Type string `json:"type"`
+	Model             string           `json:"model"`
+	Messages          []chatMsg        `json:"messages"`
+	Tools             []ToolDefinition `json:"tools,omitempty"`
+	ToolChoice        string           `json:"tool_choice,omitempty"`
+	ParallelToolCalls *bool            `json:"parallel_tool_calls,omitempty"`
 }
 
 type chatResp struct {
 	Choices []struct {
-		Message struct {
-			Content string `json:"content"`
-		} `json:"message"`
+		Message chatMsg `json:"message"`
 	} `json:"choices"`
 	Usage struct {
 		PromptTokens     int `json:"prompt_tokens"`
 		CompletionTokens int `json:"completion_tokens"`
 		TotalTokens      int `json:"total_tokens"`
 	} `json:"usage"`
+}
+
+// ToolCall and ToolDefinition mirror the OpenAI-compatible function-calling
+// wire format. They are transport records, not a second agent protocol.
+type ToolCall struct {
+	ID       string       `json:"id"`
+	Type     string       `json:"type"`
+	Function FunctionCall `json:"function"`
+}
+
+type FunctionCall struct {
+	Name      string `json:"name"`
+	Arguments string `json:"arguments"`
+}
+
+type ToolDefinition struct {
+	Type     string       `json:"type"`
+	Function ToolFunction `json:"function"`
+}
+
+type ToolFunction struct {
+	Name        string         `json:"name"`
+	Description string         `json:"description"`
+	Strict      bool           `json:"strict"`
+	Parameters  map[string]any `json:"parameters"`
+}
+
+// ToolMessage is one message in a native function-calling conversation.
+type ToolMessage struct {
+	Role       string     `json:"role"`
+	Content    string     `json:"content,omitempty"`
+	ToolCalls  []ToolCall `json:"tool_calls,omitempty"`
+	ToolCallID string     `json:"tool_call_id,omitempty"`
 }
 
 // LLMUsage 是一次 LLM 调用的 token 用量（公开给 agent/eval 包使用）。
@@ -125,19 +143,19 @@ type LLMUsage struct {
 	TotalTokens      int `json:"total_tokens"`
 }
 
-// Chat 发送一轮对话，返回助手文本（公开给 agent 包使用）。
-func (l *LLM) Chat(ctx context.Context, system, user, model string) (string, error) {
-	text, _, err := l.chatWithUsage(ctx, system, user, model)
-	return text, err
+// CompleteToolsWithUsage performs one native tool-calling model turn. The
+// caller owns the loop because it also owns tool safety, Evidence and Verdict.
+func (l *LLM) CompleteToolsWithUsage(ctx context.Context, system string, messages []ToolMessage, tools []ToolDefinition, model string) (ToolMessage, LLMUsage, error) {
+	wire := make([]chatMsg, 0, len(messages)+1)
+	wire = append(wire, chatMsg{Role: "system", Content: system})
+	for _, message := range messages {
+		wire = append(wire, chatMsg{Role: message.Role, Content: message.Content, ToolCalls: message.ToolCalls, ToolCallID: message.ToolCallID})
+	}
+	message, totalUsage, err := l.completeWithUsage(ctx, system, encodeMessages(wire), model, wire, tools)
+	return ToolMessage{Role: message.Role, Content: message.Content, ToolCalls: message.ToolCalls, ToolCallID: message.ToolCallID}, totalUsage, err
 }
 
-// ChatWithUsage 发送一轮对话，返回助手文本 + token 用量（公开给 agent 包使用）。
-func (l *LLM) ChatWithUsage(ctx context.Context, system, user, model string) (string, LLMUsage, error) {
-	return l.chatWithUsage(ctx, system, user, model)
-}
-
-// chatWithUsage 发送一轮对话（带指数退避重试），返回助手文本 + token 用量。
-func (l *LLM) chatWithUsage(ctx context.Context, system, user, model string) (string, LLMUsage, error) {
+func (l *LLM) completeWithUsage(ctx context.Context, system, user, model string, messages []chatMsg, tools []ToolDefinition) (chatMsg, LLMUsage, error) {
 	const maxRetries = 3
 	var lastErr error
 	var totalUsage LLMUsage
@@ -146,18 +164,18 @@ func (l *LLM) chatWithUsage(ctx context.Context, system, user, model string) (st
 			l.metrics.recordRetry(model)
 			select {
 			case <-ctx.Done():
-				return "", totalUsage, ctx.Err()
+				return chatMsg{}, totalUsage, ctx.Err()
 			case <-time.After(backoff(attempt)):
 			}
 		}
 
-		text, usage, err := l.chatOnce(ctx, system, user, model, attempt+1)
+		message, usage, err := l.completeOnce(ctx, system, user, model, messages, tools, attempt+1)
 		if err == nil {
 			totalUsage.PromptTokens += usage.Input
 			totalUsage.CompletionTokens += usage.Output
 			totalUsage.TotalTokens = totalUsage.PromptTokens + totalUsage.CompletionTokens
 			l.metrics.recordSuccess(model, usage)
-			return text, totalUsage, nil
+			return message, totalUsage, nil
 		}
 		lastErr = err
 		if !retryable(err) {
@@ -165,11 +183,10 @@ func (l *LLM) chatWithUsage(ctx context.Context, system, user, model string) (st
 		}
 	}
 	l.metrics.recordFail(model)
-	return "", totalUsage, lastErr
+	return chatMsg{}, totalUsage, lastErr
 }
 
-// chatOnce 发送单次 HTTP 请求，返回文本与 token 用量。
-func (l *LLM) chatOnce(ctx context.Context, system, user, model string, attempt int) (string, usage, error) {
+func (l *LLM) completeOnce(ctx context.Context, system, user, model string, messages []chatMsg, tools []ToolDefinition, attempt int) (chatMsg, usage, error) {
 	started := time.Now()
 	requestBytes := 0
 	observer := observerFromContext(ctx)
@@ -180,7 +197,7 @@ func (l *LLM) chatOnce(ctx context.Context, system, user, model string, attempt 
 		if observer != nil {
 			observer.OnLLMCall(LLMCall{Model: model, SystemPrompt: system, UserPrompt: user, Attempt: attempt, Duration: time.Since(started), Error: err.Error()})
 		}
-		return "", usage{}, err
+		return chatMsg{}, usage{}, err
 	}
 	record := func(response string, u usage, status int, err error) {
 		if observer == nil {
@@ -194,22 +211,23 @@ func (l *LLM) chatOnce(ctx context.Context, system, user, model string, attempt 
 			Response: response, Usage: LLMUsage{PromptTokens: u.Input, CompletionTokens: u.Output, TotalTokens: u.Input + u.Output},
 			Attempt: attempt, Status: status, Duration: time.Since(started), Error: msg})
 	}
-	body := chatReq{
-		Model:    model,
-		Messages: []chatMsg{{Role: "system", Content: system}, {Role: "user", Content: user}},
+	body := chatReq{Model: model, Messages: messages, Tools: tools}
+	if len(tools) > 0 {
+		parallel := false
+		body.ToolChoice = "required"
+		body.ParallelToolCalls = &parallel
 	}
-	body.Format.Type = "json_object"
 
 	raw, err := json.Marshal(body)
 	if err != nil {
 		record("", usage{}, 0, err)
-		return "", usage{}, err
+		return chatMsg{}, usage{}, err
 	}
 	requestBytes = len(raw)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, l.config.BaseURL+"/chat/completions", bytes.NewReader(raw))
 	if err != nil {
 		record("", usage{}, 0, err)
-		return "", usage{}, err
+		return chatMsg{}, usage{}, err
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+l.config.APIKey)
@@ -217,7 +235,7 @@ func (l *LLM) chatOnce(ctx context.Context, system, user, model string, attempt 
 	resp, err := l.client.Do(req)
 	if err != nil {
 		record("", usage{}, 0, err)
-		return "", usage{}, err
+		return chatMsg{}, usage{}, err
 	}
 	defer resp.Body.Close()
 
@@ -225,47 +243,31 @@ func (l *LLM) chatOnce(ctx context.Context, system, user, model string, attempt 
 		b, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		err := &llmError{status: resp.StatusCode, body: string(b)}
 		record(string(b), usage{}, resp.StatusCode, err)
-		return "", usage{}, err
+		return chatMsg{}, usage{}, err
 	}
 	var out chatResp
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
 		decodeErr := fmt.Errorf("llm: 响应不是合法 JSON (content-type=%q): %w", resp.Header.Get("Content-Type"), err)
 		record("", usage{}, resp.StatusCode, decodeErr)
-		return "", usage{}, decodeErr
+		return chatMsg{}, usage{}, decodeErr
 	}
 	if len(out.Choices) == 0 {
 		err := fmt.Errorf("llm: 空响应")
 		record("", usage{}, resp.StatusCode, err)
-		return "", usage{}, err
+		return chatMsg{}, usage{}, err
 	}
 	u := usage{
 		Input:  out.Usage.PromptTokens,
 		Output: out.Usage.CompletionTokens,
 	}
-	record(out.Choices[0].Message.Content, u, resp.StatusCode, nil)
-	return out.Choices[0].Message.Content, u, nil
+	response, _ := json.Marshal(out.Choices[0].Message)
+	record(string(response), u, resp.StatusCode, nil)
+	return out.Choices[0].Message, u, nil
 }
 
-// chatWithFallback 依次尝试多个模型，主模型失败时降级到下一个。
-func (l *LLM) chatWithFallback(ctx context.Context, system, user string, models ...string) (string, LLMUsage, error) {
-	var lastErr error
-	var totalUsage LLMUsage
-	seen := make(map[string]bool)
-	for _, m := range models {
-		if m == "" || seen[m] {
-			continue // 跳过空模型与重复模型：避免降级链退化成对同一模型的重复调用
-		}
-		seen[m] = true
-		text, usage, err := l.chatWithUsage(ctx, system, user, m)
-		totalUsage.PromptTokens += usage.PromptTokens
-		totalUsage.CompletionTokens += usage.CompletionTokens
-		totalUsage.TotalTokens += usage.TotalTokens
-		if err == nil {
-			return text, totalUsage, nil
-		}
-		lastErr = err
-	}
-	return "", totalUsage, lastErr
+func encodeMessages(messages []chatMsg) string {
+	b, _ := json.Marshal(messages)
+	return string(b)
 }
 
 // backoff 返回第 attempt 次重试的退避时间（1s/2s/4s）。
@@ -284,65 +286,6 @@ func retryable(err error) bool {
 	}
 	// 非 llmError 通常是网络错误（连接失败、超时等），可重试
 	return true
-}
-
-// Review 一次性审查 diff，返回 findings + token 用量。
-func (l *LLM) Review(ctx context.Context, diffText string) ([]Finding, LLMUsage, error) {
-	text, usage, err := l.chatWithFallback(ctx, reviewPrompt, diffText, l.config.ReviewModel, l.config.PlanModel)
-	if err != nil {
-		return nil, usage, err
-	}
-	findings, err := parseFindings(text)
-	if err == nil {
-		return findings, usage, nil
-	}
-	// 结构化输出错误只修复一次，避免一次格式问题直接造成 Recall 为零。
-	repaired, repairUsage, repairErr := l.chatWithFallback(ctx, findingRepairPrompt, text, l.config.ReviewModel, l.config.PlanModel)
-	usage.PromptTokens += repairUsage.PromptTokens
-	usage.CompletionTokens += repairUsage.CompletionTokens
-	usage.TotalTokens += repairUsage.TotalTokens
-	if repairErr != nil {
-		return nil, usage, fmt.Errorf("%v；修复 findings 格式失败: %w", err, repairErr)
-	}
-	findings, repairErr = parseFindings(repaired)
-	if repairErr != nil {
-		return nil, usage, fmt.Errorf("%v；修复后仍无法解析: %w", err, repairErr)
-	}
-	return findings, usage, nil
-}
-
-// Plan 规划审查要点，返回要点 + token 用量。
-func (l *LLM) Plan(ctx context.Context, diffText string) ([]Point, LLMUsage, error) {
-	text, usage, err := l.chatWithFallback(ctx, planPrompt, diffText, l.config.PlanModel, l.config.ReviewModel)
-	if err != nil {
-		return nil, usage, err
-	}
-	var out struct {
-		Points []Point `json:"points"`
-	}
-	if err := json.Unmarshal([]byte(stripFence(text)), &out); err != nil {
-		return nil, usage, err
-	}
-	return out.Points, usage, nil
-}
-
-func parseFindings(text string) ([]Finding, error) {
-	var out struct {
-		Findings []Finding `json:"findings"`
-	}
-	if err := json.Unmarshal([]byte(stripFence(text)), &out); err != nil {
-		return nil, fmt.Errorf("解析 findings: %w", err)
-	}
-	return out.Findings, nil
-}
-
-// stripFence 去掉模型可能包在 JSON 外的 markdown 围栏。
-func stripFence(s string) string {
-	s = strings.TrimSpace(s)
-	s = strings.TrimPrefix(s, "```json")
-	s = strings.TrimPrefix(s, "```")
-	s = strings.TrimSuffix(s, "```")
-	return strings.TrimSpace(s)
 }
 
 // usage 是一次 LLM 调用的 token 用量。

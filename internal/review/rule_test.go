@@ -27,7 +27,7 @@ func main() {
 
 	byRule := map[string]int{}
 	for _, f := range fs {
-		byRule[f.Symbol]++
+		byRule[f.Analyzer]++
 	}
 	if byRule["printf"] == 0 {
 		t.Fatalf("未命中 printf 规则: %+v", fs)
@@ -39,10 +39,10 @@ func main() {
 	// 行号与文件应可定位。
 	for _, f := range fs {
 		if f.File == "" || f.Line <= 0 {
-			t.Fatalf("finding 缺定位: %+v", f)
+			t.Fatalf("diagnostic 缺定位: %+v", f)
 		}
 		if !strings.Contains(f.File, "main.go") {
-			t.Fatalf("finding 文件路径异常: %q", f.File)
+			t.Fatalf("diagnostic 文件路径异常: %q", f.File)
 		}
 	}
 }

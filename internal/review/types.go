@@ -1,22 +1,12 @@
 package review
 
-// Finding 是一条审查意见。
-type Finding struct {
-	File        string   `json:"file"`                   // 哪个文件
-	Line        int      `json:"line"`                   // 哪一行（0 表示未定位）
-	Symbol      string   `json:"symbol,omitempty"`       // 命中的规则名/符号
-	Severity    string   `json:"severity"`               // error / warning / info
-	Msg         string   `json:"msg"`                    // 问题描述
-	Evidence    string   `json:"evidence,omitempty"`     // 证据片段
-	EvidenceIDs []string `json:"evidence_ids,omitempty"` // 关联证据
-}
-
-type Point struct {
-	Desc string   `json:"desc"`
-	Kw   []string `json:"kw"`
-}
-
-type Sym struct {
-	Name string
-	File string
+// CandidateClaim 是 Agent 基于已收集证据提出的候选问题。
+// 它在 Verdict 产生前不代表系统已经确认问题成立。
+type CandidateClaim struct {
+	ID          string   `json:"id,omitempty"`
+	File        string   `json:"file"`
+	Line        int      `json:"line"`
+	Severity    string   `json:"severity"`
+	Msg         string   `json:"msg"`
+	EvidenceIDs []string `json:"evidence_ids"`
 }

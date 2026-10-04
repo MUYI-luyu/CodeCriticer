@@ -29,4 +29,14 @@ func TestParse(t *testing.T) {
 	if len(c.Adds) != 1 || c.Adds[0].Text != "func new() {}" || c.Adds[0].No != 3 {
 		t.Errorf("Adds=%+v", c.Adds)
 	}
+	if len(c.Hunks) != 1 || c.Hunks[0].ID != "h1" || len(c.Hunks[0].Lines) != 4 {
+		t.Fatalf("Hunks=%+v", c.Hunks)
+	}
+	deleted, added := c.Hunks[0].Lines[2], c.Hunks[0].Lines[3]
+	if deleted.Kind != "delete" || deleted.OldLine != 3 || deleted.NewLine != 0 {
+		t.Fatalf("deleted=%+v", deleted)
+	}
+	if added.Kind != "add" || added.OldLine != 0 || added.NewLine != 3 {
+		t.Fatalf("added=%+v", added)
+	}
 }

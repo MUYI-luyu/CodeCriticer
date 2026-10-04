@@ -7,17 +7,17 @@ import (
 
 // Metrics 汇总一组同类 Ground Truth 的命中情况。
 type Metrics struct {
-	Bugs     int // 真实 bug 数
-	Found    int // 被命中的 bug 数
-	Findings int // 产出 finding 数
-	True     int // 命中 bug 的 finding 数
-	False    int // 未命中的 finding 数
-	TP       int // 命中的 bug 数
-	FP       int // 未命中的 finding 数
-	FN       int // 未命中的 bug 数
+	Bugs   int // 真实 bug 数
+	Found  int // 被命中的 bug 数
+	Claims int // 产出 claim 数
+	True   int // 命中 bug 的 claim 数
+	False  int // 未命中的 claim 数
+	TP     int // 命中的 bug 数
+	FP     int // 未命中的 claim 数
+	FN     int // 未命中的 bug 数
 }
 
-// TraceMetrics 分开记录 Review 原始输出、Evaluate 接受输出以及两类定位精度。
+// TraceMetrics 分开记录原始 Claim、accepted Claim 以及两类定位精度。
 type TraceMetrics struct {
 	RawLine      Metrics `json:"raw_line"`
 	AcceptedLine Metrics `json:"accepted_line"`
@@ -25,10 +25,10 @@ type TraceMetrics struct {
 	AcceptedFile Metrics `json:"accepted_file"`
 }
 
-// Compute 用贪心匹配把 findings 对齐到 bugs，容差 tol 行内算命中。
-func Compute(bugs []Bug, fs []review.Finding, tol int) Metrics {
+// Compute 用贪心匹配把 claims 对齐到 bugs，容差 tol 行内算命中。
+func Compute(bugs []Bug, fs []review.CandidateClaim, tol int) Metrics {
 	used := make([]bool, len(bugs))
-	m := Metrics{Bugs: len(bugs), Findings: len(fs)}
+	m := Metrics{Bugs: len(bugs), Claims: len(fs)}
 	for _, f := range fs {
 		best := matchingBug(bugs, used, f.File, f.Line, tol)
 		if best >= 0 {
@@ -50,13 +50,13 @@ func Compute(bugs []Bug, fs []review.Finding, tol int) Metrics {
 	return m
 }
 
-// ComputeTrace 只用 Finding 自身位置计算命中，Evidence 仅供阶段归因使用。
+// ComputeTrace 只用 CandidateClaim 自身位置计算命中，Evidence 仅供阶段归因使用。
 func ComputeTrace(c *Case, trace *workflow.Trace, tol int) TraceMetrics {
-	var raw []review.Finding
-	var accepted []review.Finding
+	var raw []review.CandidateClaim
+	var accepted []review.CandidateClaim
 	if trace != nil {
-		raw = trace.Findings
-		accepted = acceptedFindings(trace)
+		raw = trace.FinalReport.Claims
+		accepted = acceptedClaims(trace)
 	}
 	return computePrimary(c, raw, accepted, tol)
 }
@@ -66,38 +66,51 @@ func FailureMetrics(c *Case) TraceMetrics {
 	return computePrimary(c, nil, nil, 0)
 }
 
-func computePrimary(c *Case, raw, accepted []review.Finding, tol int) TraceMetrics {
-	bug := Bug{File: c.GT.Primary.File, Line: c.GT.Primary.Line, Desc: c.GT.Description}
-	if bug.Line <= 0 {
+func computePrimary(c *Case, raw, accepted []review.CandidateClaim, tol int) TraceMetrics {
+	locations := acceptableLocations(c.GT)
+	if c.GT.Primary.Line <= 0 {
 		return TraceMetrics{
-			RawFile:      Compute([]Bug{bug}, raw, tol),
-			AcceptedFile: Compute([]Bug{bug}, accepted, tol),
+			RawFile:      computeOneIssueAtLocations(locations, raw, tol),
+			AcceptedFile: computeOneIssueAtLocations(locations, accepted, tol),
 		}
 	}
 	return TraceMetrics{
-		RawLine:      Compute([]Bug{bug}, raw, tol),
-		AcceptedLine: Compute([]Bug{bug}, accepted, tol),
+		RawLine:      computeOneIssueAtLocations(locations, raw, tol),
+		AcceptedLine: computeOneIssueAtLocations(locations, accepted, tol),
 	}
 }
 
-// acceptedFindings 只返回有明确接受记录的 Finding。
-func acceptedFindings(trace *workflow.Trace) []review.Finding {
-	if trace == nil || len(trace.Validations) == 0 {
+func computeOneIssueAtLocations(locations []Location, claims []review.CandidateClaim, tol int) Metrics {
+	m := Metrics{Bugs: 1, Claims: len(claims), FN: 1}
+	matched := false
+	for _, claim := range claims {
+		claimMatched := false
+		for _, location := range locations {
+			if claim.File == location.File && (location.Line <= 0 || abs(location.Line-claim.Line) <= tol) {
+				claimMatched = true
+				break
+			}
+		}
+		if claimMatched && !matched {
+			matched = true
+			m.True++
+			m.TP++
+			m.Found = 1
+			m.FN = 0
+		} else {
+			m.False++
+			m.FP++
+		}
+	}
+	return m
+}
+
+// acceptedClaims 只返回通过通用验证边界的 CandidateClaim。
+func acceptedClaims(trace *workflow.Trace) []review.CandidateClaim {
+	if trace == nil {
 		return nil
 	}
-	accepted := make(map[int]bool, len(trace.Validations))
-	for _, validation := range trace.Validations {
-		if validation.Accepted {
-			accepted[validation.FindingIndex] = true
-		}
-	}
-	out := make([]review.Finding, 0, len(accepted))
-	for i, finding := range trace.Findings {
-		if accepted[i] {
-			out = append(out, finding)
-		}
-	}
-	return out
+	return trace.FinalReport.ClaimsWithStatus(workflow.VerdictAccepted)
 }
 
 func matchingBug(bugs []Bug, used []bool, file string, line, tol int) int {
@@ -120,7 +133,7 @@ func matchingBug(bugs []Bug, used []bool, file string, line, tol int) int {
 func (m Metrics) Add(o Metrics) Metrics {
 	m.Bugs += o.Bugs
 	m.Found += o.Found
-	m.Findings += o.Findings
+	m.Claims += o.Claims
 	m.True += o.True
 	m.False += o.False
 	m.TP += o.TP
@@ -146,20 +159,20 @@ func (m Metrics) Recall() float64 {
 	return float64(m.Found) / float64(m.Bugs)
 }
 
-// Precision 返回命中 bug 的 Finding 比例。
+// Precision 返回命中 bug 的 CandidateClaim 比例。
 func (m Metrics) Precision() float64 {
-	if m.Findings == 0 {
+	if m.Claims == 0 {
 		return 0
 	}
-	return float64(m.True) / float64(m.Findings)
+	return float64(m.True) / float64(m.Claims)
 }
 
-// FPRate 返回未命中 Finding 的比例。
+// FPRate 返回未命中 CandidateClaim 的比例。
 func (m Metrics) FPRate() float64 {
-	if m.Findings == 0 {
+	if m.Claims == 0 {
 		return 0
 	}
-	return float64(m.False) / float64(m.Findings)
+	return float64(m.False) / float64(m.Claims)
 }
 
 // F1 返回 Precision 和 Recall 的调和平均。

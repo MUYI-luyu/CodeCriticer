@@ -1,21 +1,59 @@
 package diff
 
 import (
+	"fmt"
+	"strings"
+
 	sitter "github.com/smacker/go-tree-sitter"
 	"github.com/smacker/go-tree-sitter/golang"
 )
 
 // Symbol 是被改位置所属的声明。
 type Symbol struct {
-	Name       string   // 函数名 / 方法名 / 类型名
-	Kind       string   // func / method / type / var / const
-	Line       int      // 声明起始行（1-based）
-	EndLine    int      // 声明结束行（1-based）
-	Receiver   string   // 方法接收者类型（仅 method）
-	Params     []string // 参数列表（函数/方法）
-	Returns    []string // 返回值列表（函数/方法）
-	Body       string   // 完整函数体源码
-	Signature  string   // 完整签名（用于精确匹配）
+	Name      string   // 函数名 / 方法名 / 类型名
+	Kind      string   // func / method / type / var / const
+	Line      int      // 声明起始行（1-based）
+	EndLine   int      // 声明结束行（1-based）
+	Receiver  string   // 方法接收者类型（仅 method）
+	Params    []string // 参数列表（函数/方法）
+	Returns   []string // 返回值列表（函数/方法）
+	Body      string   // 完整函数体源码
+	Signature string   // 完整签名（用于精确匹配）
+}
+
+// Find locates one top-level declaration by function/type/variable name. A
+// receiver-qualified method name (for example Server.Close) disambiguates
+// methods with the same name.
+func Find(src []byte, requested string) (Symbol, error) {
+	p := sitter.NewParser()
+	defer p.Close()
+	p.SetLanguage(golang.GetLanguage())
+	tree := p.Parse(nil, src)
+	methodReceiver, name := "", requested
+	if dot := strings.LastIndex(requested, "."); dot >= 0 {
+		methodReceiver, name = strings.Trim(requested[:dot], "*() "), requested[dot+1:]
+	}
+	var matches []Symbol
+	walk(tree.RootNode(), func(n *sitter.Node) {
+		if !isDecl(n.Type()) || declName(n, src) != name {
+			return
+		}
+		sym, ok := Locate(src, int(n.StartPoint().Row)+1)
+		if !ok {
+			return
+		}
+		if methodReceiver != "" && strings.Trim(sym.Receiver, "*() ") != methodReceiver {
+			return
+		}
+		matches = append(matches, sym)
+	})
+	if len(matches) == 0 {
+		return Symbol{}, fmt.Errorf("找不到符号 %s", requested)
+	}
+	if len(matches) > 1 {
+		return Symbol{}, fmt.Errorf("符号 %s 不唯一；请使用 Receiver.Method", requested)
+	}
+	return matches[0], nil
 }
 
 // Locate 找出包含行号 line（1-based）的最内层声明符号。
@@ -90,6 +128,27 @@ func (c *Change) Annotate(src []byte) {
 			c.Symbols = append(c.Symbols, sym)
 		}
 	}
+	for hi := range c.Hunks {
+		for li := range c.Hunks[hi].Lines {
+			line := &c.Hunks[hi].Lines[li]
+			if line.NewLine <= 0 {
+				continue
+			}
+			for _, sym := range c.Symbols {
+				if line.NewLine >= sym.Line && line.NewLine <= sym.EndLine {
+					line.Symbol = symbolDisplay(sym)
+					break
+				}
+			}
+		}
+	}
+}
+
+func symbolDisplay(sym Symbol) string {
+	if sym.Kind == "method" && sym.Receiver != "" {
+		return sym.Receiver + "." + sym.Name
+	}
+	return sym.Name
 }
 
 func walk(n *sitter.Node, fn func(*sitter.Node)) {

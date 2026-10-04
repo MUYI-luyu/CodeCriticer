@@ -28,7 +28,7 @@ import (
 	"golang.org/x/tools/go/packages"
 )
 
-// ruleAnalyzers 是确定性静态规则集，覆盖常见 bug 类，保不漏。
+// ruleAnalyzers 是 run_static_rules 工具调用的 Go analyzers。
 var ruleAnalyzers = []*analysis.Analyzer{
 	atomic.Analyzer,
 	bools.Analyzer,
@@ -52,8 +52,16 @@ var ruleAnalyzers = []*analysis.Analyzer{
 	ctrlflow.Analyzer, // 被 lostcancel 依赖
 }
 
-// Rules 跑静态规则，返回确定性 findings。
-func Rules(repo string) ([]Finding, error) {
+// StaticDiagnostic 是静态分析工具的原始输出，不代表 Agent Claim。
+type StaticDiagnostic struct {
+	File     string
+	Line     int
+	Analyzer string
+	Message  string
+}
+
+// Rules 跑静态规则，返回可供 Agent 引用的工具结果。
+func Rules(repo string) ([]StaticDiagnostic, error) {
 	cfg := &packages.Config{
 		Mode: packages.LoadAllSyntax,
 		Dir:  repo,
@@ -68,16 +76,15 @@ func Rules(repo string) ([]Finding, error) {
 		return nil, err
 	}
 
-	var out []Finding
+	var out []StaticDiagnostic
 	for _, act := range g.Roots {
 		for _, d := range act.Diagnostics {
 			p := act.Package.Fset.Position(d.Pos)
-			out = append(out, Finding{
+			out = append(out, StaticDiagnostic{
 				File:     filepath.ToSlash(relPath(repo, p.Filename)),
 				Line:     p.Line,
-				Symbol:   act.Analyzer.Name, // 命中的规则
-				Severity: "warning",
-				Msg:      d.Message,
+				Analyzer: act.Analyzer.Name,
+				Message:  d.Message,
 			})
 		}
 	}

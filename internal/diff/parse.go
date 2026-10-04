@@ -3,6 +3,7 @@ package diff
 
 import (
 	"bytes"
+	"fmt"
 	"strings"
 
 	sgd "github.com/sourcegraph/go-diff/diff"
@@ -21,6 +22,27 @@ type Change struct {
 	Adds    []Line   // 新增行
 	Dels    []Line   // 删除行
 	Symbols []Symbol // Annotate 填充
+	Hunks   []Hunk   // 完整 unified diff hunk，保留上下文和新旧行号
+}
+
+// Hunk 是可独立提供给 Agent 的完整变更块。ID 在单个文件内稳定。
+type Hunk struct {
+	ID       string
+	OldStart int
+	OldLines int
+	NewStart int
+	NewLines int
+	Section  string
+	Lines    []HunkLine
+}
+
+// HunkLine 同时保存旧、新文件坐标。不存在的一侧行号为 0。
+type HunkLine struct {
+	Kind    string // context / add / delete / metadata
+	OldLine int
+	NewLine int
+	Text    string
+	Symbol  string
 }
 
 // Parse 把 unified diff 解析为变更列表，并自动标注符号信息。
@@ -33,8 +55,8 @@ func Parse(data []byte) ([]Change, error) {
 	cs := make([]Change, 0, len(fds))
 	for _, fd := range fds {
 		c := Change{File: stripPath(fd.NewName), Old: stripPath(fd.OrigName)}
-		for _, h := range fd.Hunks {
-			c.fill(h)
+		for i, h := range fd.Hunks {
+			c.fill(h, i+1)
 		}
 		cs = append(cs, c)
 	}
@@ -52,22 +74,36 @@ func stripPath(p string) string {
 }
 
 // fill 按 hunk 头行号把正文逐行归入新增/删除。
-func (c *Change) fill(h *sgd.Hunk) {
+func (c *Change) fill(h *sgd.Hunk, index int) {
 	oldN, newN := int(h.OrigStartLine), int(h.NewStartLine)
+	hunk := Hunk{
+		ID:       fmt.Sprintf("h%d", index),
+		OldStart: oldN,
+		OldLines: int(h.OrigLines),
+		NewStart: newN,
+		NewLines: int(h.NewLines),
+		Section:  h.Section,
+	}
 	for _, raw := range bytes.Split(h.Body, []byte("\n")) {
 		if len(raw) == 0 {
 			continue
 		}
 		switch raw[0] {
 		case ' ':
+			hunk.Lines = append(hunk.Lines, HunkLine{Kind: "context", OldLine: oldN, NewLine: newN, Text: string(raw[1:])})
 			oldN++
 			newN++
 		case '-':
 			c.Dels = append(c.Dels, Line{No: oldN, Text: string(raw[1:])})
+			hunk.Lines = append(hunk.Lines, HunkLine{Kind: "delete", OldLine: oldN, Text: string(raw[1:])})
 			oldN++
 		case '+':
 			c.Adds = append(c.Adds, Line{No: newN, Text: string(raw[1:])})
+			hunk.Lines = append(hunk.Lines, HunkLine{Kind: "add", NewLine: newN, Text: string(raw[1:])})
 			newN++
+		case '\\':
+			hunk.Lines = append(hunk.Lines, HunkLine{Kind: "metadata", Text: string(raw)})
 		}
 	}
+	c.Hunks = append(c.Hunks, hunk)
 }

@@ -9,11 +9,11 @@ import (
 type BugStage string
 
 const (
-	StageInputMiss          BugStage = "input_miss"
-	StageInvestigationMiss  BugStage = "investigation_miss"
-	StageReviewMiss         BugStage = "review_miss"
-	StageEvaluationSelfHarm BugStage = "evaluation_self_harm"
-	StageSuccess            BugStage = "success"
+	StageInputMiss         BugStage = "input_miss"
+	StageInvestigationMiss BugStage = "investigation_miss"
+	StageClaimMiss         BugStage = "claim_miss"
+	StageVerdictSelfHarm   BugStage = "verdict_self_harm"
+	StageSuccess           BugStage = "success"
 )
 
 // BugAttribution 记录 Primary 在四个阶段的命中状态和 Related 的调查覆盖。
@@ -22,8 +22,8 @@ type BugAttribution struct {
 	Stage                  BugStage `json:"stage"`
 	InputHit               bool     `json:"input_hit"`
 	InvestigationHit       bool     `json:"investigation_hit"`
-	RawFindingHit          bool     `json:"raw_finding_hit"`
-	AcceptedFindingHit     bool     `json:"accepted_finding_hit"`
+	RawClaimHit            bool     `json:"raw_claim_hit"`
+	AcceptedClaimHit       bool     `json:"accepted_claim_hit"`
 	RelatedEvidenceCovered int      `json:"related_evidence_covered"`
 	RelatedEvidenceTotal   int      `json:"related_evidence_total"`
 }
@@ -42,8 +42,8 @@ func Attribute(c *Case, trace *workflow.Trace, tol int) []BugAttribution {
 
 	inputHit := evidenceSourceCovers(trace.Evidence, primary, tol, true)
 	investigationHit := evidenceSourceCovers(trace.Evidence, primary, tol, false)
-	rawFindingHit := findingsCover(trace.Findings, primary, tol)
-	acceptedFindingHit := findingsCover(acceptedFindings(trace), primary, tol)
+	rawClaimHit := claimsCoverAny(trace.FinalReport.Claims, acceptableLocations(c.GT), tol)
+	acceptedClaimHit := claimsCoverAny(acceptedClaims(trace), acceptableLocations(c.GT), tol)
 	relatedCovered := 0
 	for _, related := range c.GT.Related {
 		if evidenceSourceCovers(trace.Evidence, related, tol, false) {
@@ -53,24 +53,33 @@ func Attribute(c *Case, trace *workflow.Trace, tol int) []BugAttribution {
 
 	return []BugAttribution{{
 		Bug:                    bug,
-		Stage:                  classify(inputHit, investigationHit, rawFindingHit, acceptedFindingHit),
+		Stage:                  classify(inputHit, investigationHit, rawClaimHit, acceptedClaimHit),
 		InputHit:               inputHit,
 		InvestigationHit:       investigationHit,
-		RawFindingHit:          rawFindingHit,
-		AcceptedFindingHit:     acceptedFindingHit,
+		RawClaimHit:            rawClaimHit,
+		AcceptedClaimHit:       acceptedClaimHit,
 		RelatedEvidenceCovered: relatedCovered,
 		RelatedEvidenceTotal:   len(c.GT.Related),
 	}}
 }
 
-func classify(inputHit, investigationHit, rawFindingHit, acceptedFindingHit bool) BugStage {
+func claimsCoverAny(claims []review.CandidateClaim, locations []Location, tol int) bool {
+	for _, location := range locations {
+		if claimsCover(claims, location, tol) {
+			return true
+		}
+	}
+	return false
+}
+
+func classify(inputHit, investigationHit, rawClaimHit, acceptedClaimHit bool) BugStage {
 	switch {
-	case acceptedFindingHit:
+	case acceptedClaimHit:
 		return StageSuccess
-	case rawFindingHit:
-		return StageEvaluationSelfHarm
+	case rawClaimHit:
+		return StageVerdictSelfHarm
 	case investigationHit:
-		return StageReviewMiss
+		return StageClaimMiss
 	case inputHit:
 		return StageInvestigationMiss
 	default:
@@ -104,12 +113,12 @@ func evidenceCovers(evidence *workflow.Evidence, location Location, tol int) boo
 	return location.Line >= evidence.Line-tol && location.Line <= end+tol
 }
 
-func findingsCover(findings []review.Finding, location Location, tol int) bool {
-	for _, finding := range findings {
-		if finding.File != location.File {
+func claimsCover(claims []review.CandidateClaim, location Location, tol int) bool {
+	for _, claim := range claims {
+		if claim.File != location.File {
 			continue
 		}
-		if location.Line <= 0 || abs(location.Line-finding.Line) <= tol {
+		if location.Line <= 0 || abs(location.Line-claim.Line) <= tol {
 			return true
 		}
 	}

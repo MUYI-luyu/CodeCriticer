@@ -41,6 +41,36 @@ func TestCallersUnknown(t *testing.T) {
 	}
 }
 
+func TestCallersDistinguishSameBasename(t *testing.T) {
+	dir := t.TempDir()
+	write(t, dir, "go.mod", "module example.com/same\n\ngo 1.22\n")
+	write(t, dir, "main.go", `package main
+
+import (
+    "example.com/same/left"
+    "example.com/same/right"
+)
+
+func main() { left.Call(); right.Call() }
+`)
+	write(t, dir, "left/impl.go", `package left
+func Call() { Same() }
+func Same() {}
+`)
+	write(t, dir, "right/impl.go", `package right
+func Call() { Same() }
+func Same() {}
+`)
+	idx, err := Build(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	callers := idx.Callers(SymbolRef{Name: "Same", File: "left/impl.go"})
+	if !hasFunc(callers, "left.Call") || hasFunc(callers, "right.Call") {
+		t.Fatalf("同名符号未按完整路径区分: %+v", callers)
+	}
+}
+
 // interface 调用由 CHA 分发到实现，改实现内部函数应波及接口调用方。
 func TestInterfaceDispatch(t *testing.T) {
 	dir := t.TempDir()
@@ -85,81 +115,67 @@ func Call(r Runner) {
 	}
 }
 
-func TestDataFlowFacts(t *testing.T) {
+func TestInspectSymbolReferencesUsesCompilerIdentity(t *testing.T) {
 	dir := t.TempDir()
-	write(t, dir, "go.mod", "module example.com/flow\n\ngo 1.22\n")
+	write(t, dir, "go.mod", "module example.com/refs\n\ngo 1.22\n")
 	write(t, dir, "main.go", `package main
 
-import "fmt"
+var shared = 1
 
-func readConfig() error { return fmt.Errorf("bad config") }
-func Load() error { return readConfig() }
-func Start() error { err := Load(); return err }
-func Wrap() error { return fmt.Errorf("wrapped: %w", Load()) }
-func Ignore() error { Load(); return nil }
+func read() int { return shared }
+func write() { shared = 2 }
 `)
 	idx, err := Build(dir)
 	if err != nil {
 		t.Fatal(err)
 	}
-	steps, err := idx.DataFlow(SymbolRef{Name: "Start", File: "main.go"})
+	facts, err := idx.InspectSymbol(SymbolRef{Name: "shared", File: "main.go", Line: 3}, "references")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !hasKind(steps, "call") || !hasKind(steps, "return") {
-		t.Fatalf("缺少调用或返回事实: %+v", steps)
+	if len(facts) != 2 {
+		t.Fatalf("references=%+v", facts)
 	}
-	for _, name := range []string{"Wrap", "Ignore"} {
-		if _, err := idx.DataFlow(SymbolRef{Name: name, File: "main.go"}); err != nil {
-			t.Fatalf("%s 数据流失败: %v", name, err)
+	for _, fact := range facts {
+		if fact.Precision != "exact_types" || fact.Kind != "reference" {
+			t.Fatalf("fact=%+v", fact)
 		}
 	}
 }
 
-func TestDataFlowMissingSymbol(t *testing.T) {
+func TestInspectSymbolCallHierarchyLabelsPrecision(t *testing.T) {
 	dir := writeRepo(t)
 	idx, err := Build(dir)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := idx.DataFlow(SymbolRef{Name: "Missing", File: "main.go"}); err == nil || !strings.Contains(err.Error(), "找不到符号") {
-		t.Fatalf("应明确报告目标不存在: %v", err)
+	facts, err := idx.InspectSymbol(SymbolRef{Name: "Bar", File: "lib/lib.go", Line: 7}, "callers")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(facts) != 1 || facts[0].Precision != "exact_static_call" {
+		t.Fatalf("facts=%+v", facts)
 	}
 }
 
-func TestDataFlowLoadsTestVariant(t *testing.T) {
+func TestInspectSymbolDisambiguatesReceiver(t *testing.T) {
 	dir := t.TempDir()
-	write(t, dir, "go.mod", "module example.com/testflow\n\ngo 1.22\n")
-	write(t, dir, "flow_test.go", `package testflow
-
-import (
-    "errors"
-    "testing"
-)
-
-func Go() error { return errors.New("failed") }
-func TestEntry(t *testing.T) { _ = Go() }
+	write(t, dir, "go.mod", "module example.com/methods\n\ngo 1.22\n")
+	write(t, dir, "main.go", `package main
+type Left struct{}
+type Right struct{}
+func (Left) Close() {}
+func (Right) Close() {}
+func use() { Left{}.Close() }
 `)
 	idx, err := Build(dir)
 	if err != nil {
 		t.Fatal(err)
 	}
-	steps, err := idx.DataFlow(SymbolRef{Name: "Go", File: "flow_test.go"})
-	if err != nil {
-		t.Fatal(err)
+	facts, err := idx.InspectSymbol(SymbolRef{Name: "Left.Close", File: "main.go"}, "definition")
+	if err != nil || len(facts) != 1 || !strings.Contains(facts[0].Detail, "Left") {
+		t.Fatalf("facts=%+v err=%v", facts, err)
 	}
-	if !hasKind(steps, "return") {
-		t.Fatalf("测试变体缺少返回事实: %+v", steps)
-	}
-}
-
-func hasKind(steps []FlowStep, kind string) bool {
-	for _, step := range steps {
-		if step.Kind == kind && step.File != "" && step.Line > 0 && step.Detail != "" {
-			return true
-		}
-	}
-	return false
 }
 
 func hasFunc(cs []Caller, sub string) bool {

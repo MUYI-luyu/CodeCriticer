@@ -5,14 +5,11 @@ import (
 	"strings"
 )
 
-// Config 存储 LLM 配置，支持分级模型。
+// Config 存储 Agent 主模型和可选降级模型。
 type Config struct {
 	APIKey  string
 	BaseURL string
-
-	// 分级模型：不同任务使用不同能力的模型
-	PlanModel   string // 规划任务（便宜模型即可）
-	ReviewModel string // 审查任务（需要强模型）
+	Model   string
 }
 
 // DefaultConfig 返回默认配置。
@@ -21,9 +18,8 @@ func DefaultConfig() *Config {
 		// CodeCritic_URL is required because Claude may be reached through an
 		// OpenAI-compatible gateway; the native Anthropic endpoint is not the
 		// same protocol as this client.
-		BaseURL:     "",
-		PlanModel:   "gpt-5.4",
-		ReviewModel: "gpt-5.4",
+		BaseURL: "",
+		Model:   "gpt-5.4",
 	}
 }
 
@@ -50,17 +46,12 @@ func WithBaseURL(url string) Option {
 	return func(c *Config) { c.BaseURL = strings.TrimRight(url, "/") }
 }
 
-// WithPlanModel 设置规划模型。
-func WithPlanModel(model string) Option {
-	return func(c *Config) { c.PlanModel = model }
+// WithModel 设置 Agent 主模型。
+func WithModel(model string) Option {
+	return func(c *Config) { c.Model = model }
 }
 
-// WithReviewModel 设置审查模型。
-func WithReviewModel(model string) Option {
-	return func(c *Config) { c.ReviewModel = model }
-}
-
-// InvestigatorModel 返回调查阶段使用的模型。
-func (l *LLM) InvestigatorModel() string {
-	return l.config.ReviewModel
+// AgentModel 返回调查阶段使用的主模型。
+func (l *LLM) AgentModel() string {
+	return l.config.Model
 }

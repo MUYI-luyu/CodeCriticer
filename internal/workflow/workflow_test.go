@@ -3,70 +3,102 @@ package workflow
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/MUYI-luyu/codecritic/internal/diff"
 	"github.com/MUYI-luyu/codecritic/internal/recall"
 	"github.com/MUYI-luyu/codecritic/internal/review"
 )
 
 type scriptedLLM struct {
-	decisions       []string
+	calls           []review.ToolCall
+	transcripts     [][]review.ToolMessage
 	configuredModel string
 }
 
-type gapLoopLLM struct {
-	decisions []string
-	reviews   int
-	prompts   []string
-}
+func (s *scriptedLLM) AgentModel() string { return s.configuredModel }
 
-func (s *gapLoopLLM) Plan(context.Context, string) ([]review.Point, review.LLMUsage, error) {
-	return []review.Point{{Desc: "检查修改函数的调用关系", Kw: []string{"Run"}}}, review.LLMUsage{}, nil
-}
-
-func (s *gapLoopLLM) ChatWithUsage(_ context.Context, _, prompt, _ string) (string, review.LLMUsage, error) {
-	s.prompts = append(s.prompts, prompt)
-	if len(s.decisions) == 0 {
-		return `{"done":true}`, review.LLMUsage{}, nil
+func (s *scriptedLLM) CompleteToolsWithUsage(_ context.Context, _ string, messages []review.ToolMessage, _ []review.ToolDefinition, _ string) (review.ToolMessage, review.LLMUsage, error) {
+	s.transcripts = append(s.transcripts, append([]review.ToolMessage(nil), messages...))
+	if len(s.calls) == 0 {
+		return assistantCall("submit_claims", `{"claims":[]}`), review.LLMUsage{}, nil
 	}
-	out := s.decisions[0]
-	s.decisions = s.decisions[1:]
-	return out, review.LLMUsage{}, nil
+	out := s.calls[0]
+	s.calls = s.calls[1:]
+	return review.ToolMessage{Role: "assistant", ToolCalls: []review.ToolCall{out}}, review.LLMUsage{}, nil
 }
 
-func (s *gapLoopLLM) Review(context.Context, string) ([]review.Finding, review.LLMUsage, error) {
-	s.reviews++
-	if s.reviews == 1 {
-		return []review.Finding{{File: "main.go", Line: 4, Severity: "warning", Msg: "待补证据"}}, review.LLMUsage{}, nil
-	}
-	return []review.Finding{{File: "main.go", Line: 5, Severity: "warning", Msg: "证据充分", EvidenceIDs: []string{"e2"}}}, review.LLMUsage{}, nil
-}
-
-func (s *scriptedLLM) Plan(context.Context, string) ([]review.Point, review.LLMUsage, error) {
-	return []review.Point{{Desc: "检查修改函数的调用关系", Kw: []string{"Run"}}}, review.LLMUsage{}, nil
-}
-
-func (s *scriptedLLM) InvestigatorModel() string {
-	return s.configuredModel
-}
-
-func TestWorkflowUsesConfiguredInvestigatorModel(t *testing.T) {
-	llm := &scriptedLLM{configuredModel: "gpt-5.4"}
-	wf, err := New(llm, t.TempDir())
+func TestReviewRunIsOneShot(t *testing.T) {
+	repo, diffData := testRepo(t, "package main\n\nfunc Run() {}\n", 3)
+	run, err := NewReviewRun(&scriptedLLM{}, repo)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if wf.model != "gpt-5.4" {
-		t.Fatalf("调查模型 = %q，期望 gpt-5.4", wf.model)
+	if _, err := run.Run(context.Background(), Request{Repo: repo, Diff: diffData}); err != nil {
+		t.Fatal(err)
+	}
+	if result, err := run.Run(context.Background(), Request{Repo: repo, Diff: diffData}); !errors.Is(err, ErrReviewRunAlreadyStarted) || result != nil {
+		t.Fatalf("second Run result=%+v err=%v", result, err)
+	}
+}
+
+func TestEvidenceLedgerUsesSemanticIdentityAndDefensiveCopies(t *testing.T) {
+	run := &ReviewRun{}
+	first := &Evidence{Source: "read_code", Type: "code", File: "main.go", Line: 3, EndLine: 5, Content: "3 | func Run() {}", StepID: "s1"}
+	if id := run.appendEvidence(first); id != "e1" {
+		t.Fatalf("first id=%q", id)
+	}
+
+	first.Content = "mutated by caller"
+	copyOne := run.evidenceSnapshot()
+	if copyOne[0].Content != "3 | func Run() {}" {
+		t.Fatalf("caller mutated ledger: %+v", copyOne[0])
+	}
+	copyOne[0].Content = "mutated snapshot"
+	if got := run.evidenceSnapshot()[0].Content; got != "3 | func Run() {}" {
+		t.Fatalf("snapshot mutated ledger: %q", got)
+	}
+
+	session := &ReviewSession{run: run}
+	withSymbol := &Evidence{Source: "read_code", Type: "code", File: "main.go", Line: 3, EndLine: 5, Content: "3 | func Run() {}", Symbol: "Run"}
+	observed, novel := session.appendEvidence("s2", []*Evidence{withSymbol})
+	if !observed || novel || withSymbol.ID != "e2" {
+		t.Fatalf("semantic variant observed=%v novel=%v evidence=%+v", observed, novel, withSymbol)
+	}
+	ledger := run.evidenceSnapshot()
+	if len(ledger) != 2 || ledger[0].Symbol != "" || ledger[1].Symbol != "Run" {
+		t.Fatalf("ledger=%+v", ledger)
+	}
+}
+
+func assistantCall(name, arguments string) review.ToolMessage {
+	return review.ToolMessage{Role: "assistant", ToolCalls: []review.ToolCall{{ID: "call-" + name, Type: "function", Function: review.FunctionCall{Name: name, Arguments: arguments}}}}
+}
+
+func toolCall(name, arguments string) review.ToolCall {
+	return assistantCall(name, arguments).ToolCalls[0]
+}
+
+func TestWorkflowUsesConfiguredAgentModel(t *testing.T) {
+	wf, err := NewReviewRun(&scriptedLLM{configuredModel: "agent-model"}, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if wf.model != "agent-model" {
+		t.Fatalf("model=%q", wf.model)
 	}
 }
 
 func TestTraceSave(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "nested", "trace.json")
-	trace := &Trace{ID: "trace-test", StopReason: "validated"}
+	trace := &Trace{ID: "trace-test", StopReason: StopAgentDone}
 	if err := trace.Save(path); err != nil {
 		t.Fatal(err)
 	}
@@ -75,538 +107,557 @@ func TestTraceSave(t *testing.T) {
 		t.Fatal(err)
 	}
 	if info.Mode().Perm() != 0600 {
-		t.Fatalf("trace mode = %o, want 600", info.Mode().Perm())
+		t.Fatalf("mode=%o", info.Mode().Perm())
 	}
 	var decoded Trace
 	data, _ := os.ReadFile(path)
 	if err := json.Unmarshal(data, &decoded); err != nil || decoded.ID != trace.ID {
-		t.Fatalf("invalid trace JSON: %v", err)
-	}
-}
-func (s *scriptedLLM) ChatWithUsage(context.Context, string, string, string) (string, review.LLMUsage, error) {
-	out := s.decisions[0]
-	s.decisions = s.decisions[1:]
-	return out, review.LLMUsage{}, nil
-}
-func (s *scriptedLLM) Review(context.Context, string) ([]review.Finding, review.LLMUsage, error) {
-	return []review.Finding{{File: "main.go", Line: 4, Severity: "warning", Msg: "reviewed change", Evidence: "func Run", EvidenceIDs: []string{"e2"}}}, review.LLMUsage{}, nil
-}
-
-func TestWorkflowUsesEvidenceBeforeFinishing(t *testing.T) {
-	repo := t.TempDir()
-	if err := os.WriteFile(filepath.Join(repo, "main.go"), []byte("package main\n\nfunc Run() {\n}\n"), 0644); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(repo, "go.mod"), []byte("module example.com/test\n\ngo 1.22\n"), 0644); err != nil {
-		t.Fatal(err)
-	}
-	diff := []byte("diff --git a/main.go b/main.go\n--- a/main.go\n+++ b/main.go\n@@ -2,3 +2,3 @@\n \n-func Run() {\n+func Run() {\n }\n")
-	llm := &scriptedLLM{decisions: []string{`{"done":false,"tool":"read_code","args":{"file":"main.go"},"question_indexes":[0]}`, `{"done":true}`}}
-	wf, err := New(llm, repo)
-	if err != nil {
-		t.Fatal(err)
-	}
-	result, err := wf.Run(context.Background(), Request{Repo: repo, Diff: diff})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(result.Trace.Evidence) < 1 || result.Trace.Evidence[len(result.Trace.Evidence)-1].Type != "code" {
-		t.Fatalf("unexpected evidence: %+v", result.Trace.Evidence)
-	}
-	if len(result.Trace.ToolCalls) != 1 || result.Trace.ToolCalls[0].Tool != "read_code" {
-		t.Fatalf("unexpected calls: %+v", result.Trace.ToolCalls)
-	}
-	if len(result.Trace.Findings) != 1 || !result.Trace.Validations[0].Accepted {
-		t.Fatalf("unexpected result: %+v", result.Trace)
+		t.Fatalf("invalid trace: %v", err)
 	}
 }
 
-func TestInvestigatorContinuesAfterToolError(t *testing.T) {
-	repo := t.TempDir()
-	if err := os.WriteFile(filepath.Join(repo, "main.go"), []byte("package main\n\nfunc Run() {\n}\n"), 0644); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(repo, "go.mod"), []byte("module example.com/test\n\ngo 1.22\n"), 0644); err != nil {
-		t.Fatal(err)
-	}
-	diff := []byte("diff --git a/main.go b/main.go\n--- a/main.go\n+++ b/main.go\n@@ -2,3 +2,3 @@\n \n-func Run() {\n+func Run() {\n }\n")
-	llm := &scriptedLLM{decisions: []string{
-		`{"done":false,"tool":"dataflow","args":{"symbol":"Missing","file":"main.go"}}`,
-		`{"done":false,"tool":"read_code","args":{"file":"main.go"}}`,
-		`{"done":true}`,
+func TestAgentToolThenSubmit(t *testing.T) {
+	repo, diffData := testRepo(t, "package main\n\nfunc Run() {\n}\n", 3)
+	llm := &scriptedLLM{calls: []review.ToolCall{
+		toolCall("read_code", `{"file":"main.go","selector":{"kind":"file_start"}}`),
+		toolCall("submit_claims", `{"claims":[{"file":"main.go","line":3,"severity":"warning","msg":"Run has an issue","evidence_ids":["e2"]}]}`),
 	}}
-	wf, err := New(llm, repo)
+	wf, _ := NewReviewRun(llm, repo)
+	result, err := wf.Run(context.Background(), Request{Repo: repo, Diff: diffData})
 	if err != nil {
 		t.Fatal(err)
 	}
-	result, err := wf.Run(context.Background(), Request{Repo: repo, Diff: diff})
-	if err != nil {
-		t.Fatal(err)
+	trace := result.Trace
+	if len(trace.Investigation) != 1 || trace.Investigation[0].Tool != "read_code" {
+		t.Fatalf("investigation=%+v", trace.Investigation)
 	}
-	if len(result.Trace.ToolCalls) != 2 || result.Trace.ToolCalls[0].Error == "" || result.Trace.ToolCalls[1].Error != "" {
-		t.Fatalf("工具失败后未继续决策: %+v", result.Trace.ToolCalls)
+	if len(trace.FinalReport.Claims) != 1 || trace.FinalReport.Verdicts[0].Status != VerdictAccepted {
+		t.Fatalf("report=%+v", trace.FinalReport)
 	}
-	if len(result.Trace.Evidence) < 2 || result.Trace.Evidence[len(result.Trace.Evidence)-1].Source != "read_code" {
-		t.Fatalf("后续证据缺失: %+v", result.Trace.Evidence)
+	if trace.Evidence[len(trace.Evidence)-1].StepID != trace.Investigation[0].ID {
+		t.Fatalf("provenance not linked: evidence=%+v step=%+v", trace.Evidence, trace.Investigation[0])
 	}
 }
 
-func TestInvestigatorReportsRepeatedDecision(t *testing.T) {
-	repo := t.TempDir()
-	if err := os.WriteFile(filepath.Join(repo, "main.go"), []byte("package main\n\nfunc Run() {}\n"), 0644); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(repo, "go.mod"), []byte("module example.com/test\n\ngo 1.22\n"), 0644); err != nil {
-		t.Fatal(err)
-	}
-	diff := []byte("diff --git a/main.go b/main.go\n--- a/main.go\n+++ b/main.go\n@@ -2,2 +2,2 @@\n-func Run() {}\n+func Run() { }\n")
-	llm := &gapLoopLLM{decisions: []string{
-		`{"done":false,"tool":"read_code","args":{"file":"main.go"}}`,
-		`{"done":false,"tool":"read_code","args":{"file":"main.go"}}`,
-		`{"done":true}`,
+func TestWorkflowProjectsModelContextButKeepsFullConversation(t *testing.T) {
+	repo, diffData := testRepo(t, "package main\n\nfunc Run() {\n\tprintln(1)\n}\n", 4)
+	llm := &scriptedLLM{calls: []review.ToolCall{
+		toolCall("read_code", `{"file":"main.go","selector":{"kind":"range","start":3,"max_lines":2}}`),
+		toolCall("read_code", `{"file":"main.go","selector":{"kind":"range","start":1,"max_lines":5}}`),
+		toolCall("submit_claims", `{"claims":[]}`),
 	}}
-	wf, err := New(llm, repo)
+	wf, _ := NewReviewRun(llm, repo)
+	wf.SetContextProjection(true)
+	result, err := wf.Run(context.Background(), Request{Repo: repo, Diff: diffData})
 	if err != nil {
 		t.Fatal(err)
 	}
-	result, err := wf.Run(context.Background(), Request{Repo: repo, Diff: diff})
-	if err != nil {
-		t.Fatal(err)
+	if len(llm.transcripts) != 3 || !strings.Contains(llm.transcripts[2][2].Content, "read_code_covered") {
+		t.Fatalf("third model request was not projected: %+v", llm.transcripts)
 	}
-	if len(result.Trace.ToolCalls) < 2 || !strings.Contains(result.Trace.ToolCalls[1].Error, "重复调用") {
-		t.Fatalf("重复决策未记录: %+v", result.Trace.ToolCalls)
+	trace := result.Trace
+	if len(trace.Conversation) != 6 || strings.Contains(trace.Conversation[2].Content, "context_projection") || !strings.Contains(trace.Conversation[2].Content, `"evidence"`) {
+		t.Fatalf("full conversation was not preserved: %+v", trace.Conversation)
 	}
-	if len(llm.prompts) < 3 || !strings.Contains(llm.prompts[2], "未产生新证据") {
-		t.Fatalf("重复决策未反馈给下一轮: %+v", llm.prompts)
+	if !trace.Projection.Enabled || trace.Projection.Applications != 3 || trace.Projection.DominatedReadCodeCompacted != 1 {
+		t.Fatalf("projection stats=%+v", trace.Projection)
 	}
 }
 
-func TestInvestigatorRecordsCoveredReadAsNoNewEvidence(t *testing.T) {
-	repo := t.TempDir()
-	if err := os.WriteFile(filepath.Join(repo, "main.go"), []byte("package main\n\nfunc Run() {\n\tprintln(1)\n}\n"), 0644); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(repo, "go.mod"), []byte("module example.com/test\n\ngo 1.22\n"), 0644); err != nil {
-		t.Fatal(err)
-	}
-	diff := []byte("diff --git a/main.go b/main.go\n--- a/main.go\n+++ b/main.go\n@@ -3,3 +3,3 @@\n func Run() {\n-\tprintln(0)\n+\tprintln(1)\n }\n")
-	llm := &scriptedLLM{decisions: []string{
-		`{"done":false,"tool":"read_code","args":{"file":"main.go","start_line":1,"end_line":5},"question_indexes":[0]}`,
-		`{"done":false,"tool":"read_code","args":{"file":"main.go","start_line":3,"end_line":4},"question_indexes":[0]}`,
-		`{"done":true}`,
+func TestAgentCanInspectConcurrencyFacts(t *testing.T) {
+	repo, diffData := testRepo(t, `package main
+
+import "sync"
+
+var mu sync.Mutex
+
+func Run() {
+	mu.Lock()
+	defer mu.Unlock()
+}
+`, 1)
+	llm := &scriptedLLM{calls: []review.ToolCall{
+		toolCall("inspect_concurrency", `{"symbol":"Run","file":"main.go","line":null}`),
+		toolCall("submit_claims", `{"claims":[]}`),
 	}}
-	wf, err := New(llm, repo)
+	wf, _ := NewReviewRun(llm, repo)
+	result, err := wf.Run(context.Background(), Request{Repo: repo, Diff: diffData})
 	if err != nil {
 		t.Fatal(err)
 	}
-	result, err := wf.Run(context.Background(), Request{Repo: repo, Diff: diff})
-	if err != nil {
-		t.Fatal(err)
+	foundAcquire := false
+	for _, evidence := range result.Trace.Evidence {
+		if evidence.Source == "inspect_concurrency" && evidence.Type == "lock_acquire" && strings.Contains(evidence.Content, "Mutex.Lock") {
+			foundAcquire = true
+			break
+		}
 	}
-	tr := result.Trace
-	if tr.Stats.SuccessfulToolCalls != 1 || tr.Stats.NoNewEvidenceCalls != 1 {
-		t.Fatalf("无新证据调用统计异常: %+v", tr.Stats)
-	}
-	if len(tr.ToolCalls) != 2 || !strings.Contains(tr.ToolCalls[1].Error, "未产生新证据") {
-		t.Fatalf("覆盖读取应记录为无新证据: %+v", tr.ToolCalls)
-	}
-	if got := tr.Evidence[len(tr.Evidence)-1]; got.Line != 1 || got.EndLine != 5 {
-		t.Fatalf("较小读取不应覆盖完整证据: %+v", got)
+	if !foundAcquire {
+		t.Fatalf("concurrency evidence=%+v", result.Trace.Evidence)
 	}
 }
 
-func TestInvestigatorStopsAfterCoveredQuestionsAndStaleResults(t *testing.T) {
-	repo := t.TempDir()
-	if err := os.WriteFile(filepath.Join(repo, "main.go"), []byte("package main\n\nfunc Run() {\n\tprintln(1)\n}\n"), 0644); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(repo, "go.mod"), []byte("module example.com/test\n\ngo 1.22\n"), 0644); err != nil {
-		t.Fatal(err)
-	}
-	diff := []byte("diff --git a/main.go b/main.go\n--- a/main.go\n+++ b/main.go\n@@ -3,3 +3,3 @@\n func Run() {\n-\tprintln(0)\n+\tprintln(1)\n }\n")
-	llm := &scriptedLLM{decisions: []string{
-		`{"done":false,"tool":"read_code","args":{"file":"main.go","start_line":1,"end_line":5},"question_indexes":[0]}`,
-		`{"done":false,"tool":"read_code","args":{"file":"main.go","start_line":3,"end_line":4},"question_indexes":[0]}`,
-		`{"done":false,"tool":"read_code","args":{"file":"main.go","start_line":2,"end_line":3},"question_indexes":[0]}`,
+func TestRejectedSubmissionReturnsToSameAgentLoop(t *testing.T) {
+	repo, diffData := testRepo(t, "package main\n\nfunc Run() {\n}\n", 3)
+	llm := &scriptedLLM{calls: []review.ToolCall{
+		toolCall("submit_claims", `{"claims":[{"file":"main.go","line":3,"severity":"warning","msg":"needs evidence","evidence_ids":["e99"]}]}`),
+		toolCall("read_code", `{"file":"main.go","selector":{"kind":"file_start"}}`),
+		toolCall("submit_claims", `{"claims":[{"file":"main.go","line":3,"severity":"warning","msg":"now supported","evidence_ids":["e2"]}]}`),
 	}}
-	wf, err := New(llm, repo)
+	wf, _ := NewReviewRun(llm, repo)
+	result, err := wf.Run(context.Background(), Request{Repo: repo, Diff: diffData})
 	if err != nil {
 		t.Fatal(err)
 	}
-	result, err := wf.Run(context.Background(), Request{Repo: repo, Diff: diff})
-	if err != nil {
-		t.Fatal(err)
+	if len(llm.transcripts) != 3 || !strings.Contains(llm.transcripts[1][len(llm.transcripts[1])-1].Content, "Evidence e99 不存在") {
+		t.Fatalf("verdict was not returned to same loop: %v", llm.transcripts)
 	}
-	if result.Trace.StopReason != StopEvidenceEnough || result.Trace.Stats.NoNewEvidenceCalls != 2 {
-		t.Fatalf("证据覆盖后的无新增调用应触发收敛: stop=%s stats=%+v", result.Trace.StopReason, result.Trace.Stats)
+	if result.Trace.FinalReport.Verdicts[0].Status != VerdictAccepted || len(result.Trace.Investigation) != 1 {
+		t.Fatalf("trace=%+v", result.Trace)
 	}
 }
 
-func TestEvaluateEvidenceContract(t *testing.T) {
-	evidence := []*Evidence{{ID: "e1", File: "pkg/main.go", Line: 10}}
+func TestAgentContinuesAfterToolError(t *testing.T) {
+	repo, diffData := testRepo(t, "package main\n\nfunc Run() {}\n", 3)
+	llm := &scriptedLLM{calls: []review.ToolCall{
+		toolCall("inspect_symbol", `{"symbol":"Missing","file":"main.go","line":null,"relation":"references"}`),
+		toolCall("read_code", `{"file":"main.go","selector":{"kind":"file_start"}}`),
+		toolCall("submit_claims", `{"claims":[]}`),
+	}}
+	wf, _ := NewReviewRun(llm, repo)
+	result, err := wf.Run(context.Background(), Request{Repo: repo, Diff: diffData})
+	if err != nil {
+		t.Fatal(err)
+	}
+	steps := result.Trace.Investigation
+	if len(steps) != 2 || steps[0].Error == "" || steps[1].Error != "" {
+		t.Fatalf("steps=%+v", steps)
+	}
+}
+
+func TestAgentRecordsDuplicateAndNoNewEvidence(t *testing.T) {
+	repo, diffData := testRepo(t, "package main\n\nfunc Run() {\n\tprintln(1)\n}\n", 4)
+	llm := &scriptedLLM{calls: []review.ToolCall{
+		toolCall("read_code", `{"file":"main.go","selector":{"kind":"range","start":1,"max_lines":5}}`),
+		toolCall("read_code", `{"file":"main.go","selector":{"kind":"range","start":1,"max_lines":5}}`),
+		toolCall("read_code", `{"file":"main.go","selector":{"kind":"range","start":3,"max_lines":2}}`),
+		toolCall("submit_claims", `{"claims":[]}`),
+	}}
+	wf, _ := NewReviewRun(llm, repo)
+	result, err := wf.Run(context.Background(), Request{Repo: repo, Diff: diffData})
+	if err != nil {
+		t.Fatal(err)
+	}
+	trace := result.Trace
+	if trace.Stats.DuplicateCalls != 1 || trace.Stats.NoNewEvidenceCalls != 1 || trace.Stats.SuccessfulToolCalls != 1 {
+		t.Fatalf("stats=%+v", trace.Stats)
+	}
+	if !strings.Contains(trace.Investigation[1].Error, "重复调用") || !strings.Contains(trace.Investigation[2].Error, "未产生新证据") {
+		t.Fatalf("steps=%+v", trace.Investigation)
+	}
+}
+
+func TestEvidenceIdentityIsAppendOnlyForWiderRead(t *testing.T) {
+	repo, diffData := testRepo(t, "package main\n\nfunc Run() {\n\tprintln(1)\n}\n\nfunc Other() {}\n", 3)
+	llm := &scriptedLLM{calls: []review.ToolCall{
+		toolCall("read_code", `{"file":"main.go","selector":{"kind":"range","start":3,"max_lines":2}}`),
+		toolCall("read_code", `{"file":"main.go","selector":{"kind":"file_start"}}`),
+		toolCall("submit_claims", `{"claims":[]}`),
+	}}
+	run, err := NewReviewRun(llm, repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := run.Run(context.Background(), Request{Repo: repo, Diff: diffData})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Trace.Evidence) != 4 {
+		t.Fatalf("expected two diff and two read Evidence entries, got %+v", result.Trace.Evidence)
+	}
+	firstRead, widerRead := result.Trace.Evidence[2], result.Trace.Evidence[3]
+	if firstRead.ID != "e3" || firstRead.Line != 3 || firstRead.EndLine != 4 || firstRead.StepID != "s1" {
+		t.Fatalf("first read Evidence was replaced: %+v", firstRead)
+	}
+	if widerRead.ID != "e4" || widerRead.Line != 1 || widerRead.StepID != "s2" {
+		t.Fatalf("wider read Evidence=%+v", widerRead)
+	}
+}
+
+func TestDecisionBudgetExhaustionIsNotReportedAsNoIssues(t *testing.T) {
+	repo, diffData := testRepo(t, "package main\n\nfunc Run() {}\n", 3)
+	llm := &scriptedLLM{calls: []review.ToolCall{
+		toolCall("submit_claims", `{"claims":[{"file":"main.go","line":3,"severity":"warning","msg":"needs evidence","evidence_ids":["missing"]}]}`),
+		toolCall("submit_claims", `{"claims":[{"file":"main.go","line":3,"severity":"warning","msg":"needs evidence","evidence_ids":["missing"]}]}`),
+		toolCall("submit_claims", `{"claims":[{"file":"main.go","line":3,"severity":"warning","msg":"needs evidence","evidence_ids":["missing"]}]}`),
+		toolCall("submit_claims", `{"claims":[{"file":"main.go","line":3,"severity":"warning","msg":"needs evidence","evidence_ids":["missing"]}]}`),
+	}}
+	wf, _ := NewReviewRun(llm, repo)
+	wf.SetMaxSteps(1)
+	result, err := wf.Run(context.Background(), Request{Repo: repo, Diff: diffData})
+	if err == nil {
+		t.Fatal("budget exhaustion must not be reported as a successful empty review")
+	}
+	if result.Trace.StopReason != StopMaxSteps || len(result.Trace.FinalReport.Claims) != 1 || result.Trace.FinalReport.Verdicts[0].Status != VerdictUnresolved {
+		t.Fatalf("trace=%+v", result.Trace)
+	}
+}
+
+func TestFailedToolExecutionConsumesToolBudget(t *testing.T) {
+	repo, diffData := testRepo(t, "package main\n\nfunc Run() {}\n", 3)
+	llm := &scriptedLLM{calls: []review.ToolCall{
+		toolCall("read_code", `{"file":"missing.go","selector":{"kind":"file_start"}}`),
+		toolCall("read_code", `{"file":"main.go","selector":{"kind":"file_start"}}`),
+		toolCall("submit_claims", `{"claims":[]}`),
+	}}
+	run, err := NewReviewRun(llm, repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run.SetMaxSteps(1)
+	result, err := run.Run(context.Background(), Request{Repo: repo, Diff: diffData})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Trace.Stats.FailedToolCalls != 1 || result.Trace.Stats.SuccessfulToolCalls != 0 {
+		t.Fatalf("stats=%+v", result.Trace.Stats)
+	}
+	if len(result.Trace.Investigation) != 2 || !strings.Contains(result.Trace.Investigation[1].Error, "预算已耗尽") {
+		t.Fatalf("investigation=%+v", result.Trace.Investigation)
+	}
+}
+
+func TestAgentDoesNotRepairInvalidNativeResponse(t *testing.T) {
+	repo, diffData := testRepo(t, "package main\n\nfunc Run() {}\n", 3)
+	llm := &scriptedLLM{calls: []review.ToolCall{{}}}
+	wf, _ := NewReviewRun(llm, repo)
+	result, err := wf.Run(context.Background(), Request{Repo: repo, Diff: diffData})
+	if err == nil || result.Trace.StopReason != StopInvalidDecision || len(llm.transcripts) != 1 {
+		t.Fatalf("trace=%+v", result.Trace)
+	}
+}
+
+func TestAgentToolSchemasAreStrict(t *testing.T) {
+	tools := agentTools(false)
+	if len(tools) != 8 {
+		t.Fatalf("tools=%d", len(tools))
+	}
+	for _, tool := range tools {
+		if !tool.Function.Strict || tool.Function.Parameters["additionalProperties"] != false {
+			t.Fatalf("tool is not strict: %+v", tool)
+		}
+		assertStrictSchemaObjects(t, tool.Function.Name, tool.Function.Parameters)
+	}
+}
+
+func assertStrictSchemaObjects(t *testing.T, path string, schema map[string]any) {
+	t.Helper()
+	if schema["type"] == "object" {
+		if schema["additionalProperties"] != false {
+			t.Fatalf("%s object allows additional properties: %+v", path, schema)
+		}
+		properties, _ := schema["properties"].(map[string]any)
+		required, _ := schema["required"].([]string)
+		for name := range properties {
+			if !schemaContainsString(required, name) {
+				t.Fatalf("%s.%s is not required", path, name)
+			}
+		}
+	}
+	if properties, ok := schema["properties"].(map[string]any); ok {
+		for name, raw := range properties {
+			if child, ok := raw.(map[string]any); ok {
+				assertStrictSchemaObjects(t, path+"."+name, child)
+			}
+		}
+	}
+	if items, ok := schema["items"].(map[string]any); ok {
+		assertStrictSchemaObjects(t, path+"[]", items)
+	}
+	if branches, ok := schema["anyOf"].([]any); ok {
+		for i, raw := range branches {
+			if child, ok := raw.(map[string]any); ok {
+				assertStrictSchemaObjects(t, fmt.Sprintf("%s.anyOf[%d]", path, i), child)
+			}
+		}
+	}
+}
+
+func schemaContainsString(values []string, target string) bool {
+	for _, value := range values {
+		if value == target {
+			return true
+		}
+	}
+	return false
+}
+
+func TestReadCodeSchemaUsesExclusiveSelectorShapes(t *testing.T) {
+	var schema map[string]any
+	for _, tool := range agentTools(false) {
+		if tool.Function.Name == "read_code" {
+			schema = tool.Function.Parameters
+			break
+		}
+	}
+	properties, _ := schema["properties"].(map[string]any)
+	selector, _ := properties["selector"].(map[string]any)
+	branches, _ := selector["anyOf"].([]any)
+	if len(branches) != 4 {
+		t.Fatalf("selector schema=%+v", selector)
+	}
+	for _, raw := range branches {
+		branch, _ := raw.(map[string]any)
+		if branch["type"] != "object" || branch["additionalProperties"] != false {
+			t.Fatalf("selector branch is not strict: %+v", branch)
+		}
+		branchProperties, _ := branch["properties"].(map[string]any)
+		if _, exists := branchProperties["kind"]; !exists {
+			t.Fatalf("selector branch has no discriminator: %+v", branch)
+		}
+	}
+	for _, legacy := range []string{"start_line", "end_line", "symbol", "line", "context_lines"} {
+		if _, exists := properties[legacy]; exists {
+			t.Fatalf("legacy selector %q remains expressible", legacy)
+		}
+	}
+}
+
+func TestToolSchemasMatchConcreteArgumentTypes(t *testing.T) {
+	types := map[string]reflect.Type{
+		"read_diff":           reflect.TypeOf(readDiffArgs{}),
+		"read_code":           reflect.TypeOf(readCodeEnvelope{}),
+		"search_code":         reflect.TypeOf(searchCodeArgs{}),
+		"inspect_symbol":      reflect.TypeOf(inspectSymbolArgs{}),
+		"inspect_concurrency": reflect.TypeOf(inspectConcurrencyArgs{}),
+		"run_static_rules":    reflect.TypeOf(emptyToolArgs{}),
+		"run_go_validation":   reflect.TypeOf(goValidationArgs{}),
+		"submit_claims":       reflect.TypeOf(submitClaimsArgs{}),
+	}
+	for _, tool := range agentTools(false) {
+		argType, ok := types[tool.Function.Name]
+		if !ok {
+			t.Fatalf("missing argument type for %s", tool.Function.Name)
+		}
+		assertSchemaPropertiesMatchStruct(t, tool.Function.Name, tool.Function.Parameters, argType)
+	}
+
+	readSchema := toolSchema(t, "read_code")
+	readProperties := readSchema["properties"].(map[string]any)
+	selectorSchema := readProperties["selector"].(map[string]any)
+	branches := selectorSchema["anyOf"].([]any)
+	selectorTypes := []reflect.Type{
+		reflect.TypeOf(fileStartSelector{}), reflect.TypeOf(rangeSelector{}),
+		reflect.TypeOf(lineSelector{}), reflect.TypeOf(symbolSelector{}),
+	}
+	for i, selectorType := range selectorTypes {
+		assertSchemaPropertiesMatchStruct(t, fmt.Sprintf("read_code.selector[%d]", i), branches[i].(map[string]any), selectorType)
+	}
+
+	submitSchema := toolSchema(t, "submit_claims")
+	claimItems := submitSchema["properties"].(map[string]any)["claims"].(map[string]any)["items"].(map[string]any)
+	assertSchemaPropertiesMatchStruct(t, "submit_claims.claims[]", claimItems, reflect.TypeOf(candidateClaimInput{}))
+}
+
+func toolSchema(t *testing.T, name string) map[string]any {
+	t.Helper()
+	for _, tool := range agentTools(false) {
+		if tool.Function.Name == name {
+			return tool.Function.Parameters
+		}
+	}
+	t.Fatalf("tool %s not found", name)
+	return nil
+}
+
+func assertSchemaPropertiesMatchStruct(t *testing.T, path string, schema map[string]any, typ reflect.Type) {
+	t.Helper()
+	properties, _ := schema["properties"].(map[string]any)
+	required, _ := schema["required"].([]string)
+	fields := make(map[string]bool, typ.NumField())
+	for i := 0; i < typ.NumField(); i++ {
+		name := strings.Split(typ.Field(i).Tag.Get("json"), ",")[0]
+		if name != "" && name != "-" {
+			fields[name] = true
+		}
+	}
+	if len(properties) != len(fields) || len(required) != len(fields) {
+		t.Fatalf("%s schema fields=%v required=%v Go fields=%v", path, properties, required, fields)
+	}
+	for name := range fields {
+		if _, ok := properties[name]; !ok || !schemaContainsString(required, name) {
+			t.Fatalf("%s.%s missing from schema or required", path, name)
+		}
+	}
+}
+
+func TestToolArgumentsDecodeStrictly(t *testing.T) {
+	tool := newToolRuntime(t.TempDir(), "", nil, false, toolSurfaceAgent)
 	tests := []struct {
-		name    string
-		finding review.Finding
-		want    EvaluateStatus
+		name string
+		tool string
+		json string
 	}{
-		{name: "证据充分", finding: review.Finding{File: "pkg/main.go", Line: 11, EvidenceIDs: []string{"e1"}}, want: EvaluateSufficient},
-		{name: "缺少引用", finding: review.Finding{File: "pkg/main.go", Line: 11}, want: EvaluateInsufficient},
-		{name: "证据不存在", finding: review.Finding{File: "pkg/main.go", Line: 11, EvidenceIDs: []string{"e2"}}, want: EvaluateInsufficient},
-		{name: "位置不同", finding: review.Finding{File: "other/main.go", Line: 11, EvidenceIDs: []string{"e1"}}, want: EvaluateInsufficient},
+		{"unknown top-level field", "search_code", `{"keyword":"x","file":null,"extra":true}`},
+		{"unknown selector field", "read_code", `{"file":"main.go","selector":{"kind":"range","start":1,"max_lines":10,"line":2}}`},
+		{"fractional range integer", "read_code", `{"file":"main.go","selector":{"kind":"range","start":1.5,"max_lines":10}}`},
+		{"fractional timeout", "run_go_validation", `{"mode":"compile","package":".","test":null,"timeout_seconds":1.5}`},
+		{"multiple JSON values", "run_static_rules", `{} {}`},
 	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			_, got, _ := evaluateFindings([]review.Finding{tt.finding}, evidence)
-			if got != tt.want {
-				t.Fatalf("status=%s want=%s", got, tt.want)
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if _, err := tool.prepare(test.tool, test.json); err == nil {
+				t.Fatalf("%s accepted invalid arguments", test.tool)
 			}
 		})
 	}
 }
 
-func TestEvaluateAcceptsCrossLocationSupportEvidence(t *testing.T) {
-	evidence := []*Evidence{{ID: "e1", Source: "find_callers", Type: "call_chain", Relation: "supports", File: "caller.go", Line: 20, Content: "caller -> Changed"}}
-	findings := []review.Finding{{File: "changed.go", Line: 10, EvidenceIDs: []string{"e1"}}}
-	validations, status, _ := evaluateFindings(findings, evidence)
-	if status != EvaluateInsufficient || len(validations) != 1 || validations[0].Accepted {
-		t.Fatalf("仅有跨位置证据时不应替代 Finding 锚点: status=%s validations=%+v", status, validations)
+func TestGatewayAcceptsAgentToolSchemas(t *testing.T) {
+	if os.Getenv("CODECRITIC_LIVE_TEST") != "1" {
+		t.Skip("set CODECRITIC_LIVE_TEST=1 to exercise the configured model gateway")
 	}
-}
-
-func TestEvaluateAcceptsAnchorWithCrossLocationSupport(t *testing.T) {
-	evidence := []*Evidence{
-		{ID: "e1", Source: "diff", Type: "changed_line", Relation: "supports", File: "changed.go", Line: 10, Content: "return Changed()", Symbol: "Run"},
-		{ID: "e2", Source: "find_callers", Type: "call_chain", Relation: "supports", File: "caller.go", Line: 20, Content: "caller -> Changed", Symbol: "caller"},
+	baseURL := os.Getenv("CodeCritic_URL")
+	apiKey := os.Getenv("CodeCritic_API_KEY")
+	if baseURL == "" || apiKey == "" {
+		t.Skip("CodeCritic_URL and CodeCritic_API_KEY are required")
 	}
-	findings := []review.Finding{{File: "changed.go", Line: 10, Msg: "调用关系错误", Evidence: "return Changed()", EvidenceIDs: []string{"e1", "e2"}}}
-	validations, status, _ := evaluateFindings(findings, evidence)
-	if status != EvaluateSufficient || !validations[0].Accepted {
-		t.Fatalf("直接锚点和跨位置支持应通过验收: status=%s validations=%+v", status, validations)
-	}
-}
-
-func TestNormalizeEvidencePath(t *testing.T) {
-	repo := t.TempDir()
-	e := &Evidence{File: filepath.Join(repo, "pkg", "main.go"), Line: 1}
-	normalizeEvidencePath(repo, e)
-	if e.File != "pkg/main.go" {
-		t.Fatalf("file=%q", e.File)
-	}
-}
-
-func TestInvestigatorEvaluateGapLoop(t *testing.T) {
-	repo := t.TempDir()
-	if err := os.WriteFile(filepath.Join(repo, "main.go"), []byte("package main\n\nfunc Load() error { return nil }\nfunc Start() error { return Load() }\n"), 0644); err != nil {
+	llm := review.NewLLMWithConfig(
+		review.WithBaseURL(baseURL),
+		review.WithAPIKey(apiKey),
+		review.WithModel("gpt-5.4"),
+	)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	message, _, err := llm.CompleteToolsWithUsage(ctx, agentSystemPrompt, []review.ToolMessage{{
+		Role:    "user",
+		Content: "Call submit_claims with an empty claims array.",
+	}}, agentTools(false), "gpt-5.4")
+	if err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(repo, "go.mod"), []byte("module example.com/test\n\ngo 1.22\n"), 0644); err != nil {
+	if len(message.ToolCalls) != 1 {
+		t.Fatalf("tool calls=%+v", message.ToolCalls)
+	}
+}
+
+func TestAgentReceivesCompleteDiffHunkBeyondTwentyFourAddedLines(t *testing.T) {
+	repo := t.TempDir()
+	var source strings.Builder
+	source.WriteString("package main\n")
+	for i := 0; i < 30; i++ {
+		fmt.Fprintf(&source, "var v%d = %d\n", i, i)
+	}
+	if err := os.WriteFile(filepath.Join(repo, "main.go"), []byte(source.String()), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	diff := []byte("diff --git a/main.go b/main.go\n--- a/main.go\n+++ b/main.go\n@@ -2,3 +2,3 @@\n \n-func Run() {}\n+func Run() { }\n")
-	llm := &gapLoopLLM{decisions: []string{
-		`{"done":false,"tool":"dataflow","args":{"symbol":"Start","file":"main.go"},"question_indexes":[0]}`,
-		`{"done":true}`,
-		`{"done":false,"tool":"dataflow","args":{"symbol":"Load","file":"main.go"},"question_indexes":[0]}`,
-		`{"done":true}`,
+	if err := os.WriteFile(filepath.Join(repo, "go.mod"), []byte("module example.com/diff\n\ngo 1.22\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var patch strings.Builder
+	patch.WriteString("diff --git a/main.go b/main.go\n--- a/main.go\n+++ b/main.go\n@@ -1,2 +1,31 @@\n package main\n-var old = 1\n")
+	for i := 0; i < 30; i++ {
+		fmt.Fprintf(&patch, "+var v%d = %d\n", i, i)
+	}
+	llm := &scriptedLLM{calls: []review.ToolCall{toolCall("submit_claims", `{"claims":[]}`)}}
+	wf, _ := NewReviewRun(llm, repo)
+	if _, err := wf.Run(context.Background(), Request{Repo: repo, Diff: []byte(patch.String())}); err != nil {
+		t.Fatal(err)
+	}
+	prompt := llm.transcripts[0][0].Content
+	for _, want := range []string{"var old = 1", "var v29 = 29", `"omitted_hunks":[]`, "old=2 new=0", "old=0 new=31"} {
+		if !strings.Contains(prompt, want) {
+			t.Fatalf("prompt missing %q: %s", want, prompt)
+		}
+	}
+}
+
+func TestLargeDiffListsOmittedHunkExplicitly(t *testing.T) {
+	change := diff.Change{File: "main.go", Hunks: []diff.Hunk{
+		{ID: "h1", OldStart: 1, NewStart: 1, NewLines: 1, Lines: []diff.HunkLine{{Kind: "add", NewLine: 1, Text: strings.Repeat("x", 70<<10)}}},
+		{ID: "h2", OldStart: 2, NewStart: 2, NewLines: 1, Lines: []diff.HunkLine{{Kind: "add", NewLine: 2, Text: "small"}}},
 	}}
-	wf, err := New(llm, repo)
-	if err != nil {
-		t.Fatal(err)
-	}
-	result, err := wf.Run(context.Background(), Request{Repo: repo, Diff: diff})
-	if err != nil {
-		t.Fatal(err)
-	}
-	tr := result.Trace
-	if llm.reviews != 2 {
-		t.Fatalf("review calls=%d want 2", llm.reviews)
-	}
-	if len(tr.ToolCalls) != 2 || tr.ToolCalls[0].Tool != "dataflow" || tr.ToolCalls[1].Tool != "dataflow" {
-		t.Fatalf("unexpected tool calls: %+v", tr.ToolCalls)
-	}
-	if len(llm.prompts) < 3 || !strings.Contains(llm.prompts[2], "未引用证据") {
-		t.Fatalf("evidence gap not passed to investigator: %v", llm.prompts)
-	}
-	if tr.Evaluation != EvaluateSufficient || len(tr.Evidence) < 2 || !tr.Validations[0].Accepted {
-		t.Fatalf("unexpected final evaluation: %+v", tr)
+	encoded := encodeChangedContext(&Trace{}, []diff.Change{change})
+	if !strings.Contains(encoded, `"omitted_hunks":["main.go:h1"]`) || !strings.Contains(encoded, `"hunk_id":"h2"`) {
+		t.Fatalf("encoded=%s", encoded)
 	}
 }
 
-func TestQuestionIndexesDoNotProveCoverage(t *testing.T) {
-	tr := &Trace{Plan: Plan{Questions: []string{"检查调用关系"}}, Evidence: []*Evidence{{ID: "e1", File: "main.go", Line: 1, QuestionIndexes: []int{0}}}}
-	if questionsCovered(tr) {
-		t.Fatal("question_indexes must not prove coverage without substantive evidence")
-	}
-}
-
-func TestDiffEvidenceDoesNotProveInvestigationCoverage(t *testing.T) {
-	tr := &Trace{
-		Plan: Plan{Questions: []string{"检查锁路径"}},
-		Evidence: []*Evidence{{
-			ID: "e1", Source: "diff", Type: "changed_line", File: "main.go", Line: 10,
-			Content: "mu.Lock()", QuestionIndexes: []int{0},
-		}},
-	}
-	if questionsCovered(tr) {
-		t.Fatal("Diff 证据不能替代 Investigator 调查证据")
-	}
-}
-
-func TestInvestigatorRepairsMalformedDecisionOnce(t *testing.T) {
+func TestAgentRecoversOmittedHunkThroughReadDiff(t *testing.T) {
 	repo := t.TempDir()
-	if err := os.WriteFile(filepath.Join(repo, "main.go"), []byte("package main\n\nfunc Run() {}\n"), 0644); err != nil {
+	largeLine := "// " + strings.Repeat("x", 70<<10)
+	source := "package main\n" + largeLine + "\n"
+	if err := os.WriteFile(filepath.Join(repo, "main.go"), []byte(source), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(repo, "go.mod"), []byte("module example.com/test\n\ngo 1.22\n"), 0644); err != nil {
+	if err := os.WriteFile(filepath.Join(repo, "go.mod"), []byte("module example.com/large\n\ngo 1.22\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	diff := []byte("diff --git a/main.go b/main.go\n--- a/main.go\n+++ b/main.go\n@@ -2,2 +2,2 @@\n-func Run() {}\n+func Run() { }\n")
-	llm := &scriptedLLM{decisions: []string{
-		`{"done":false,"tool":"read_code","args":{"file":"main.go"}}{"done":true}`,
-		`{"done":false,"tool":"read_code","args":{"file":"main.go"},"question_indexes":[0]}`,
-		`{"done":true}`,
+	diffData := []byte("diff --git a/main.go b/main.go\n--- /dev/null\n+++ b/main.go\n@@ -0,0 +1,2 @@\n+package main\n+" + largeLine + "\n")
+	llm := &scriptedLLM{calls: []review.ToolCall{
+		toolCall("read_diff", `{"file":"main.go","hunk_id":"h1"}`),
+		toolCall("submit_claims", `{"claims":[{"file":"main.go","line":2,"severity":"warning","msg":"large hunk was recovered","evidence_ids":["e3"]}]}`),
 	}}
-	wf, err := New(llm, repo)
+	wf, _ := NewReviewRun(llm, repo)
+	result, err := wf.Run(context.Background(), Request{Repo: repo, Diff: diffData})
 	if err != nil {
 		t.Fatal(err)
 	}
-	result, err := wf.Run(context.Background(), Request{Repo: repo, Diff: diff})
-	if err != nil {
-		t.Fatal(err)
+	if !strings.Contains(llm.transcripts[0][0].Content, `"omitted_hunks":["main.go:h1"]`) {
+		t.Fatal("initial prompt did not disclose the omitted hunk")
 	}
-	if len(result.Trace.ToolCalls) != 1 || result.Trace.ToolCalls[0].Tool != "read_code" {
-		t.Fatalf("格式纠正后未执行预期工具: %+v", result.Trace.ToolCalls)
+	if len(result.Trace.Investigation) != 1 || result.Trace.Investigation[0].Tool != "read_diff" {
+		t.Fatalf("investigation=%+v", result.Trace.Investigation)
 	}
-	if result.Trace.StopReason != StopAgentDone {
-		t.Fatalf("停止原因 = %s，期望 %s", result.Trace.StopReason, StopAgentDone)
+	if len(result.Trace.Evidence) != 3 || result.Trace.Evidence[2].Source != "read_diff" || !strings.Contains(result.Trace.Evidence[2].Content, largeLine) {
+		t.Fatalf("evidence=%+v", result.Trace.Evidence)
 	}
-	if len(result.Trace.Errors) == 0 || !strings.Contains(result.Trace.Errors[0], "调查决策格式错误") {
-		t.Fatalf("Trace 未记录格式纠正: %+v", result.Trace.Errors)
-	}
-}
-
-func TestParseInvestigatorDecisionRejectsFindingPayload(t *testing.T) {
-	_, err := parseInvestigatorDecision(`{"findings":[{"file":"main.go","line":1}]}`)
-	if err == nil {
-		t.Fatalf("Finding 响应不应被当成工具决策: %v", err)
+	if result.Trace.FinalReport.Verdicts[0].Status != VerdictAccepted {
+		t.Fatalf("report=%+v", result.Trace.FinalReport)
 	}
 }
 
-func TestParseInvestigatorDecisionRejectsExtraFields(t *testing.T) {
-	_, err := parseInvestigatorDecision(`{"done":true,"findings":[]}`)
-	if err == nil {
-		t.Fatal("带 findings 的 done 响应不应被当成合法工具决策")
-	}
-}
-
-func TestSingleEvidenceDoesNotCoverMultipleQuestions(t *testing.T) {
-	tr := &Trace{
-		Plan:     Plan{Questions: []string{"问题一", "问题二"}},
-		Evidence: []*Evidence{{ID: "e1", Type: "code", File: "main.go", Line: 1, Content: "func Run() {}", QuestionIndexes: []int{0, 1}}},
-	}
-	if questionsCovered(tr) {
-		t.Fatal("单个大段代码证据不能覆盖多个调查问题")
-	}
-}
-
-func TestEvaluateRejectsDeadlockWithoutSecondParticipant(t *testing.T) {
+func TestVerifierOnlyChecksGenericEvidenceContract(t *testing.T) {
+	repo := t.TempDir()
 	evidence := []*Evidence{
-		{ID: "e1", File: "main.go", Line: 10, Content: "s.mu.Lock()", Symbol: "Stop"},
-		{ID: "e2", File: "main.go", Line: 11, Content: "close(s.stopped)", Symbol: "Stop"},
+		{ID: "e1", Source: "read_code", File: "main.go", Line: 10, EndLine: 20, Content: "arbitrary code"},
+		{ID: "e2", Source: "find_callers", File: "caller.go", Line: 30, Content: "caller"},
 	}
-	findings := []review.Finding{{File: "main.go", Line: 10, Msg: "死锁：等待者被唤醒后会获取同一把锁", Evidence: "s.mu.Lock()", EvidenceIDs: []string{"e1", "e2"}}}
-	validations, status, gaps := evaluateFindings(findings, evidence)
-	if status != EvaluateInsufficient || validations[0].Accepted || len(gaps) == 0 {
-		t.Fatalf("缺少第二参与路径的死锁不应通过: status=%s validations=%+v gaps=%v", status, validations, gaps)
+	tests := []struct {
+		name  string
+		claim review.CandidateClaim
+		want  VerdictStatus
+	}{
+		{"anchored", review.CandidateClaim{File: "main.go", Line: 12, Severity: "error", Msg: "any semantic claim", EvidenceIDs: []string{"e1", "e2"}}, VerdictAccepted},
+		{"missing evidence", review.CandidateClaim{File: "main.go", Line: 12, Severity: "error", Msg: "claim", EvidenceIDs: []string{"missing"}}, VerdictUnresolved},
+		{"cross location only", review.CandidateClaim{File: "main.go", Line: 12, Severity: "error", Msg: "claim", EvidenceIDs: []string{"e2"}}, VerdictUnresolved},
+		{"bad shape", review.CandidateClaim{File: "main.go", Line: 0, Severity: "urgent", Msg: "", EvidenceIDs: []string{"e1"}}, VerdictRejected},
+		{"duplicate reference", review.CandidateClaim{File: "main.go", Line: 12, Severity: "error", Msg: "claim", EvidenceIDs: []string{"e1", "e1"}}, VerdictRejected},
 	}
-}
-
-func TestEvaluateAcceptsLockLeakAtEarlyReturn(t *testing.T) {
-	evidence := []*Evidence{
-		{ID: "e1", File: "main.go", Line: 10, Content: "ccc.mu.Lock()", Symbol: "Remove"},
-		{ID: "e2", File: "main.go", Line: 11, Content: "if entry.abort {", Symbol: "Remove"},
-		{ID: "e3", File: "main.go", Line: 12, Content: "return", Symbol: "Remove"},
-	}
-	finding := review.Finding{File: "main.go", Line: 12, Msg: "提前退出后互斥量一直处于占用状态，导致死锁", Evidence: "ccc.mu.Lock(); return", EvidenceIDs: []string{"e1", "e2", "e3"}}
-	validations, status, gaps := evaluateFindings([]review.Finding{finding}, evidence)
-	if status != EvaluateSufficient || !validations[0].Accepted || len(gaps) != 0 {
-		t.Fatalf("提前退出前未释放锁的事实已经闭合: status=%s validations=%+v gaps=%v", status, validations, gaps)
-	}
-}
-
-func TestEvaluateRejectsCondWaitAsLockMismatch(t *testing.T) {
-	evidence := []*Evidence{
-		{ID: "e1", File: "main.go", Line: 10, Content: "p.lock.Lock()", Symbol: "add"},
-		{ID: "e2", File: "main.go", Line: 20, Content: "p.lock.Lock()", Symbol: "pop"},
-		{ID: "e3", File: "main.go", Line: 21, Content: "p.cond.Wait()", Symbol: "pop"},
-		{ID: "e4", File: "main.go", Line: 30, Content: "p.cond.L = &p.lock", Symbol: "setup"},
-	}
-	finding := review.Finding{File: "main.go", Line: 21, Msg: "sync.Cond 与 RWMutex 的锁类型不匹配，会造成并发错误", Evidence: "p.lock.Lock(); p.cond.Wait(); p.cond.L = &p.lock", EvidenceIDs: []string{"e1", "e2", "e3", "e4"}}
-	validations, status, gaps := evaluateFindings([]review.Finding{finding}, evidence)
-	if status != EvaluateInsufficient || validations[0].Accepted || len(gaps) == 0 {
-		t.Fatalf("没有锁泄漏、重入或锁顺序环的结论不应通过: status=%s validations=%+v gaps=%v", status, validations, gaps)
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			claims := []review.CandidateClaim{test.claim}
+			verdicts, _ := verifyClaims(repo, claims, evidence)
+			if verdicts[0].Status != test.want {
+				t.Fatalf("verdict=%+v", verdicts[0])
+			}
+		})
 	}
 }
 
-func TestEvaluateRejectsAsyncRelockWithoutWait(t *testing.T) {
-	evidence := []*Evidence{
-		{ID: "e1", File: "main.go", Line: 10, Content: "s.mu.Lock()", Symbol: "Start"},
-		{ID: "e2", File: "main.go", Line: 11, Content: "s.workers.Run(func() {", Symbol: "Start"},
-		{ID: "e3", File: "main.go", Line: 20, Content: "s.mu.Lock()", Symbol: "worker"},
-	}
-	finding := review.Finding{File: "main.go", Line: 10, Msg: "持锁启动 goroutine，goroutine 再获取同一把锁导致死锁", Evidence: "s.mu.Lock(); Run; s.mu.Lock()", EvidenceIDs: []string{"e1", "e2", "e3"}}
-	validations, status, gaps := evaluateFindings([]review.Finding{finding}, evidence)
-	if status != EvaluateInsufficient || validations[0].Accepted || len(gaps) == 0 {
-		t.Fatalf("缺少并发启动和等待关系的异步重锁结论不应通过: status=%s validations=%+v gaps=%v", status, validations, gaps)
+func TestInspectSymbolRequiresIndex(t *testing.T) {
+	tool := &ToolRuntime{repo: t.TempDir()}
+	_, err := tool.inspectSymbol(inspectSymbolArgs{Symbol: "Run", File: "main.go", Relation: "references"})
+	if err == nil || !strings.Contains(err.Error(), "unavailable") {
+		t.Fatalf("err=%v", err)
 	}
 }
 
-func TestEvaluateAcceptsRecursiveLockEvidence(t *testing.T) {
-	evidence := []*Evidence{
-		{ID: "e1", File: "main.go", Line: 10, Content: "c.Lock()", Symbol: "Sync"},
-		{ID: "e2", File: "main.go", Line: 11, Content: "c.Do()", Symbol: "Sync"},
-		{ID: "e3", File: "main.go", Line: 20, Content: "c.RLock()", Symbol: "Do"},
-	}
-	finding := review.Finding{File: "main.go", Line: 10, Msg: "同一 goroutine 外层持有写锁时同步调用 Do，Do 再获取同一把读锁导致死锁", Evidence: "c.Lock(); c.Do(); c.RLock()", EvidenceIDs: []string{"e1", "e2", "e3"}}
-	validations, status, gaps := evaluateFindings([]review.Finding{finding}, evidence)
-	if status != EvaluateSufficient || !validations[0].Accepted || len(gaps) != 0 {
-		t.Fatalf("同一把锁的同步重入事实已经闭合: status=%s validations=%+v gaps=%v", status, validations, gaps)
-	}
-}
-
-func TestEvaluateAcceptsLockChannelCycleEvidence(t *testing.T) {
-	evidence := []*Evidence{
-		{ID: "e1", File: "main.go", Line: 10, Content: "rr.mu.Lock()", Symbol: "send"},
-		{ID: "e2", File: "main.go", Line: 11, Content: "rr.ch <- value", Symbol: "send"},
-		{ID: "e3", File: "main.go", Line: 20, Content: "rr.mu.Lock()", Symbol: "consume"},
-	}
-	finding := review.Finding{File: "main.go", Line: 11, Msg: "持锁向无缓冲 channel 发送，消费者回到同一把锁导致死锁", Evidence: "rr.mu.Lock(); rr.ch <- value; rr.mu.Lock()", EvidenceIDs: []string{"e1", "e2", "e3"}}
-	validations, status, gaps := evaluateFindings([]review.Finding{finding}, evidence)
-	if status != EvaluateSufficient || !validations[0].Accepted || len(gaps) != 0 {
-		t.Fatalf("锁内 channel 操作和消费者回锁的事实已经闭合: status=%s validations=%+v gaps=%v", status, validations, gaps)
-	}
-}
-
-func TestEvaluateRejectsNilChannelClaimWithoutOperation(t *testing.T) {
-	evidence := []*Evidence{
-		{ID: "e1", File: "main.go", Line: 10, Content: "func Start() {", Symbol: "Start"},
-		{ID: "e2", File: "main.go", Line: 20, Content: "return func() { down() }", Symbol: "Up"},
-	}
-	finding := review.Finding{File: "main.go", Line: 20, Msg: "Up 返回闭包时 channel 尚未初始化，可能导致 nil channel 错误", Evidence: "Start 尚未执行；Up 返回闭包", EvidenceIDs: []string{"e1", "e2"}}
-	validations, status, gaps := evaluateFindings([]review.Finding{finding}, evidence)
-	if status != EvaluateInsufficient || validations[0].Accepted || len(gaps) == 0 {
-		t.Fatalf("没有 channel 实际操作的 nil 结论不应通过: status=%s validations=%+v gaps=%v", status, validations, gaps)
-	}
-}
-
-func TestEvaluateAcceptsNilChannelClaimWithOperation(t *testing.T) {
-	evidence := []*Evidence{
-		{ID: "e1", File: "main.go", Line: 10, Content: "var ch chan bool", Symbol: "Start"},
-		{ID: "e2", File: "main.go", Line: 20, Content: "ch <- true", Symbol: "send"},
-	}
-	finding := review.Finding{File: "main.go", Line: 20, Msg: "向未初始化的 nil channel 发送会永久阻塞", Evidence: "var ch chan bool; ch <- true", EvidenceIDs: []string{"e1", "e2"}}
-	validations, status, gaps := evaluateFindings([]review.Finding{finding}, evidence)
-	if status != EvaluateSufficient || !validations[0].Accepted || len(gaps) != 0 {
-		t.Fatalf("存在 channel 实际发送操作的 nil 结论应通过: status=%s validations=%+v gaps=%v", status, validations, gaps)
-	}
-}
-
-func TestEvaluateAcceptsLockOrderCycleEvidence(t *testing.T) {
-	evidence := []*Evidence{
-		{ID: "e1", File: "main.go", Line: 10, Content: "a.mu.Lock()", Symbol: "first"},
-		{ID: "e2", File: "main.go", Line: 11, Content: "b.mu.Lock()", Symbol: "first"},
-		{ID: "e3", File: "main.go", Line: 20, Content: "b.mu.Lock()", Symbol: "second"},
-		{ID: "e4", File: "main.go", Line: 21, Content: "a.mu.Lock()", Symbol: "second"},
-	}
-	finding := review.Finding{File: "main.go", Line: 10, Msg: "两条路径以相反锁顺序形成 AB-BA 死锁", Evidence: "a.mu -> b.mu; b.mu -> a.mu", EvidenceIDs: []string{"e1", "e2", "e3", "e4"}}
-	validations, status, gaps := evaluateFindings([]review.Finding{finding}, evidence)
-	if status != EvaluateSufficient || !validations[0].Accepted || len(gaps) != 0 {
-		t.Fatalf("反向锁顺序的两条参与路径已经闭合: status=%s validations=%+v gaps=%v", status, validations, gaps)
-	}
-}
-
-func TestEvaluateRejectsDuplicateRepresentationOfOneLock(t *testing.T) {
-	evidence := []*Evidence{
-		{ID: "e1", Type: "changed_line", File: "main.go", Line: 10, Content: "s.mu.Lock()", Symbol: "Stop"},
-		{ID: "e2", Type: "call", File: "main.go", Line: 10, Content: "s.mu.Lock()", Symbol: "Stop"},
-	}
-	finding := review.Finding{File: "main.go", Line: 10, Msg: "同一把锁被重复获取导致死锁", Evidence: "s.mu.Lock()", EvidenceIDs: []string{"e1", "e2"}}
-	validations, status, gaps := evaluateFindings([]review.Finding{finding}, evidence)
-	if status != EvaluateInsufficient || validations[0].Accepted || len(gaps) == 0 {
-		t.Fatalf("同一位置的多种 Evidence 表示不能充当两次加锁: status=%s validations=%+v gaps=%v", status, validations, gaps)
-	}
-}
-
-func TestEvaluateRejectsLockOrderClaimFromOneFunction(t *testing.T) {
-	evidence := []*Evidence{
-		{ID: "e1", File: "main.go", Line: 10, Content: "r.client.mu.RLock()", Symbol: "acquire"},
-		{ID: "e2", File: "main.go", Line: 11, Content: "r.mu.Lock()", Symbol: "acquire"},
-		{ID: "e3", Type: "call", File: "main.go", Line: 10, Content: "r.client.mu.RLock()", Symbol: "(*example.remoteClient).acquire"},
-	}
-	finding := review.Finding{File: "main.go", Line: 10, Msg: "两个锁形成 AB-BA 锁顺序死锁", Evidence: "r.client.mu.RLock(); r.mu.Lock()", EvidenceIDs: []string{"e1", "e2", "e3"}}
-	validations, status, gaps := evaluateFindings([]review.Finding{finding}, evidence)
-	if status != EvaluateInsufficient || validations[0].Accepted || len(gaps) == 0 {
-		t.Fatalf("同一函数的源码和 SSA 表示不能充当两条反向锁路径: status=%s validations=%+v gaps=%v", status, validations, gaps)
-	}
-}
-
-func TestEvaluateKeepsDifferentRootCausesWithSharedEvidence(t *testing.T) {
-	evidence := []*Evidence{
-		{ID: "e1", File: "main.go", Line: 10, Content: "value := shared[key]", Symbol: "Read"},
-		{ID: "e2", File: "main.go", Line: 11, Content: "shared[key] = value", Symbol: "Write"},
-		{ID: "e3", File: "main.go", Line: 20, Content: "go Write()", Symbol: "Start"},
-	}
-	findings := []review.Finding{
-		{File: "main.go", Line: 10, Msg: "数据竞争：并发读写 map", Evidence: "value := shared[key]", EvidenceIDs: []string{"e1", "e2", "e3"}},
-		{File: "main.go", Line: 11, Msg: "逻辑错误：把 map 当作连续索引访问", Evidence: "write shared map", EvidenceIDs: []string{"e1", "e2"}},
-	}
-	validations, status, _ := evaluateFindings(findings, evidence)
-	if status != EvaluateSufficient || !validations[0].Accepted || !validations[1].Accepted {
-		t.Fatalf("共享证据但根因不同的 Finding 都应保留: status=%s validations=%+v", status, validations)
-	}
-}
-
-func TestEvaluateRejectsRaceWithoutWritePath(t *testing.T) {
-	evidence := []*Evidence{
-		{ID: "e1", File: "main.go", Line: 10, Content: "existing, ok := m.tables[0]", Symbol: "findTableState"},
-		{ID: "e2", File: "main.go", Line: 20, Content: "go m.Release()", Symbol: "Release"},
-	}
-	finding := review.Finding{File: "main.go", Line: 10, Msg: "数据竞争：m.tables 存在无锁并发读写", Evidence: "existing, ok := m.tables[0]", EvidenceIDs: []string{"e1", "e2"}}
-	validations, status, gaps := evaluateFindings([]review.Finding{finding}, evidence)
-	if status != EvaluateInsufficient || validations[0].Accepted || len(gaps) == 0 {
-		t.Fatalf("没有共享写路径的竞态不应通过: status=%s validations=%+v gaps=%v", status, validations, gaps)
-	}
-}
-
-func TestEvaluateAcceptsRangeVariableCapture(t *testing.T) {
-	evidence := []*Evidence{
-		{ID: "e1", File: "main.go", Line: 10, Content: "for _, item := range items {", Symbol: "Run"},
-		{ID: "e2", File: "main.go", Line: 11, Content: "go func() { use(&item.Name) }()", Symbol: "Run"},
-	}
-	finding := review.Finding{File: "main.go", Line: 10, Msg: "数据竞争：goroutine 闭包捕获 range 变量 item", Evidence: "for _, item := range items; go func() { use(&item.Name) }", EvidenceIDs: []string{"e1", "e2"}}
-	validations, status, gaps := evaluateFindings([]review.Finding{finding}, evidence)
-	if status != EvaluateSufficient || !validations[0].Accepted || len(gaps) != 0 {
-		t.Fatalf("闭包捕获的竞态事实已闭合: status=%s validations=%+v gaps=%v", status, validations, gaps)
-	}
-}
-
-func TestEvaluateRejectsRootCauseAtWrongAnchor(t *testing.T) {
-	evidence := []*Evidence{
-		{ID: "e1", File: "main.go", Line: 10, Content: "cond.L.Lock()", Symbol: "Run"},
-		{ID: "e2", File: "main.go", Line: 30, Content: "sync.NewCond(mu.RLocker())", Symbol: "Setup"},
-	}
-	finding := review.Finding{File: "main.go", Line: 10, Msg: "死锁：RLocker 初始化配置导致重入等待", Evidence: "sync.NewCond(mu.RLocker())", EvidenceIDs: []string{"e1", "e2"}}
-	validations, status, gaps := evaluateFindings([]review.Finding{finding}, evidence)
-	if status != EvaluateInsufficient || validations[0].Accepted || len(gaps) == 0 {
-		t.Fatalf("RLocker 根因必须锚定配置位置: status=%s validations=%+v gaps=%v", status, validations, gaps)
-	}
-}
-
-func TestDataflowRejectsFieldSymbol(t *testing.T) {
-	tool := &toolset{repo: t.TempDir()}
-	_, err := tool.dataflow(map[string]interface{}{"symbol": "Stopper.draining", "file": "main.go"})
-	if err == nil || !strings.Contains(err.Error(), "字段符号") {
-		t.Fatalf("字段符号应被拒绝: %v", err)
+func TestInspectConcurrencyRequiresIndex(t *testing.T) {
+	tool := &ToolRuntime{repo: t.TempDir()}
+	_, err := tool.inspectConcurrency(inspectConcurrencyArgs{Symbol: "Run", File: "main.go"})
+	if err == nil || !strings.Contains(err.Error(), "unavailable") {
+		t.Fatalf("err=%v", err)
 	}
 }
 
@@ -615,41 +666,226 @@ func TestSearchCodeRecordsScopedAbsence(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(repo, "main.go"), []byte("package main\n"), 0644); err != nil {
 		t.Fatal(err)
 	}
-	tool := &toolset{repo: repo, store: recall.New(repo, nil)}
-	evidence, err := tool.searchCode(map[string]interface{}{"file": "main.go", "keyword": "drain.Done"})
+	tool := &ToolRuntime{repo: repo, store: recall.New(repo, nil)}
+	file := "main.go"
+	evidence, err := tool.searchCode(searchCodeArgs{File: &file, Keyword: "missing"})
 	if err != nil || len(evidence) != 1 || evidence[0].Type != "search_absence" {
-		t.Fatalf("限定文件的空搜索应形成负面证据: evidence=%+v err=%v", evidence, err)
+		t.Fatalf("evidence=%+v err=%v", evidence, err)
 	}
 }
 
-func TestEvaluateRejectsDuplicateAndSpeculativeFindings(t *testing.T) {
-	evidence := []*Evidence{
-		{ID: "e1", File: "main.go", Line: 10, Content: "shared = value", Symbol: "Write"},
-		{ID: "e2", File: "main.go", Line: 11, Content: "go Write()", Symbol: "Start"},
+func TestReadCodeBySymbol(t *testing.T) {
+	repo := t.TempDir()
+	source := "package main\n\nfunc First() {}\n\nfunc Second() {\n\tprintln(2)\n}\n"
+	if err := os.WriteFile(filepath.Join(repo, "main.go"), []byte(source), 0o644); err != nil {
+		t.Fatal(err)
 	}
-	findings := []review.Finding{
-		{File: "main.go", Line: 10, Msg: "数据竞争：共享状态未同步", EvidenceIDs: []string{"e1", "e2"}},
-		{File: "main.go", Line: 12, Msg: "数据竞争：同一问题的重复描述", EvidenceIDs: []string{"e1", "e2"}},
-		{File: "main.go", Line: 20, Msg: "未来扩展可能导致死锁", EvidenceIDs: []string{"e1"}},
-	}
-	validations, status, gaps := evaluateFindings(findings, evidence)
-	if status != EvaluatePartial || !validations[0].Accepted || validations[1].Accepted || validations[2].Accepted || len(gaps) < 2 {
-		t.Fatalf("应拒绝重复和推测 Finding: status=%s validations=%+v gaps=%v", status, validations, gaps)
+	tool := &ToolRuntime{repo: repo}
+	evidence, err := tool.readCode(readCodeArgs{File: "main.go", Selector: symbolSelector{Kind: "symbol", Symbol: "Second"}})
+	if err != nil || len(evidence) != 1 || evidence[0].Line != 5 || strings.Contains(evidence[0].Content, "First") {
+		t.Fatalf("evidence=%+v err=%v", evidence, err)
 	}
 }
 
-func TestEvaluateDeduplicatesDifferentDescriptionsOfSameLockRootCause(t *testing.T) {
-	evidence := []*Evidence{
-		{ID: "e1", File: "main.go", Line: 10, Content: "s.mu.Lock()", Symbol: "Stop"},
-		{ID: "e2", File: "main.go", Line: 12, Content: "return", Symbol: "Stop"},
-		{ID: "e3", File: "main.go", Line: 20, Content: "s.mu.Lock()", Symbol: "Stop"},
+func TestReadCodeSelectorKinds(t *testing.T) {
+	repo := t.TempDir()
+	source := "package main\n\nfunc First() {}\n\nfunc Second() {\n\tprintln(2)\n}\n"
+	if err := os.WriteFile(filepath.Join(repo, "main.go"), []byte(source), 0o644); err != nil {
+		t.Fatal(err)
 	}
-	findings := []review.Finding{
-		{File: "main.go", Line: 10, Msg: "持锁后提前 return 未释放，导致锁泄漏", Evidence: "s.mu.Lock(); return", EvidenceIDs: []string{"e1", "e2", "e3"}},
-		{File: "main.go", Line: 10, Msg: "重复获取同一把锁导致死锁", Evidence: "s.mu.Lock(); s.mu.Lock()", EvidenceIDs: []string{"e1", "e2", "e3"}},
+	tool := &ToolRuntime{repo: repo}
+	tests := []struct {
+		name     string
+		selector readCodeSelector
+		line     int
+		endLine  int
+	}{
+		{name: "file start", selector: fileStartSelector{Kind: "file_start"}, line: 1, endLine: 8},
+		{name: "range", selector: rangeSelector{Kind: "range", Start: 3, MaxLines: 2}, line: 3, endLine: 4},
+		{name: "focus line", selector: lineSelector{Kind: "line", Line: 5, ContextLines: 1}, line: 4, endLine: 6},
 	}
-	validations, status, _ := evaluateFindings(findings, evidence)
-	if status != EvaluatePartial || !validations[0].Accepted || validations[1].Accepted {
-		t.Fatalf("同一锁根因的不同描述应只保留一条: status=%s validations=%+v", status, validations)
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			evidence, err := tool.readCode(readCodeArgs{File: "main.go", Selector: test.selector})
+			if err != nil || len(evidence) != 1 || evidence[0].Line != test.line || evidence[0].EndLine != test.endLine {
+				t.Fatalf("evidence=%+v err=%v", evidence, err)
+			}
+		})
 	}
+}
+
+func TestReadCodeRejectsSymlinkOutsideRepository(t *testing.T) {
+	repo := t.TempDir()
+	outside := filepath.Join(t.TempDir(), "secret.go")
+	if err := os.WriteFile(outside, []byte("package secret\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, filepath.Join(repo, "linked.go")); err != nil {
+		t.Fatal(err)
+	}
+	tool := &ToolRuntime{repo: repo}
+	_, err := tool.readCode(readCodeArgs{File: "linked.go", Selector: fileStartSelector{Kind: "file_start"}})
+	if err == nil || !strings.Contains(err.Error(), "超出仓库") {
+		t.Fatalf("err=%v", err)
+	}
+}
+
+func TestGoValidationExecutionPermission(t *testing.T) {
+	repo := t.TempDir()
+	if err := os.WriteFile(filepath.Join(repo, "go.mod"), []byte("module example.com/validation\n\ngo 1.22\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repo, "main.go"), []byte("package main\nfunc main() {}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	tool := &ToolRuntime{repo: repo, changes: []diff.Change{{File: "main.go"}}, surface: toolSurfaceAgent}
+	evidence, err := tool.runGoValidation(context.Background(), goValidationArgs{Mode: "compile", Package: ".", TimeoutSeconds: 30})
+	if err != nil || len(evidence) != 1 || evidence[0].Type != "validation_passed" {
+		if len(evidence) > 0 {
+			t.Fatalf("evidence=%+v content=%s err=%v", evidence, evidence[0].Content, err)
+		}
+		t.Fatalf("evidence=%+v err=%v", evidence, err)
+	}
+	_, err = tool.prepare("run_go_validation", `{"mode":"test","package":".","test":null,"timeout_seconds":30}`)
+	if err == nil || !strings.Contains(err.Error(), "--allow-exec") {
+		t.Fatalf("err=%v", err)
+	}
+}
+
+func TestGoValidationAcceptsCurrentDirectorySlashPattern(t *testing.T) {
+	repo := t.TempDir()
+	if err := os.WriteFile(filepath.Join(repo, "go.mod"), []byte("module example.com/slash\n\ngo 1.22\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repo, "main.go"), []byte("package main\nfunc main() {}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	tool := &ToolRuntime{repo: repo, changes: []diff.Change{{File: "main.go"}}}
+	evidence, err := tool.runGoValidation(context.Background(), goValidationArgs{Mode: "compile", Package: "./", TimeoutSeconds: 30})
+	if err != nil || len(evidence) != 1 || evidence[0].Type != "validation_passed" {
+		t.Fatalf("evidence=%+v err=%v", evidence, err)
+	}
+}
+
+func TestGoPackagePatternMatchesToolContract(t *testing.T) {
+	tests := map[string]bool{
+		".": true, "./": true, "./...": true, "./pkg": true, "./pkg/sub": true, "./pkg/...": true,
+		"./.../cmd": true, "./foo...bar": true, "./模块": true, "./pkg name": true,
+		"": false, "../pkg": false, "/tmp/pkg": false, `./pkg\\sub`: false, "./../pkg": false,
+		"./pkg//sub": false, "./pkg/./sub": false, "./pkg/../sub": false, "./pkg\nsub": false,
+	}
+	for pattern, valid := range tests {
+		err := validatePackagePattern(pattern)
+		if (err == nil) != valid {
+			t.Errorf("pattern %q: valid=%v err=%v", pattern, valid, err)
+		}
+	}
+}
+
+func TestCompilePackageDirectoryCannotEscapeRepository(t *testing.T) {
+	repo := t.TempDir()
+	outside := t.TempDir()
+	link := filepath.Join(repo, "linked-package")
+	if err := os.Symlink(outside, link); err != nil {
+		t.Fatal(err)
+	}
+	if err := ensureDirectoryWithinRepo(repo, link); err == nil || !strings.Contains(err.Error(), "escapes repository") {
+		t.Fatalf("err=%v", err)
+	}
+}
+
+func TestGoCompileValidationMatrix(t *testing.T) {
+	t.Run("library dot and slash", func(t *testing.T) {
+		repo := t.TempDir()
+		writeTestFile(t, repo, "go.mod", "module example.com/library\n\ngo 1.22\n")
+		writeTestFile(t, repo, "library.go", "package library\nfunc Value() int { return 1 }\n")
+		for _, pattern := range []string{".", "./"} {
+			assertCompileEvidence(t, repo, pattern, "validation_passed")
+		}
+	})
+
+	t.Run("main package", func(t *testing.T) {
+		repo := t.TempDir()
+		writeTestFile(t, repo, "go.mod", "module example.com/mainapp\n\ngo 1.22\n")
+		writeTestFile(t, repo, "main.go", "package main\nfunc main() {}\n")
+		assertCompileEvidence(t, repo, "./", "validation_passed")
+		if _, err := os.Stat(filepath.Join(repo, filepath.Base(repo))); !os.IsNotExist(err) {
+			t.Fatalf("compile wrote an executable into repository: %v", err)
+		}
+	})
+
+	t.Run("recursive mixed packages", func(t *testing.T) {
+		repo := t.TempDir()
+		writeTestFile(t, repo, "go.mod", "module example.com/mixed\n\ngo 1.22\n")
+		writeTestFile(t, repo, "library.go", "package mixed\nfunc Value() int { return 1 }\n")
+		writeTestFile(t, repo, "pkg/sub/sub.go", "package sub\nfunc Value() int { return 2 }\n")
+		writeTestFile(t, repo, "cmd/app/main.go", "package main\nfunc main() {}\n")
+		assertCompileEvidence(t, repo, "./...", "validation_passed")
+	})
+
+	t.Run("compile failure is evidence", func(t *testing.T) {
+		repo := t.TempDir()
+		writeTestFile(t, repo, "go.mod", "module example.com/broken\n\ngo 1.22\n")
+		writeTestFile(t, repo, "broken.go", "package broken\nfunc Broken( {\n")
+		assertCompileEvidence(t, repo, "./", "validation_failed")
+	})
+
+	t.Run("tool start failure is error", func(t *testing.T) {
+		repo := t.TempDir()
+		writeTestFile(t, repo, "go.mod", "module example.com/startfailure\n\ngo 1.22\n")
+		writeTestFile(t, repo, "library.go", "package startfailure\n")
+		t.Setenv("PATH", t.TempDir())
+		tool := &ToolRuntime{repo: repo, changes: []diff.Change{{File: "library.go"}}}
+		evidence, err := tool.runGoValidation(context.Background(), goValidationArgs{Mode: "compile", Package: "./", TimeoutSeconds: 30})
+		if err == nil || len(evidence) != 0 || !strings.Contains(err.Error(), "start go list") {
+			t.Fatalf("evidence=%+v err=%v", evidence, err)
+		}
+	})
+}
+
+func assertCompileEvidence(t *testing.T, repo, pattern, wantType string) {
+	t.Helper()
+	tool := &ToolRuntime{repo: repo, changes: []diff.Change{{File: "main.go"}}}
+	evidence, err := tool.runGoValidation(context.Background(), goValidationArgs{Mode: "compile", Package: pattern, TimeoutSeconds: 30})
+	if err != nil || len(evidence) != 1 || evidence[0].Type != wantType {
+		if len(evidence) > 0 {
+			t.Fatalf("pattern=%q evidence=%+v content=%s err=%v", pattern, evidence, evidence[0].Content, err)
+		}
+		t.Fatalf("pattern=%q evidence=%+v err=%v", pattern, evidence, err)
+	}
+}
+
+func writeTestFile(t *testing.T, repo, name, content string) {
+	t.Helper()
+	path := filepath.Join(repo, name)
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestNormalizeEvidencePath(t *testing.T) {
+	repo := t.TempDir()
+	evidence := &Evidence{File: filepath.Join(repo, "pkg", "main.go"), Line: 1}
+	if err := normalizeEvidencePath(repo, evidence); err != nil || evidence.File != "pkg/main.go" {
+		t.Fatalf("evidence=%+v err=%v", evidence, err)
+	}
+}
+
+func testRepo(t *testing.T, source string, changedLine int) (string, []byte) {
+	t.Helper()
+	repo := t.TempDir()
+	if err := os.WriteFile(filepath.Join(repo, "main.go"), []byte(source), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repo, "go.mod"), []byte("module example.com/test\n\ngo 1.22\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	diffData := []byte("diff --git a/main.go b/main.go\n--- a/main.go\n+++ b/main.go\n@@ -1,1 +1,1 @@\n-package main\n+package main\n")
+	if changedLine > 1 {
+		diffData = []byte("diff --git a/main.go b/main.go\n--- a/main.go\n+++ b/main.go\n@@ -" + string(rune('0'+changedLine)) + ",1 +" + string(rune('0'+changedLine)) + ",1 @@\n-old\n+new\n")
+	}
+	return repo, diffData
 }
