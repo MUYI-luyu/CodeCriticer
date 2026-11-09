@@ -13,15 +13,23 @@ func runtimeToolSpecs(allowExecution bool) []runtimeToolSpec {
 	for _, definition := range toolDefinitions(allowExecution) {
 		definitions[definition.Function.Name] = definition
 	}
+	// The built-in reviewer deliberately keeps its default tool surface small.
+	// Reading the diff/source, searching, and static diagnostics are enough for
+	// the ordinary ReAct loop. Graph analysis and process execution remain
+	// available to an MCP host, where a human or a richer coding agent can opt
+	// into them for a specific question instead of paying their context and
+	// failure cost on every review.
 	shared := toolSurfaceAgent | toolSurfaceMCP
 	return []runtimeToolSpec{
 		{definition: definitions["read_diff"], surfaces: shared, prepare: prepareReadDiff},
 		{definition: definitions["read_code"], surfaces: shared, prepare: prepareReadCode},
 		{definition: definitions["search_code"], surfaces: shared, prepare: prepareSearchCode},
-		{definition: definitions["inspect_symbol"], surfaces: shared, prepare: prepareInspectSymbol},
-		{definition: definitions["inspect_concurrency"], surfaces: shared, prepare: prepareInspectConcurrency},
+		{definition: definitions["read_evidence"], surfaces: toolSurfaceAgent, prepare: prepareReadEvidence},
+		{definition: definitions["inspect_symbol"], surfaces: toolSurfaceMCP, prepare: prepareInspectSymbol},
+		{definition: definitions["inspect_concurrency"], surfaces: toolSurfaceMCP, prepare: prepareInspectConcurrency},
 		{definition: definitions["run_static_rules"], surfaces: toolSurfaceAgent, prepare: prepareStaticRules},
-		{definition: definitions["run_go_validation"], surfaces: toolSurfaceAgent, prepare: prepareGoValidation},
+		// Validation is intentionally not a model-callable default. It remains a
+		// package capability for the CLI/eval harness and direct operator use.
 	}
 }
 
@@ -36,6 +44,9 @@ func agentTools(allowExecution bool) []review.ToolDefinition {
 	specs := runtimeToolSpecs(allowExecution)
 	definitions := make([]review.ToolDefinition, 0, len(specs)+1)
 	for _, spec := range specs {
+		if spec.surfaces&toolSurfaceAgent == 0 {
+			continue
+		}
 		definitions = append(definitions, spec.definition)
 	}
 	return append(definitions, submitClaimsDefinition())
@@ -78,6 +89,9 @@ func toolDefinitions(allowExecution bool) []review.ToolDefinition {
 		functionTool("search_code", "Literal search over Go source. Results include nearby code. An empty scoped result is explicit absence; operational failure is returned as an error.", map[string]any{
 			"keyword": stringValue, "file": nullableString,
 		}, []string{"keyword", "file"}),
+		functionTool("read_evidence", "Re-read canonical Evidence from an earlier tool result by ID when it is no longer in the active context. This is read-only and does not create new Evidence.", map[string]any{
+			"evidence_ids": map[string]any{"type": "array", "minItems": 1, "maxItems": 8, "items": stringValue},
+		}, []string{"evidence_ids"}),
 		functionTool("inspect_symbol", "Use Go compiler identity to inspect a definition or references, or a CHA call hierarchy. Call results state whether an edge is exact or an over-approximation; this is navigation evidence, not data-flow proof.", map[string]any{
 			"symbol": stringValue, "file": stringValue, "line": nullableInteger,
 			"relation": map[string]any{"type": "string", "enum": []string{"definition", "references", "callers", "callees"}},
@@ -100,10 +114,11 @@ func toolDefinitions(allowExecution bool) []review.ToolDefinition {
 						"file":         stringValue,
 						"line":         map[string]any{"type": "integer", "minimum": 1},
 						"severity":     map[string]any{"type": "string", "enum": []string{"error", "warning", "info"}},
+						"certainty":    map[string]any{"type": "string", "enum": []string{"certain", "schedule_dependent", "contract_dependent"}},
 						"msg":          stringValue,
 						"evidence_ids": map[string]any{"type": "array", "items": stringValue, "minItems": 1},
 					},
-					"required":             []string{"file", "line", "severity", "msg", "evidence_ids"},
+					"required":             []string{"file", "line", "severity", "certainty", "msg", "evidence_ids"},
 					"additionalProperties": false,
 				},
 			},

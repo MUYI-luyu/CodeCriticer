@@ -70,6 +70,10 @@ type searchCodeArgs struct {
 	File    *string `json:"file"`
 }
 
+type readEvidenceArgs struct {
+	EvidenceIDs []string `json:"evidence_ids"`
+}
+
 type inspectSymbolArgs struct {
 	Symbol   string `json:"symbol"`
 	File     string `json:"file"`
@@ -96,6 +100,7 @@ type candidateClaimInput struct {
 	File        string   `json:"file"`
 	Line        int      `json:"line"`
 	Severity    string   `json:"severity"`
+	Certainty   string   `json:"certainty"`
 	Msg         string   `json:"msg"`
 	EvidenceIDs []string `json:"evidence_ids"`
 }
@@ -107,9 +112,16 @@ type submitClaimsArgs struct {
 func (a submitClaimsArgs) candidateClaims() []review.CandidateClaim {
 	claims := make([]review.CandidateClaim, len(a.Claims))
 	for i, claim := range a.Claims {
+		certainty := claim.Certainty
+		// Persisted traces and test doubles from before the structured field
+		// existed remain readable. Native strict Function Calling requires it
+		// for new model output.
+		if certainty == "" {
+			certainty = "certain"
+		}
 		claims[i] = review.CandidateClaim{
 			File: claim.File, Line: claim.Line, Severity: claim.Severity,
-			Msg: claim.Msg, EvidenceIDs: claim.EvidenceIDs,
+			Certainty: certainty, Msg: claim.Msg, EvidenceIDs: claim.EvidenceIDs,
 		}
 	}
 	return claims
@@ -157,6 +169,27 @@ func prepareSearchCode(t *ToolRuntime, arguments string) (preparedToolCall, erro
 		}
 	}
 	return prepareTyped(args, func(context.Context) ([]*Evidence, error) { return t.searchCode(args) })
+}
+
+func prepareReadEvidence(t *ToolRuntime, arguments string) (preparedToolCall, error) {
+	args, err := decodeStrict[readEvidenceArgs](arguments)
+	if err != nil {
+		return preparedToolCall{}, err
+	}
+	if len(args.EvidenceIDs) == 0 || len(args.EvidenceIDs) > 8 {
+		return preparedToolCall{}, fmt.Errorf("evidence_ids must contain 1 to 8 IDs")
+	}
+	seen := make(map[string]bool, len(args.EvidenceIDs))
+	for _, id := range args.EvidenceIDs {
+		if err := requireNonBlank("evidence_ids", id); err != nil {
+			return preparedToolCall{}, err
+		}
+		if seen[id] {
+			return preparedToolCall{}, fmt.Errorf("evidence_ids contains duplicate %q", id)
+		}
+		seen[id] = true
+	}
+	return prepareTyped(args, func(context.Context) ([]*Evidence, error) { return t.readEvidence(args.EvidenceIDs) })
 }
 
 func prepareInspectSymbol(t *ToolRuntime, arguments string) (preparedToolCall, error) {

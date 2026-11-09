@@ -23,7 +23,7 @@ func TestToolRuntimeRegistryControlsSurfacePermissions(t *testing.T) {
 		}
 		return out
 	}
-	if got, want := names(agent), []string{"read_diff", "read_code", "search_code", "inspect_symbol", "inspect_concurrency", "run_static_rules", "run_go_validation"}; !reflect.DeepEqual(got, want) {
+	if got, want := names(agent), []string{"read_diff", "read_code", "search_code", "read_evidence", "run_static_rules"}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("agent tools=%v want=%v", got, want)
 	}
 	if got, want := names(mcpRuntime), []string{"read_diff", "read_code", "search_code", "inspect_symbol", "inspect_concurrency"}; !reflect.DeepEqual(got, want) {
@@ -38,7 +38,7 @@ func TestToolRuntimeRegistryControlsSurfacePermissions(t *testing.T) {
 
 func TestToolRuntimeBuildsGraphOnlyForGraphTools(t *testing.T) {
 	root := writeToolRuntimeRepo(t, "package sample\n\nfunc Value() int { return 1 }\n")
-	runtime := newToolRuntime(root, "", nil, false, toolSurfaceAgent)
+	runtime := newToolRuntime(root, "", nil, false, toolSurfaceMCP)
 
 	read, err := runtime.prepare("read_code", `{"file":"main.go","selector":{"kind":"symbol","symbol":"Value"}}`)
 	if err != nil {
@@ -66,7 +66,7 @@ func TestToolRuntimeBuildsGraphOnlyForGraphTools(t *testing.T) {
 
 func TestToolRuntimeGraphFailureDoesNotDisableReadTools(t *testing.T) {
 	root := writeToolRuntimeRepo(t, "package sample\n\nfunc Broken( {\n")
-	runtime := newToolRuntime(root, "", nil, false, toolSurfaceAgent)
+	runtime := newToolRuntime(root, "", nil, false, toolSurfaceMCP)
 
 	read, err := runtime.prepare("read_code", `{"file":"main.go","selector":{"kind":"file_start"}}`)
 	if err != nil {

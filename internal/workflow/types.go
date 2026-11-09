@@ -38,15 +38,74 @@ type TraceStats struct {
 	NoNewEvidenceCalls  int `json:"no_new_evidence_calls"`
 }
 
-// ContextProjectionStats describes only the latest model-facing projection.
-// Conversation remains the complete, unmodified transcript.
-type ContextProjectionStats struct {
-	Enabled                    bool `json:"enabled"`
-	Applications               int  `json:"applications"`
-	FullBytes                  int  `json:"full_bytes"`
-	ProjectedBytes             int  `json:"projected_bytes"`
-	DuplicateResultsCompacted  int  `json:"duplicate_results_compacted"`
-	DominatedReadCodeCompacted int  `json:"dominated_read_code_compacted"`
+// ReviewFact is compact trace metadata. Hypotheses are deliberately not stored
+// here: model proposals remain untrusted until a tool result supports them.
+type ReviewFact struct {
+	EvidenceID string `json:"evidence_id"`
+	Summary    string `json:"summary"`
+}
+
+// ReviewState is host-derived trace metadata. It deliberately does not
+// prescribe a tool order or serve as a second model-memory channel.
+type ReviewState struct {
+	Objective     string       `json:"objective"`
+	Phase         string       `json:"phase"` // investigate, done, partial
+	Facts         []ReviewFact `json:"facts,omitempty"`
+	RecentActions []string     `json:"recent_actions,omitempty"`
+}
+
+// MemoryEntry is a human-confirmed, project-scoped review convention.  It is
+// intentionally not a store of arbitrary model outputs: only entries matching
+// changed paths are eligible for a review prompt.
+type MemoryEntry struct {
+	ID         string   `json:"id"`
+	PathPrefix string   `json:"path_prefix"`
+	Content    string   `json:"content"`
+	Tags       []string `json:"tags,omitempty"`
+	Source     string   `json:"source"` // human_confirmed
+}
+
+// ContextCheckpoint is the only lossy representation used in a long review.
+// It is a model-produced, schema-checked investigation handoff; durable
+// Conversation remains the source of truth and Claim evidence must still
+// point to concrete tool output.
+type ContextCheckpoint struct {
+	Task               string               `json:"task"`
+	Reviewed           []CheckpointFact     `json:"reviewed"`
+	OpenQuestions      []CheckpointQuestion `json:"open_questions"`
+	RejectedHypotheses []string             `json:"rejected_hypotheses"`
+	ClaimsInProgress   []string             `json:"claims_in_progress"`
+}
+
+type CheckpointFact struct {
+	File  string `json:"file"`
+	Range string `json:"range"`
+	Fact  string `json:"fact"`
+}
+
+type CheckpointQuestion struct {
+	Question string `json:"question"`
+	NextTool string `json:"next_tool"`
+}
+
+// ContextCompactionStats records checkpoint lifecycle separately from legacy
+// deterministic projection statistics.
+type ContextCompactionStats struct {
+	Enabled          bool                     `json:"enabled"`
+	Checkpoints      int                      `json:"checkpoints"`
+	FullBytes        int                      `json:"full_bytes"`
+	ActiveBytes      int                      `json:"active_bytes"`
+	Failed           bool                     `json:"failed"`
+	CheckpointInputs []ContextCheckpointInput `json:"checkpoint_inputs,omitempty"`
+}
+
+// ContextCheckpointInput makes a lossy handoff auditable without becoming a
+// second source of review facts. Indices address the durable Conversation.
+type ContextCheckpointInput struct {
+	DurableStart int `json:"durable_start"`
+	DurableEnd   int `json:"durable_end"`
+	ToolPairs    int `json:"tool_pairs"`
+	InputBytes   int `json:"input_bytes"`
 }
 
 type Evidence struct {
@@ -94,21 +153,24 @@ type FinalReport struct {
 }
 
 type Trace struct {
-	ID            string                 `json:"id"`
-	Request       Request                `json:"request"`
-	Snapshot      *ReviewSnapshot        `json:"snapshot,omitempty"`
-	Scope         ReviewScope            `json:"scope"`
-	Evidence      []*Evidence            `json:"evidence"`
-	Investigation []InvestigationStep    `json:"investigation"`
-	FinalReport   FinalReport            `json:"final_report,omitempty"`
-	Conversation  []review.ToolMessage   `json:"conversation,omitempty"`
-	LLMCalls      []review.LLMCall       `json:"llm_calls"`
-	StopReason    string                 `json:"stop_reason"`
-	Usage         review.LLMUsage        `json:"usage"`
-	Duration      time.Duration          `json:"duration"`
-	Errors        []string               `json:"errors,omitempty"`
-	Stats         TraceStats             `json:"stats"`
-	Projection    ContextProjectionStats `json:"context_projection"`
+	ID              string                 `json:"id"`
+	Request         Request                `json:"request"`
+	Snapshot        *ReviewSnapshot        `json:"snapshot,omitempty"`
+	Scope           ReviewScope            `json:"scope"`
+	Evidence        []*Evidence            `json:"evidence"`
+	Investigation   []InvestigationStep    `json:"investigation"`
+	FinalReport     FinalReport            `json:"final_report,omitempty"`
+	Conversation    []review.ToolMessage   `json:"conversation,omitempty"`
+	LLMCalls        []review.LLMCall       `json:"llm_calls"`
+	StopReason      string                 `json:"stop_reason"`
+	Usage           review.LLMUsage        `json:"usage"`
+	Duration        time.Duration          `json:"duration"`
+	Errors          []string               `json:"errors,omitempty"`
+	Stats           TraceStats             `json:"stats"`
+	Compaction      ContextCompactionStats `json:"context_compaction"`
+	Checkpoint      *ContextCheckpoint     `json:"context_checkpoint,omitempty"`
+	ReviewState     ReviewState            `json:"review_state,omitempty"`
+	RetrievedMemory []MemoryEntry          `json:"retrieved_memory,omitempty"`
 }
 
 func (r FinalReport) ClaimsWithStatus(status VerdictStatus) []review.CandidateClaim {
@@ -127,7 +189,7 @@ func (r FinalReport) ClaimsWithStatus(status VerdictStatus) []review.CandidateCl
 
 const (
 	StopAgentDone       = "agent_done"
-	StopMaxSteps        = "max_steps"
+	StopPartial         = "partial"
 	StopInvalidDecision = "invalid_decision"
 	StopContextCanceled = "context_canceled"
 	StopStageError      = "stage_error"
@@ -177,4 +239,7 @@ func (o *observer) OnLLMCall(c review.LLMCall) {
 	o.trace.Usage.PromptTokens += c.Usage.PromptTokens
 	o.trace.Usage.CompletionTokens += c.Usage.CompletionTokens
 	o.trace.Usage.TotalTokens += c.Usage.TotalTokens
+	// Best-effort diagnostic output only: never affect the review result or
+	// Agent conversation.
+	_ = appendModelResponseLog(modelResponseLogPath, c)
 }

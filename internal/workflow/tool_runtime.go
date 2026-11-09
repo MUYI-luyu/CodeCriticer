@@ -30,6 +30,10 @@ type ToolRuntime struct {
 
 	store *recall.Store
 
+	// evidenceReader is attached by a ReviewSession. MCP and standalone tool
+	// runtimes deliberately have no access to a review's private Evidence.
+	evidenceReader func([]string) ([]*Evidence, error)
+
 	graphOnce sync.Once
 	index     *graph.Index
 	graphErr  error
@@ -37,6 +41,17 @@ type ToolRuntime struct {
 	registryOnce sync.Once
 	ordered      []runtimeToolSpec
 	registry     map[string]runtimeToolSpec
+}
+
+func (t *ToolRuntime) setEvidenceReader(reader func([]string) ([]*Evidence, error)) {
+	t.evidenceReader = reader
+}
+
+func (t *ToolRuntime) readEvidence(ids []string) ([]*Evidence, error) {
+	if t.evidenceReader == nil {
+		return nil, fmt.Errorf("read_evidence is unavailable outside an active review session")
+	}
+	return t.evidenceReader(ids)
 }
 
 func newToolRuntime(repo, validationRepo string, changes []changediff.Change, allowExecution bool, surface toolSurface) *ToolRuntime {

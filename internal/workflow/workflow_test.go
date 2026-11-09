@@ -19,6 +19,7 @@ import (
 
 type scriptedLLM struct {
 	calls           []review.ToolCall
+	usages          []review.LLMUsage
 	transcripts     [][]review.ToolMessage
 	configuredModel string
 }
@@ -30,9 +31,14 @@ func (s *scriptedLLM) CompleteToolsWithUsage(_ context.Context, _ string, messag
 	if len(s.calls) == 0 {
 		return assistantCall("submit_claims", `{"claims":[]}`), review.LLMUsage{}, nil
 	}
+	idx := len(s.transcripts) - 1
 	out := s.calls[0]
 	s.calls = s.calls[1:]
-	return review.ToolMessage{Role: "assistant", ToolCalls: []review.ToolCall{out}}, review.LLMUsage{}, nil
+	var usage review.LLMUsage
+	if idx < len(s.usages) {
+		usage = s.usages[idx]
+	}
+	return review.ToolMessage{Role: "assistant", ToolCalls: []review.ToolCall{out}}, usage, nil
 }
 
 func TestReviewRunIsOneShot(t *testing.T) {
@@ -139,7 +145,7 @@ func TestAgentToolThenSubmit(t *testing.T) {
 	}
 }
 
-func TestWorkflowProjectsModelContextButKeepsFullConversation(t *testing.T) {
+func TestWorkflowKeepsNativeContextForOrdinaryReview(t *testing.T) {
 	repo, diffData := testRepo(t, "package main\n\nfunc Run() {\n\tprintln(1)\n}\n", 4)
 	llm := &scriptedLLM{calls: []review.ToolCall{
 		toolCall("read_code", `{"file":"main.go","selector":{"kind":"range","start":3,"max_lines":2}}`),
@@ -147,24 +153,108 @@ func TestWorkflowProjectsModelContextButKeepsFullConversation(t *testing.T) {
 		toolCall("submit_claims", `{"claims":[]}`),
 	}}
 	wf, _ := NewReviewRun(llm, repo)
-	wf.SetContextProjection(true)
 	result, err := wf.Run(context.Background(), Request{Repo: repo, Diff: diffData})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(llm.transcripts) != 3 || !strings.Contains(llm.transcripts[2][2].Content, "read_code_covered") {
-		t.Fatalf("third model request was not projected: %+v", llm.transcripts)
+	if len(llm.transcripts) != 3 || !messagesContain(llm.transcripts[2], `"evidence"`) {
+		t.Fatalf("third model request lost native tool context: %+v", llm.transcripts)
 	}
 	trace := result.Trace
 	if len(trace.Conversation) != 6 || strings.Contains(trace.Conversation[2].Content, "context_projection") || !strings.Contains(trace.Conversation[2].Content, `"evidence"`) {
 		t.Fatalf("full conversation was not preserved: %+v", trace.Conversation)
 	}
-	if !trace.Projection.Enabled || trace.Projection.Applications != 3 || trace.Projection.DominatedReadCodeCompacted != 1 {
-		t.Fatalf("projection stats=%+v", trace.Projection)
+	if trace.Compaction.Checkpoints != 0 || trace.Checkpoint != nil {
+		t.Fatalf("ordinary review unexpectedly compacted: %+v", trace.Compaction)
 	}
 }
 
-func TestAgentCanInspectConcurrencyFacts(t *testing.T) {
+func TestWorkflowCreatesCheckpointAndKeepsDurableHistory(t *testing.T) {
+	longLine := "// " + strings.Repeat("x", 100) + "\n"
+	source := "package main\n\nfunc Run() {}\n" + strings.Repeat(longLine, 80)
+	repo, diffData := testRepo(t, source, 3)
+	checkpoint := `{"task":"review main.go","reviewed":[{"file":"main.go","range":"1-180","fact":"source was read"}],"open_questions":[{"question":"no remaining question","next_tool":"submit_claims"}],"rejected_hypotheses":[],"claims_in_progress":[]}`
+	llm := &scriptedLLM{calls: []review.ToolCall{
+		toolCall("read_code", `{"file":"main.go","selector":{"kind":"file_start"}}`),
+		toolCall("read_code", `{"file":"main.go","selector":{"kind":"range","start":3,"max_lines":80}}`),
+		toolCall("save_context_checkpoint", checkpoint),
+		toolCall("submit_claims", `{"claims":[]}`),
+	}}
+	wf, _ := NewReviewRun(llm, repo)
+	wf.SetModelContextBudget(12 << 10)
+	result, err := wf.Run(context.Background(), Request{Repo: repo, Diff: diffData})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Trace.StopReason != StopAgentDone || result.Trace.Compaction.Checkpoints != 1 || result.Trace.Checkpoint == nil {
+		t.Fatalf("checkpoint trace=%+v", result.Trace)
+	}
+	if len(result.Trace.Conversation) != 6 || !strings.Contains(result.Trace.Conversation[2].Content, strings.Repeat("x", 80)) {
+		t.Fatalf("durable conversation was changed: %+v", result.Trace.Conversation)
+	}
+	if len(result.Trace.Compaction.CheckpointInputs) != 1 || result.Trace.Compaction.CheckpointInputs[0].ToolPairs == 0 {
+		t.Fatalf("checkpoint input was not auditable: %+v", result.Trace.Compaction)
+	}
+	if len(llm.transcripts) != 4 || !messagesContain(llm.transcripts[3], "Context checkpoint") {
+		t.Fatalf("active checkpoint was not injected: %+v", llm.transcripts)
+	}
+	for request, messages := range llm.transcripts {
+		if got := toolMessagesBytes(messages); got > 12<<10 {
+			t.Fatalf("model request %d exceeded active budget: %d", request, got)
+		}
+	}
+}
+
+func messagesContain(messages []review.ToolMessage, needle string) bool {
+	for _, message := range messages {
+		if strings.Contains(message.Content, needle) {
+			return true
+		}
+	}
+	return false
+}
+
+func TestCheckpointProtocolFailureEndsPartialWithoutLooping(t *testing.T) {
+	longLine := "// " + strings.Repeat("x", 100) + "\n"
+	repo, diffData := testRepo(t, "package main\n\nfunc Run() {}\n"+strings.Repeat(longLine, 80), 3)
+	llm := &scriptedLLM{calls: []review.ToolCall{
+		toolCall("read_code", `{"file":"main.go","selector":{"kind":"file_start"}}`),
+		toolCall("read_code", `{"file":"main.go","selector":{"kind":"range","start":3,"max_lines":80}}`),
+		// The private compaction call must use the dedicated schema, not the
+		// ordinary Agent completion tool.
+		toolCall("submit_claims", `{"claims":[]}`),
+	}}
+	wf, _ := NewReviewRun(llm, repo)
+	wf.SetModelContextBudget(12 << 10)
+	result, err := wf.Run(context.Background(), Request{Repo: repo, Diff: diffData})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Trace.StopReason != StopPartial || !result.Trace.Compaction.Failed || len(llm.transcripts) != 3 {
+		t.Fatalf("failed checkpoint must stop once: trace=%+v calls=%d", result.Trace.Compaction, len(llm.transcripts))
+	}
+}
+
+func TestWorkflowDoesNotSendKernelBeyondContextBudget(t *testing.T) {
+	repo, _ := testRepo(t, "package main\n", 1)
+	largeLine := strings.Repeat("x", 4<<10)
+	diffData := []byte("diff --git a/main.go b/main.go\n--- a/main.go\n+++ b/main.go\n@@ -1 +1 @@\n-package main\n+" + largeLine + "\n")
+	llm := &scriptedLLM{}
+	wf, _ := NewReviewRun(llm, repo)
+	wf.SetModelContextBudget(1 << 10)
+	result, err := wf.Run(context.Background(), Request{Repo: repo, Diff: diffData})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Trace.StopReason != StopPartial || len(llm.transcripts) != 0 {
+		t.Fatalf("oversized kernel must stop before a model call: stop=%s requests=%d errors=%v", result.Trace.StopReason, len(llm.transcripts), result.Trace.Errors)
+	}
+	if len(result.Trace.Errors) != 1 || !strings.Contains(result.Trace.Errors[0], "context_budget_exhausted") {
+		t.Fatalf("expected context budget error, got %v", result.Trace.Errors)
+	}
+}
+
+func TestDefaultAgentDoesNotExposeGraphTools(t *testing.T) {
 	repo, diffData := testRepo(t, `package main
 
 import "sync"
@@ -176,24 +266,10 @@ func Run() {
 	defer mu.Unlock()
 }
 `, 1)
-	llm := &scriptedLLM{calls: []review.ToolCall{
-		toolCall("inspect_concurrency", `{"symbol":"Run","file":"main.go","line":null}`),
-		toolCall("submit_claims", `{"claims":[]}`),
-	}}
-	wf, _ := NewReviewRun(llm, repo)
-	result, err := wf.Run(context.Background(), Request{Repo: repo, Diff: diffData})
-	if err != nil {
-		t.Fatal(err)
-	}
-	foundAcquire := false
-	for _, evidence := range result.Trace.Evidence {
-		if evidence.Source == "inspect_concurrency" && evidence.Type == "lock_acquire" && strings.Contains(evidence.Content, "Mutex.Lock") {
-			foundAcquire = true
-			break
-		}
-	}
-	if !foundAcquire {
-		t.Fatalf("concurrency evidence=%+v", result.Trace.Evidence)
+	_ = diffData
+	runtime := newToolRuntime(repo, "", nil, false, toolSurfaceAgent)
+	if _, err := runtime.prepare("inspect_concurrency", `{"symbol":"Run","file":"main.go","line":null}`); err == nil || !strings.Contains(err.Error(), "not available") {
+		t.Fatalf("default agent unexpectedly exposes graph tool: %v", err)
 	}
 }
 
@@ -220,7 +296,7 @@ func TestRejectedSubmissionReturnsToSameAgentLoop(t *testing.T) {
 func TestAgentContinuesAfterToolError(t *testing.T) {
 	repo, diffData := testRepo(t, "package main\n\nfunc Run() {}\n", 3)
 	llm := &scriptedLLM{calls: []review.ToolCall{
-		toolCall("inspect_symbol", `{"symbol":"Missing","file":"main.go","line":null,"relation":"references"}`),
+		toolCall("read_code", `{"file":"missing.go","selector":{"kind":"file_start"}}`),
 		toolCall("read_code", `{"file":"main.go","selector":{"kind":"file_start"}}`),
 		toolCall("submit_claims", `{"claims":[]}`),
 	}}
@@ -254,6 +330,33 @@ func TestAgentRecordsDuplicateAndNoNewEvidence(t *testing.T) {
 	}
 	if !strings.Contains(trace.Investigation[1].Error, "重复调用") || !strings.Contains(trace.Investigation[2].Error, "未产生新证据") {
 		t.Fatalf("steps=%+v", trace.Investigation)
+	}
+}
+
+func TestAgentRehydratesEvidenceAfterDuplicateRead(t *testing.T) {
+	repo, diffData := testRepo(t, "package main\n\nfunc Run() {\n\tprintln(1)\n}\n", 4)
+	llm := &scriptedLLM{calls: []review.ToolCall{
+		toolCall("read_code", `{"file":"main.go","selector":{"kind":"range","start":1,"max_lines":5}}`),
+		toolCall("read_code", `{"file":"main.go","selector":{"kind":"range","start":1,"max_lines":5}}`),
+		toolCall("read_evidence", `{"evidence_ids":["e3"]}`),
+		toolCall("submit_claims", `{"claims":[]}`),
+	}}
+	wf, _ := NewReviewRun(llm, repo)
+	result, err := wf.Run(context.Background(), Request{Repo: repo, Diff: diffData})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := len(result.Trace.Evidence); got != 3 {
+		t.Fatalf("rehydration must not create Evidence: got %d evidence", got)
+	}
+	if got := result.Trace.Stats.DuplicateCalls; got != 1 {
+		t.Fatalf("duplicate calls=%d", got)
+	}
+	if !messagesContain(llm.transcripts[2], `"original_step_id":"s1"`) || !messagesContain(llm.transcripts[2], `"evidence_ids":["e3"]`) {
+		t.Fatalf("duplicate response did not identify recoverable evidence: %+v", llm.transcripts[2])
+	}
+	if !messagesContain(llm.transcripts[3], "func Run()") {
+		t.Fatalf("rehydrated tool response did not contain original Evidence: %+v", llm.transcripts[3])
 	}
 }
 
@@ -293,12 +396,12 @@ func TestDecisionBudgetExhaustionIsNotReportedAsNoIssues(t *testing.T) {
 		toolCall("submit_claims", `{"claims":[{"file":"main.go","line":3,"severity":"warning","msg":"needs evidence","evidence_ids":["missing"]}]}`),
 	}}
 	wf, _ := NewReviewRun(llm, repo)
-	wf.SetMaxSteps(1)
+	wf.SetMaxTurns(4)
 	result, err := wf.Run(context.Background(), Request{Repo: repo, Diff: diffData})
-	if err == nil {
-		t.Fatal("budget exhaustion must not be reported as a successful empty review")
+	if err != nil {
+		t.Fatalf("partial review should retain its trace without a runtime error: %v", err)
 	}
-	if result.Trace.StopReason != StopMaxSteps || len(result.Trace.FinalReport.Claims) != 1 || result.Trace.FinalReport.Verdicts[0].Status != VerdictUnresolved {
+	if result.Trace.StopReason != StopPartial || len(result.Trace.FinalReport.Claims) != 1 || result.Trace.FinalReport.Verdicts[0].Status != VerdictUnresolved {
 		t.Fatalf("trace=%+v", result.Trace)
 	}
 }
@@ -322,7 +425,7 @@ func TestFailedToolExecutionConsumesToolBudget(t *testing.T) {
 	if result.Trace.Stats.FailedToolCalls != 1 || result.Trace.Stats.SuccessfulToolCalls != 0 {
 		t.Fatalf("stats=%+v", result.Trace.Stats)
 	}
-	if len(result.Trace.Investigation) != 2 || !strings.Contains(result.Trace.Investigation[1].Error, "预算已耗尽") {
+	if len(result.Trace.Investigation) != 2 || !strings.Contains(result.Trace.Investigation[1].Error, "安全上限已到") {
 		t.Fatalf("investigation=%+v", result.Trace.Investigation)
 	}
 }
@@ -339,7 +442,7 @@ func TestAgentDoesNotRepairInvalidNativeResponse(t *testing.T) {
 
 func TestAgentToolSchemasAreStrict(t *testing.T) {
 	tools := agentTools(false)
-	if len(tools) != 8 {
+	if len(tools) != 6 {
 		t.Fatalf("tools=%d", len(tools))
 	}
 	for _, tool := range tools {
@@ -428,6 +531,7 @@ func TestToolSchemasMatchConcreteArgumentTypes(t *testing.T) {
 		"read_diff":           reflect.TypeOf(readDiffArgs{}),
 		"read_code":           reflect.TypeOf(readCodeEnvelope{}),
 		"search_code":         reflect.TypeOf(searchCodeArgs{}),
+		"read_evidence":       reflect.TypeOf(readEvidenceArgs{}),
 		"inspect_symbol":      reflect.TypeOf(inspectSymbolArgs{}),
 		"inspect_concurrency": reflect.TypeOf(inspectConcurrencyArgs{}),
 		"run_static_rules":    reflect.TypeOf(emptyToolArgs{}),
@@ -501,7 +605,6 @@ func TestToolArgumentsDecodeStrictly(t *testing.T) {
 		{"unknown top-level field", "search_code", `{"keyword":"x","file":null,"extra":true}`},
 		{"unknown selector field", "read_code", `{"file":"main.go","selector":{"kind":"range","start":1,"max_lines":10,"line":2}}`},
 		{"fractional range integer", "read_code", `{"file":"main.go","selector":{"kind":"range","start":1.5,"max_lines":10}}`},
-		{"fractional timeout", "run_go_validation", `{"mode":"compile","package":".","test":null,"timeout_seconds":1.5}`},
 		{"multiple JSON values", "run_static_rules", `{} {}`},
 	}
 	for _, test := range tests {
@@ -580,6 +683,22 @@ func TestLargeDiffListsOmittedHunkExplicitly(t *testing.T) {
 	encoded := encodeChangedContext(&Trace{}, []diff.Change{change})
 	if !strings.Contains(encoded, `"omitted_hunks":["main.go:h1"]`) || !strings.Contains(encoded, `"hunk_id":"h2"`) {
 		t.Fatalf("encoded=%s", encoded)
+	}
+}
+
+func TestCompactedKernelKeepsManifestWithoutInliningHunkBodies(t *testing.T) {
+	change := diff.Change{File: "main.go", Hunks: []diff.Hunk{{
+		ID: "h1", OldStart: 1, NewStart: 1, OldLines: 1, NewLines: 1,
+		Lines: []diff.HunkLine{{Kind: "add", NewLine: 1, Text: "unique inline hunk body"}},
+	}}}
+	compact := buildCompactedAgentPrompt(&Trace{Scope: ReviewScope{Concern: "review"}}, []diff.Change{change})
+	for _, want := range []string{`"hunk_id":"h1"`, `"included":false`, `"omitted_hunks":["main.go:h1"]`} {
+		if !strings.Contains(compact, want) {
+			t.Fatalf("compacted kernel missing %q: %s", want, compact)
+		}
+	}
+	if strings.Contains(compact, "unique inline hunk body") {
+		t.Fatalf("compacted kernel retained hunk body: %s", compact)
 	}
 }
 
@@ -746,7 +865,7 @@ func TestGoValidationExecutionPermission(t *testing.T) {
 		}
 		t.Fatalf("evidence=%+v err=%v", evidence, err)
 	}
-	_, err = tool.prepare("run_go_validation", `{"mode":"test","package":".","test":null,"timeout_seconds":30}`)
+	_, err = prepareGoValidation(tool, `{"mode":"test","package":".","test":null,"timeout_seconds":30}`)
 	if err == nil || !strings.Contains(err.Error(), "--allow-exec") {
 		t.Fatalf("err=%v", err)
 	}

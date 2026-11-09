@@ -24,10 +24,14 @@ func main() {
 	switch os.Args[1] {
 	case "review":
 		cmdReview(os.Args[2:])
+	case "reviewbench":
+		cmdReviewBench(os.Args[2:])
 	case "mcp":
 		cmdMCP(os.Args[2:])
 	case "eval":
 		cmdEval(os.Args[2:])
+	case "rescore":
+		cmdRescore(os.Args[2:])
 	case "replay":
 		cmdReplay(os.Args[2:])
 	default:
@@ -44,7 +48,13 @@ func usage() {
 	fmt.Fprintln(os.Stderr, "    --head <SHA>            固定审查的 head commit；Diff 由 Git 生成")
 	fmt.Fprintln(os.Stderr, "    --trace <路径>          保存完整轨迹（JSON 文件）")
 	fmt.Fprintln(os.Stderr, "    --model <模型>          Agent 使用的主模型")
-	fmt.Fprintln(os.Stderr, "    --allow-exec            允许 Agent 运行目标仓库的 go test/-race（默认禁止）")
+	fmt.Fprintln(os.Stderr, "    --memory <文件>         人工确认的项目规则记忆（JSON，可选）")
+	fmt.Fprintln(os.Stderr, "    --max-tool-calls <n>    可选：工具调用安全上限（默认 32，不决定正常完成）")
+	fmt.Fprintln(os.Stderr, "    --max-turns <n>         可选：模型决策安全上限（默认 64）")
+	fmt.Fprintln(os.Stderr, "    --max-total-tokens <n>  可选：累计 provider token 安全上限（默认不限）")
+	fmt.Fprintln(os.Stderr, "")
+	fmt.Fprintln(os.Stderr, "  codecritic reviewbench")
+	fmt.Fprintln(os.Stderr, "    ReviewBench 容器入口；从 RB_* 环境变量读取固定 PR 输入并写入 RB_OUT")
 	fmt.Fprintln(os.Stderr, "")
 	fmt.Fprintln(os.Stderr, "  codecritic mcp --repo <路径> --base <SHA> --head <SHA>")
 	fmt.Fprintln(os.Stderr, "    通过 stdio 暴露绑定固定 Review Snapshot 的只读分析工具")
@@ -55,9 +65,13 @@ func usage() {
 	fmt.Fprintln(os.Stderr, "    --verbose, -v           显示详细的 Agent 执行轨迹")
 	fmt.Fprintln(os.Stderr, "    --model <模型>")
 	fmt.Fprintln(os.Stderr, "    --judge-model <模型>    可选：独立评估 Claim 语义与引用 Evidence")
-	fmt.Fprintln(os.Stderr, "    --context-projection    启用确定性工具结果裁剪")
-	fmt.Fprintln(os.Stderr, "    --ab-context            成对运行 Full Context 与 Context Projection")
+	fmt.Fprintln(os.Stderr, "    --ab-context            成对运行 Full Context 与 Context Checkpoint")
+	fmt.Fprintln(os.Stderr, "    --context-checkpoint    在 eval 中启用 checkpoint 上下文")
+	fmt.Fprintln(os.Stderr, "    --context-budget <byte> eval-only：覆盖 checkpoint 触发预算")
 	fmt.Fprintln(os.Stderr, "    --diagnose              对已完成的漏报运行工具/证据/全上下文干预")
+	fmt.Fprintln(os.Stderr, "")
+	fmt.Fprintln(os.Stderr, "  codecritic rescore --dataset <目录> --trace-dir <目录>")
+	fmt.Fprintln(os.Stderr, "    用当前已审计的标注离线重算已有 trace，不请求模型也不覆盖原轨迹")
 	fmt.Fprintln(os.Stderr, "")
 	fmt.Fprintln(os.Stderr, "  codecritic replay <trace文件> [选项]")
 	fmt.Fprintln(os.Stderr, "    --output <路径>         保存分析结果（JSON 文件）")
@@ -115,7 +129,7 @@ func cmdMCP(args []string) {
 }
 
 func cmdReview(args []string) {
-	repo, diffPath, tracePath, model, base, head, verbose, allowExec := parseReviewArgs(args)
+	repo, diffPath, tracePath, model, base, head, memoryPath, maxToolCalls, maxTurns, maxTotalTokens, verbose := parseReviewArgs(args)
 	pinned := base != "" || head != ""
 	if repo == "" || !pinned || base == "" || head == "" || diffPath != "" {
 		usage()
@@ -136,11 +150,19 @@ func cmdReview(args []string) {
 	var snapshot *workflow.ReviewSnapshot
 	var diffData []byte
 	var err error
-	snapshot, diffData, err = workflow.CreateGitReviewSnapshot(ctx, repo, base, head, allowExec)
+	snapshot, diffData, err = workflow.CreateGitReviewSnapshot(ctx, repo, base, head, false)
 	if err != nil {
 		log.Fatalf("创建 Review Snapshot: %v", err)
 	}
 	raw = diffData
+	var memoryEntries []workflow.MemoryEntry
+	if memoryPath != "" {
+		memoryEntries, err = workflow.LoadProjectMemory(memoryPath)
+		if err != nil {
+			_ = snapshot.Close()
+			log.Fatalf("加载项目记忆失败: %v", err)
+		}
+	}
 	run, err = workflow.NewWithSnapshot(llm, snapshot)
 	if err != nil {
 		if cleanupErr := snapshot.Close(); cleanupErr != nil {
@@ -148,7 +170,21 @@ func cmdReview(args []string) {
 		}
 		log.Fatalf("创建 ReviewRun: %v", err)
 	}
-	result, err := run.Run(ctx, workflow.Request{Diff: raw, AllowExecution: allowExec})
+	// Ordinary review keeps the native conversation intact. Checkpointing is
+	// only activated when the active context exceeds its conservative budget.
+	if maxToolCalls > 0 {
+		run.SetMaxToolCalls(maxToolCalls)
+	}
+	if maxTurns > 0 {
+		run.SetMaxTurns(maxTurns)
+	}
+	if maxTotalTokens > 0 {
+		run.SetMaxTotalTokens(maxTotalTokens)
+	}
+	if len(memoryEntries) > 0 {
+		run.SetProjectMemory(memoryEntries)
+	}
+	result, err := run.Run(ctx, workflow.Request{Diff: raw})
 	if tracePath == "" && result != nil && result.Trace != nil {
 		tracePath = filepath.Join("logs", result.Trace.ID+".json")
 	}
@@ -168,10 +204,41 @@ func cmdReview(args []string) {
 			log.Printf("保存 workflow 轨迹失败: %v", err)
 		}
 	}
+	if result.Trace.StopReason == workflow.StopPartial {
+		fmt.Fprintln(os.Stderr, "审查以 partial 结束：运行安全阀触发，Trace 保留了当前证据与未完成结论；不能将空输出解释为未发现问题。")
+	}
 	printClaims(result.Trace.FinalReport.ClaimsWithStatus(workflow.VerdictAccepted))
 
 	if verbose {
 		printLLMMetrics(llm)
+	}
+}
+
+func cmdRescore(args []string) {
+	dataset := "internal/eval/testdata/cases"
+	traceDir := ""
+	for i := 0; i < len(args); i++ {
+		switch {
+		case args[i] == "--dataset" && i+1 < len(args):
+			dataset, i = args[i+1], i+1
+		case strings.HasPrefix(args[i], "--dataset="):
+			dataset = strings.TrimPrefix(args[i], "--dataset=")
+		case args[i] == "--trace-dir" && i+1 < len(args):
+			traceDir, i = args[i+1], i+1
+		case strings.HasPrefix(args[i], "--trace-dir="):
+			traceDir = strings.TrimPrefix(args[i], "--trace-dir=")
+		default:
+			fmt.Fprintf(os.Stderr, "未知 rescore 参数: %s\n", args[i])
+			usage()
+			return
+		}
+	}
+	if traceDir == "" {
+		fmt.Fprintln(os.Stderr, "rescore 需要 --trace-dir")
+		os.Exit(2)
+	}
+	if err := eval.RescoreTraceDir(os.Stdout, dataset, traceDir); err != nil {
+		log.Fatalf("重新评分失败: %v", err)
 	}
 }
 
@@ -180,7 +247,8 @@ func cmdEval(args []string) {
 	var model string
 	var judgeModel string
 	var verbose bool
-	var contextProjection bool
+	var contextCheckpointing bool
+	var contextBudget int
 	var abContext bool
 	var diagnose bool
 	traceDir := "logs"
@@ -210,22 +278,26 @@ func cmdEval(args []string) {
 			judgeModel, i = args[i+1], i+1
 		case strings.HasPrefix(args[i], "--judge-model="):
 			judgeModel = strings.TrimPrefix(args[i], "--judge-model=")
-		case args[i] == "--context-projection":
-			contextProjection = true
+		case args[i] == "--context-checkpoint":
+			contextCheckpointing = true
+		case args[i] == "--context-budget" && i+1 < len(args):
+			contextBudget, i = atoiOr(args[i+1], 0), i+1
+		case strings.HasPrefix(args[i], "--context-budget="):
+			contextBudget = atoiOr(strings.TrimPrefix(args[i], "--context-budget="), 0)
 		case args[i] == "--ab-context":
 			abContext = true
 		case args[i] == "--diagnose":
 			diagnose = true
 		}
 	}
-	if abContext && contextProjection {
-		log.Fatal("--ab-context 已包含 projection 组，不能与 --context-projection 同时使用")
+	if abContext && contextCheckpointing {
+		log.Fatal("--ab-context 已包含 checkpoint 组，不能与 --context-checkpoint 同时使用")
 	}
 	if abContext && judgeModel != "" {
 		log.Fatal("--ab-context 暂不运行可选语义 judge；请单独运行 --judge-model")
 	}
-	if diagnose && (abContext || contextProjection) {
-		log.Fatal("--diagnose 只诊断基线运行，不能与上下文投影选项同时使用")
+	if diagnose && (abContext || contextCheckpointing) {
+		log.Fatal("--diagnose 只诊断基线运行，不能与上下文 checkpoint 选项同时使用")
 	}
 
 	key := getEnv("CodeCritic_API_KEY", "DEEPSEEK_API_KEY")
@@ -245,15 +317,19 @@ func cmdEval(args []string) {
 		}
 		err = eval.RunConcurrentWithDiagnosis(ctx, llm, judgeLLM, judgeModel, dataset, verbose, concurrency, traceDir)
 	} else if abContext {
-		err = eval.RunContextProjectionAB(ctx, llm, dataset, verbose, concurrency, traceDir)
-	} else if judgeModel != "" && contextProjection {
+		err = eval.RunContextCheckpointABWithBudget(ctx, llm, dataset, verbose, concurrency, traceDir, contextBudget)
+	} else if judgeModel != "" && contextCheckpointing {
 		judgeLLM := buildLLM(key, judgeModel)
-		err = eval.RunConcurrentProjectedWithJudge(ctx, llm, judgeLLM, judgeModel, dataset, verbose, concurrency, traceDir)
+		err = eval.RunConcurrentCheckpointedWithJudge(ctx, llm, judgeLLM, judgeModel, dataset, verbose, concurrency, traceDir)
 	} else if judgeModel != "" {
 		judgeLLM := buildLLM(key, judgeModel)
 		err = eval.RunConcurrentWithJudge(ctx, llm, judgeLLM, judgeModel, dataset, verbose, concurrency, traceDir)
-	} else if contextProjection {
-		err = eval.RunConcurrentProjected(ctx, llm, dataset, verbose, concurrency, traceDir)
+	} else if contextCheckpointing {
+		if contextBudget > 0 {
+			err = eval.RunConcurrentCheckpointedWithBudget(ctx, llm, dataset, verbose, concurrency, traceDir, contextBudget)
+		} else {
+			err = eval.RunConcurrentCheckpointed(ctx, llm, dataset, verbose, concurrency, traceDir)
+		}
 	} else {
 		err = eval.RunConcurrent(ctx, llm, dataset, verbose, concurrency, traceDir)
 	}
@@ -268,7 +344,7 @@ func cmdEval(args []string) {
 }
 
 // parseReviewArgs 提取 review 命令的参数。
-func parseReviewArgs(args []string) (repo, diff, tracePath, model, base, head string, verbose, allowExec bool) {
+func parseReviewArgs(args []string) (repo, diff, tracePath, model, base, head, memoryPath string, maxToolCalls, maxTurns, maxTotalTokens int, verbose bool) {
 	for i := 0; i < len(args); i++ {
 		a := args[i]
 		switch {
@@ -286,8 +362,6 @@ func parseReviewArgs(args []string) (repo, diff, tracePath, model, base, head st
 			head = strings.TrimPrefix(a, "--head=")
 		case a == "--verbose" || a == "-v":
 			verbose = true
-		case a == "--allow-exec":
-			allowExec = true
 		case a == "--trace" && i+1 < len(args):
 			tracePath, i = args[i+1], i+1
 		case strings.HasPrefix(a, "--trace="):
@@ -296,6 +370,22 @@ func parseReviewArgs(args []string) (repo, diff, tracePath, model, base, head st
 			model, i = args[i+1], i+1
 		case strings.HasPrefix(a, "--model="):
 			model = strings.TrimPrefix(a, "--model=")
+		case a == "--memory" && i+1 < len(args):
+			memoryPath, i = args[i+1], i+1
+		case strings.HasPrefix(a, "--memory="):
+			memoryPath = strings.TrimPrefix(a, "--memory=")
+		case a == "--max-tool-calls" && i+1 < len(args):
+			maxToolCalls, i = atoiOr(args[i+1], 0), i+1
+		case strings.HasPrefix(a, "--max-tool-calls="):
+			maxToolCalls = atoiOr(strings.TrimPrefix(a, "--max-tool-calls="), 0)
+		case a == "--max-turns" && i+1 < len(args):
+			maxTurns, i = atoiOr(args[i+1], 0), i+1
+		case strings.HasPrefix(a, "--max-turns="):
+			maxTurns = atoiOr(strings.TrimPrefix(a, "--max-turns="), 0)
+		case a == "--max-total-tokens" && i+1 < len(args):
+			maxTotalTokens, i = atoiOr(args[i+1], 0), i+1
+		case strings.HasPrefix(a, "--max-total-tokens="):
+			maxTotalTokens = atoiOr(strings.TrimPrefix(a, "--max-total-tokens="), 0)
 		default:
 			if diff == "" && !strings.HasPrefix(a, "--") {
 				diff = a
@@ -345,7 +435,11 @@ func printClaims(fs []review.CandidateClaim) {
 		if f.Line > 0 {
 			loc = fmt.Sprintf("%s:%d", f.File, f.Line)
 		}
-		fmt.Printf("[%s] %s — %s\n", sev, loc, f.Msg)
+		certainty := f.Certainty
+		if certainty == "" {
+			certainty = "certain"
+		}
+		fmt.Printf("[%s/%s] %s — %s\n", sev, certainty, loc, f.Msg)
 	}
 }
 

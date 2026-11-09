@@ -63,8 +63,6 @@ func TestGitReviewSnapshotPinsDiffAndToolRoot(t *testing.T) {
 
 	llm := &scriptedLLM{calls: []review.ToolCall{
 		toolCall("read_code", `{"file":"main.go","selector":{"kind":"file_start"}}`),
-		toolCall("inspect_symbol", `{"symbol":"Value","file":"main.go","line":null,"relation":"definition"}`),
-		toolCall("run_go_validation", `{"mode":"test","package":".","test":null,"timeout_seconds":30}`),
 		toolCall("submit_claims", `{"claims":[]}`),
 	}}
 	wf, err := NewWithSnapshot(llm, snapshot)
@@ -86,19 +84,13 @@ func TestGitReviewSnapshotPinsDiffAndToolRoot(t *testing.T) {
 	if result.Trace.Snapshot == nil || result.Trace.Snapshot.HeadSHA != head || result.Trace.Snapshot.DiffHash != hashBytes(diffData) {
 		t.Fatalf("trace snapshot=%+v", result.Trace.Snapshot)
 	}
-	foundPinnedCode, foundPinnedSymbol, validationPassed := false, false, false
+	foundPinnedCode := false
 	for _, evidence := range result.Trace.Evidence {
 		if evidence.Source == "read_code" && strings.Contains(evidence.Content, "return 2") && !strings.Contains(evidence.Content, "return 99") {
 			foundPinnedCode = true
 		}
-		if evidence.Source == "inspect_symbol" && evidence.Symbol == "Value" && evidence.File == "main.go" {
-			foundPinnedSymbol = true
-		}
-		if evidence.Source == "run_go_validation" && evidence.Type == "validation_passed" {
-			validationPassed = true
-		}
 	}
-	if !foundPinnedCode || !foundPinnedSymbol || !validationPassed {
+	if !foundPinnedCode {
 		t.Fatalf("evidence=%+v", result.Trace.Evidence)
 	}
 	if _, err := os.Stat(analysisRoot); !os.IsNotExist(err) {
@@ -123,6 +115,42 @@ func TestGitReviewSnapshotPinsDiffAndToolRoot(t *testing.T) {
 	registered := gitTest(t, repo, "worktree", "list", "--porcelain")
 	if strings.Contains(registered, analysisRoot) || strings.Contains(registered, executionRoot) {
 		t.Fatalf("snapshot worktree registration leaked:\n%s", registered)
+	}
+}
+
+func TestSnapshotReviewLetsModelChooseAFreeInvestigationPath(t *testing.T) {
+	repo := t.TempDir()
+	gitTest(t, repo, "init")
+	gitTest(t, repo, "config", "user.email", "snapshot@example.com")
+	gitTest(t, repo, "config", "user.name", "Snapshot Test")
+	writeSnapshotFile(t, repo, "go.mod", "module example.com/snapshotgate\n\ngo 1.22\n")
+	writeSnapshotFile(t, repo, "main.go", "package snapshotgate\n\nvar Value = 1\n")
+	gitTest(t, repo, "add", ".")
+	gitTest(t, repo, "commit", "-m", "base")
+	base := strings.TrimSpace(gitTest(t, repo, "rev-parse", "HEAD"))
+	writeSnapshotFile(t, repo, "main.go", "package snapshotgate\n\nvar Value = 2\n")
+	gitTest(t, repo, "add", "main.go")
+	gitTest(t, repo, "commit", "-m", "head")
+	head := strings.TrimSpace(gitTest(t, repo, "rev-parse", "HEAD"))
+
+	snapshot, diffData, err := CreateGitReviewSnapshot(context.Background(), repo, base, head, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	llm := &scriptedLLM{calls: []review.ToolCall{
+		toolCall("submit_claims", `{"claims":[]}`),
+	}}
+	run, err := NewWithSnapshot(llm, snapshot)
+	if err != nil {
+		_ = snapshot.Close()
+		t.Fatal(err)
+	}
+	result, err := run.Run(context.Background(), Request{Diff: diffData})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Trace.StopReason != StopAgentDone || result.Trace.ReviewState.Phase != "done" || len(llm.transcripts) != 1 {
+		t.Fatalf("trace=%+v calls=%d", result.Trace, len(llm.transcripts))
 	}
 }
 

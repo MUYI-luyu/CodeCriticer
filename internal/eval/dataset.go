@@ -43,13 +43,27 @@ type Metadata struct {
 	OriginalRepoLOC int    `json:"original_repo_loc,omitempty"` // 原始 repo 总行数（如果已知）
 }
 
+// CaseCategory determines how a case participates in evaluation. Semantic
+// positives measure recall, negatives measure false positives, and convention
+// cases measure policy-rule hit rate without contaminating bug metrics.
+type CaseCategory string
+
+const (
+	CategorySemanticPositive CaseCategory = "semantic_positive"
+	CategoryNegative         CaseCategory = "negative"
+	CategoryConvention       CaseCategory = "convention"
+)
+
 // Case 是单个评测用例：buggy 为含缺陷代码，fixed 为修复后代码。
 type Case struct {
-	Name   string
-	Source string
-	Rule   string            // 能确定性命中的规则名，无则 LLM 兜底
-	Repo   map[string]string // 文件名 → buggy 内容（写入仓库）
-	Diff   []byte            // 引入 bug 的 unified diff
+	Name      string
+	Source    string
+	Rule      string            // 能确定性命中的规则名，无则 LLM 兜底
+	Category  CaseCategory      // semantic_positive, negative, convention
+	GoVersion string            // materialized module language version
+	PolicyID  string            // required only for convention cases
+	Repo      map[string]string // 文件名 → buggy 内容（写入仓库）
+	Diff      []byte            // 引入 bug 的 unified diff
 
 	// === 单一事实来源：GroundTruth ===
 	GT GroundTruth `json:"ground_truth"`
@@ -60,6 +74,9 @@ type Case struct {
 
 // Bugs 返回以 Primary 为唯一 Bug 单位的兼容视图。
 func (c *Case) Bugs() []Bug {
+	if c == nil || c.GT.Primary.File == "" {
+		return nil
+	}
 	return []Bug{{
 		File: c.GT.Primary.File,
 		Line: c.GT.Primary.Line,
@@ -69,6 +86,14 @@ func (c *Case) Bugs() []Bug {
 
 // Load 加载数据集目录，每个子目录是一个用例。
 func Load(dir string) ([]*Case, error) {
+	// A curated manifest selects original cases without copying or rewriting
+	// their source files.  This keeps the provenance of imported datasets
+	// intact while allowing an audited subset to carry current-language labels.
+	if _, err := os.Stat(filepath.Join(dir, "manifest.json")); err == nil {
+		return loadManifest(dir)
+	} else if !os.IsNotExist(err) {
+		return nil, err
+	}
 	ents, err := os.ReadDir(dir)
 	if err != nil {
 		return nil, err
@@ -87,6 +112,72 @@ func Load(dir string) ([]*Case, error) {
 	return out, nil
 }
 
+type manifest struct {
+	Cases []manifestCase `json:"cases"`
+}
+
+type manifestCase struct {
+	Directory   string       `json:"directory"`
+	Category    CaseCategory `json:"category"`
+	GoVersion   string       `json:"go_version,omitempty"`
+	GroundTruth *GroundTruth `json:"ground_truth,omitempty"`
+}
+
+func loadManifest(dir string) ([]*Case, error) {
+	raw, err := os.ReadFile(filepath.Join(dir, "manifest.json"))
+	if err != nil {
+		return nil, err
+	}
+	var m manifest
+	if err := json.Unmarshal(raw, &m); err != nil {
+		return nil, err
+	}
+	if len(m.Cases) == 0 {
+		return nil, fmt.Errorf("curated manifest has no cases")
+	}
+	out := make([]*Case, 0, len(m.Cases))
+	seen := make(map[string]struct{}, len(m.Cases))
+	for _, entry := range m.Cases {
+		if strings.TrimSpace(entry.Directory) == "" {
+			return nil, fmt.Errorf("curated manifest case has empty directory")
+		}
+		if entry.Category != CategorySemanticPositive && entry.Category != CategoryNegative {
+			return nil, fmt.Errorf("%s: curated case category must be semantic_positive or negative", entry.Directory)
+		}
+		caseDir := filepath.Clean(filepath.Join(dir, entry.Directory))
+		c, err := loadCase(caseDir)
+		if err != nil {
+			return nil, fmt.Errorf("%s: %w", entry.Directory, err)
+		}
+		if _, ok := seen[c.Name]; ok {
+			return nil, fmt.Errorf("duplicate curated case %q", c.Name)
+		}
+		seen[c.Name] = struct{}{}
+		c.Category = entry.Category
+		if entry.GoVersion != "" {
+			c.GoVersion = entry.GoVersion
+		}
+		if entry.GroundTruth != nil {
+			override := *entry.GroundTruth
+			if override.Primary.File == "" {
+				override.Primary = c.GT.Primary
+			}
+			if override.Description == "" {
+				override.Description = c.GT.Description
+			}
+			if len(override.BugTypes) == 0 {
+				override.BugTypes = c.GT.BugTypes
+			}
+			c.GT = override
+		}
+		if c.Category == CategoryNegative {
+			c.GT = GroundTruth{}
+		}
+		out = append(out, c)
+	}
+	return out, nil
+}
+
 type meta struct {
 	Name        string       `json:"name"`
 	Source      string       `json:"source"`
@@ -94,6 +185,9 @@ type meta struct {
 	File        string       `json:"file,omitempty"`
 	Bugs        []Bug        `json:"bugs,omitempty"`
 	GroundTruth *GroundTruth `json:"ground_truth,omitempty"`
+	Category    CaseCategory `json:"category,omitempty"`
+	GoVersion   string       `json:"go_version,omitempty"`
+	PolicyID    string       `json:"policy_id,omitempty"`
 }
 
 func loadCase(dir string) (*Case, error) {
@@ -104,6 +198,20 @@ func loadCase(dir string) (*Case, error) {
 	var m meta
 	if err := json.Unmarshal(raw, &m); err != nil {
 		return nil, err
+	}
+	if m.Category == "" {
+		// Backward compatibility for imported GoKer-style cases. New curated
+		// cases must state the category explicitly in case.json.
+		m.Category = CategorySemanticPositive
+	}
+	if m.Category != CategorySemanticPositive && m.Category != CategoryNegative && m.Category != CategoryConvention {
+		return nil, fmt.Errorf("unsupported category %q", m.Category)
+	}
+	if m.GoVersion == "" {
+		m.GoVersion = "1.22"
+	}
+	if m.Category == CategoryConvention && strings.TrimSpace(m.PolicyID) == "" {
+		return nil, fmt.Errorf("convention case requires policy_id")
 	}
 
 	buggyRaw, err := os.ReadFile(filepath.Join(dir, "buggy.go"))
@@ -169,13 +277,23 @@ func loadCase(dir string) (*Case, error) {
 		gt = explicit
 	}
 
+	if m.Category == CategorySemanticPositive && gt.Primary.File == "" {
+		return nil, fmt.Errorf("semantic_positive case requires ground truth")
+	}
+	if m.Category == CategoryNegative {
+		gt = GroundTruth{}
+	}
+
 	return &Case{
-		Name:   m.Name,
-		Source: m.Source,
-		Rule:   m.Rule,
-		Repo:   map[string]string{file: clean},
-		Diff:   diff,
-		GT:     gt,
+		Name:      m.Name,
+		Source:    m.Source,
+		Rule:      m.Rule,
+		Category:  m.Category,
+		GoVersion: m.GoVersion,
+		PolicyID:  m.PolicyID,
+		Repo:      map[string]string{file: clean},
+		Diff:      diff,
+		GT:        gt,
 	}, nil
 }
 

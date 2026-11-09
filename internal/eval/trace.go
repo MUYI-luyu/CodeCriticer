@@ -16,6 +16,9 @@ import (
 // 让 31 例自伤 / 19 例真漏这类问题可以事后逐阶段回看，而不是黑盒。
 type EvalTrace struct {
 	Name         string              `json:"name"`
+	Category     CaseCategory        `json:"category"`
+	GoVersion    string              `json:"go_version"`
+	PolicyID     string              `json:"policy_id,omitempty"`
 	Bugs         []Bug               `json:"bugs"` // ground-truth
 	GroundTruth  GroundTruth         `json:"ground_truth"`
 	Workflow     *workflow.Trace     `json:"workflow"`
@@ -38,6 +41,79 @@ func SaveTrace(dir string, t EvalTrace) error {
 	}
 	path := filepath.Join(dir, safeName(t.Name)+".json")
 	return os.WriteFile(path, data, 0o600)
+}
+
+// RescoreTraceDir recomputes metrics from persisted workflow traces and the
+// current dataset labels. It deliberately does not rewrite the trace files:
+// the original run remains reproducible while a corrected, audited manifest
+// can be evaluated without another model call.
+func RescoreTraceDir(w io.Writer, datasetDir, traceDir string) error {
+	cases, err := Load(datasetDir)
+	if err != nil {
+		return err
+	}
+	byName := make(map[string]*Case, len(cases))
+	for _, c := range cases {
+		byName[c.Name] = c
+	}
+	entries, err := os.ReadDir(traceDir)
+	if err != nil {
+		return err
+	}
+	var total TraceMetrics
+	matched := 0
+	for _, entry := range entries {
+		if entry.IsDir() || filepath.Ext(entry.Name()) != ".json" {
+			continue
+		}
+		data, err := os.ReadFile(filepath.Join(traceDir, entry.Name()))
+		if err != nil {
+			return err
+		}
+		var saved EvalTrace
+		if err := json.Unmarshal(data, &saved); err != nil {
+			return fmt.Errorf("%s: %w", entry.Name(), err)
+		}
+		c := byName[saved.Name]
+		if c == nil {
+			return fmt.Errorf("trace %s has no matching case in %s", entry.Name(), datasetDir)
+		}
+		completed := saved.FailureStage == "" && (saved.Workflow == nil || saved.Workflow.StopReason != workflow.StopPartial)
+		metrics := ComputeTrace(c, saved.Workflow, tol)
+		status := "done"
+		if !completed {
+			// Match the evaluator's end-to-end convention: a partial run is not
+			// a clean negative result. Its accepted outcome counts as a miss for
+			// positive cases, while raw trace details remain inspectable on disk.
+			metrics = FailureMetrics(c)
+			status = "partial"
+		}
+		total = total.Add(metrics)
+		matched++
+		fmt.Fprintf(w, "%-28s status=%-7s accepted_hit=%d accepted_fp=%d claims=%d\n", saved.Name, status, acceptedHit(metrics), acceptedFalse(metrics), acceptedClaimsCount(metrics))
+	}
+	if matched == 0 {
+		return fmt.Errorf("no EvalTrace JSON files in %s", traceDir)
+	}
+	fmt.Fprintf(w, "\n重新评分：%d 个 trace；数据集=%s\n", matched, datasetDir)
+	printMetrics(w, "行级 GT / Accepted", total.AcceptedLine)
+	printMetrics(w, "文件级 GT / Accepted", total.AcceptedFile)
+	printConventionMetrics(w, "规范项 / Accepted", total.AcceptedConvention)
+	return nil
+}
+
+func acceptedFalse(metrics TraceMetrics) int {
+	if metrics.AcceptedLine.Bugs > 0 || metrics.AcceptedLine.Claims > 0 {
+		return metrics.AcceptedLine.False
+	}
+	return metrics.AcceptedFile.False
+}
+
+func acceptedClaimsCount(metrics TraceMetrics) int {
+	if metrics.AcceptedLine.Bugs > 0 || metrics.AcceptedLine.Claims > 0 {
+		return metrics.AcceptedLine.Claims
+	}
+	return metrics.AcceptedFile.Claims
 }
 
 // safeName 把用例名里的路径分隔符换成下划线，避免写到子目录/越界。

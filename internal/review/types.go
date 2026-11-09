@@ -7,6 +7,7 @@ type CandidateClaim struct {
 	File        string   `json:"file"`
 	Line        int      `json:"line"`
 	Severity    string   `json:"severity"`
+	Certainty   string   `json:"certainty,omitempty"` // certain, schedule_dependent, contract_dependent
 	Msg         string   `json:"msg"`
 	EvidenceIDs []string `json:"evidence_ids"`
 }

@@ -19,10 +19,34 @@ type Metrics struct {
 
 // TraceMetrics 分开记录原始 Claim、accepted Claim 以及两类定位精度。
 type TraceMetrics struct {
-	RawLine      Metrics `json:"raw_line"`
-	AcceptedLine Metrics `json:"accepted_line"`
-	RawFile      Metrics `json:"raw_file"`
-	AcceptedFile Metrics `json:"accepted_file"`
+	RawLine            Metrics           `json:"raw_line"`
+	AcceptedLine       Metrics           `json:"accepted_line"`
+	RawFile            Metrics           `json:"raw_file"`
+	AcceptedFile       Metrics           `json:"accepted_file"`
+	RawConvention      ConventionMetrics `json:"raw_convention"`
+	AcceptedConvention ConventionMetrics `json:"accepted_convention"`
+}
+
+// ConventionMetrics is intentionally separate from Recall/Precision. A
+// convention hit is useful only when its named project policy is in scope.
+type ConventionMetrics struct {
+	Cases  int `json:"cases"`
+	Hits   int `json:"hits"`
+	Claims int `json:"claims"`
+}
+
+func (m ConventionMetrics) Add(o ConventionMetrics) ConventionMetrics {
+	m.Cases += o.Cases
+	m.Hits += o.Hits
+	m.Claims += o.Claims
+	return m
+}
+
+func (m ConventionMetrics) HitRate() float64 {
+	if m.Cases == 0 {
+		return 0
+	}
+	return float64(m.Hits) / float64(m.Cases)
 }
 
 // Compute 用贪心匹配把 claims 对齐到 bugs，容差 tol 行内算命中。
@@ -58,12 +82,43 @@ func ComputeTrace(c *Case, trace *workflow.Trace, tol int) TraceMetrics {
 		raw = trace.FinalReport.Claims
 		accepted = acceptedClaims(trace)
 	}
-	return computePrimary(c, raw, accepted, tol)
+	switch c.Category {
+	case CategoryNegative:
+		return computeNegative(raw, accepted)
+	case CategoryConvention:
+		return TraceMetrics{
+			RawConvention:      computeConvention(c, raw, tol),
+			AcceptedConvention: computeConvention(c, accepted, tol),
+		}
+	default:
+		return computePrimary(c, raw, accepted, tol)
+	}
 }
 
 // FailureMetrics 把未完成的 Case 计入端到端漏检。
 func FailureMetrics(c *Case) TraceMetrics {
+	if c.Category == CategoryConvention {
+		return TraceMetrics{RawConvention: computeConvention(c, nil, 0), AcceptedConvention: computeConvention(c, nil, 0)}
+	}
+	if c.Category == CategoryNegative {
+		return TraceMetrics{}
+	}
 	return computePrimary(c, nil, nil, 0)
+}
+
+func computeNegative(raw, accepted []review.CandidateClaim) TraceMetrics {
+	return TraceMetrics{
+		RawLine:      Metrics{Claims: len(raw), False: len(raw), FP: len(raw)},
+		AcceptedLine: Metrics{Claims: len(accepted), False: len(accepted), FP: len(accepted)},
+	}
+}
+
+func computeConvention(c *Case, claims []review.CandidateClaim, tol int) ConventionMetrics {
+	m := ConventionMetrics{Cases: 1, Claims: len(claims)}
+	if claimsCoverAny(claims, acceptableLocations(c.GT), tol) {
+		m.Hits = 1
+	}
+	return m
 }
 
 func computePrimary(c *Case, raw, accepted []review.CandidateClaim, tol int) TraceMetrics {
@@ -148,6 +203,8 @@ func (m TraceMetrics) Add(o TraceMetrics) TraceMetrics {
 	m.AcceptedLine = m.AcceptedLine.Add(o.AcceptedLine)
 	m.RawFile = m.RawFile.Add(o.RawFile)
 	m.AcceptedFile = m.AcceptedFile.Add(o.AcceptedFile)
+	m.RawConvention = m.RawConvention.Add(o.RawConvention)
+	m.AcceptedConvention = m.AcceptedConvention.Add(o.AcceptedConvention)
 	return m
 }
 

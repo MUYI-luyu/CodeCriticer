@@ -3,6 +3,7 @@ package workflow
 import (
 	"context"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/MUYI-luyu/codecritic/internal/review"
@@ -35,13 +36,13 @@ func TestCharacterizationBaseline(t *testing.T) {
 	if len(llm.requests) != 2 {
 		t.Fatalf("requests=%d", len(llm.requests))
 	}
-	if !reflect.DeepEqual(llm.systems, []string{agentSystemPrompt, agentSystemPrompt}) {
+	if len(llm.systems) != 2 || !strings.HasPrefix(llm.systems[0], agentSystemPrompt) || !strings.HasPrefix(llm.systems[1], agentSystemPrompt) || strings.Contains(llm.systems[1], "Host review state") {
 		t.Fatalf("systems=%q", llm.systems)
 	}
 	if !reflect.DeepEqual(llm.models, []string{"characterization-model", "characterization-model"}) {
 		t.Fatalf("models=%q", llm.models)
 	}
-	expectedTools := []string{"read_diff", "read_code", "search_code", "inspect_symbol", "inspect_concurrency", "run_static_rules", "run_go_validation", "submit_claims"}
+	expectedTools := []string{"read_diff", "read_code", "search_code", "read_evidence", "run_static_rules", "submit_claims"}
 	for requestIndex, definitions := range llm.tools {
 		if len(definitions) != len(expectedTools) {
 			t.Fatalf("request %d tools=%d", requestIndex, len(definitions))
@@ -52,7 +53,7 @@ func TestCharacterizationBaseline(t *testing.T) {
 			}
 		}
 	}
-	if len(llm.requests[0]) != 1 || len(llm.requests[1]) != 3 || llm.requests[1][1].Role != "assistant" || llm.requests[1][2].Role != "tool" || llm.requests[1][2].ToolCallID != llm.requests[1][1].ToolCalls[0].ID {
+	if len(llm.requests[0]) != 2 || len(llm.requests[1]) != 4 || llm.requests[1][2].Role != "assistant" || llm.requests[1][3].Role != "tool" || llm.requests[1][3].ToolCallID != llm.requests[1][2].ToolCalls[0].ID {
 		t.Fatalf("request history=%+v", llm.requests)
 	}
 	if len(result.Trace.Investigation) != 1 || result.Trace.Investigation[0].Tool != "read_code" || result.Trace.Investigation[0].Error != "" {
@@ -69,6 +70,9 @@ func TestCharacterizationBaseline(t *testing.T) {
 	}
 	if result.Trace.StopReason != StopAgentDone {
 		t.Fatalf("stop_reason=%q", result.Trace.StopReason)
+	}
+	if result.Trace.ReviewState.Phase != "done" || len(result.Trace.ReviewState.Facts) == 0 {
+		t.Fatalf("agent state not finalized: %+v", result.Trace.ReviewState)
 	}
 	if result.Trace.Usage.PromptTokens != 30 || result.Trace.Usage.CompletionTokens != 9 || result.Trace.Usage.TotalTokens != 39 {
 		t.Fatalf("usage=%+v", result.Trace.Usage)

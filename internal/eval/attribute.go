@@ -30,6 +30,9 @@ type BugAttribution struct {
 
 // Attribute 对一个 Case 的 Primary 做阶段归因，Related 仅用于调查覆盖统计。
 func Attribute(c *Case, trace *workflow.Trace, tol int) []BugAttribution {
+	if c == nil || c.Category == CategoryNegative || c.Category == CategoryConvention {
+		return nil
+	}
 	primary := c.GT.Primary
 	bug := Bug{File: primary.File, Line: primary.Line, Desc: c.GT.Description}
 	if trace == nil {

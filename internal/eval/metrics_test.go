@@ -149,3 +149,27 @@ func TestFailureMetricsCountsEndToEndFalseNegative(t *testing.T) {
 		t.Fatalf("失败的文件级 Case 必须计入端到端 FN: %+v", fileMetrics)
 	}
 }
+
+func TestNegativeClaimsCountAsFalsePositivesWithoutFalseNegatives(t *testing.T) {
+	c := &Case{Category: CategoryNegative}
+	trace := &workflow.Trace{FinalReport: workflow.FinalReport{
+		Claims:   []review.CandidateClaim{{ID: "c1", File: "main.go", Line: 8}},
+		Verdicts: []workflow.Verdict{{ClaimID: "c1", Status: workflow.VerdictAccepted}},
+	}}
+	m := ComputeTrace(c, trace, 3)
+	if m.RawLine.Bugs != 0 || m.RawLine.FP != 1 || m.AcceptedLine.FP != 1 || m.AcceptedLine.FN != 0 {
+		t.Fatalf("negative metrics=%+v", m)
+	}
+}
+
+func TestConventionIsSeparatedFromBugMetrics(t *testing.T) {
+	c := &Case{Category: CategoryConvention, GT: GroundTruth{Primary: Location{File: "main.go", Line: 8}}}
+	trace := &workflow.Trace{FinalReport: workflow.FinalReport{
+		Claims:   []review.CandidateClaim{{ID: "c1", File: "main.go", Line: 8}},
+		Verdicts: []workflow.Verdict{{ClaimID: "c1", Status: workflow.VerdictAccepted}},
+	}}
+	m := ComputeTrace(c, trace, 3)
+	if m.AcceptedLine.Bugs != 0 || m.AcceptedLine.Claims != 0 || m.AcceptedConvention.Cases != 1 || m.AcceptedConvention.Hits != 1 {
+		t.Fatalf("convention metrics=%+v", m)
+	}
+}

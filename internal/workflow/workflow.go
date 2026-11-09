@@ -23,20 +23,24 @@ import (
 // trace and append-only Evidence collection to the session that investigates
 // that input.
 type ReviewRun struct {
-	llm            LLMClient
-	repo           string
-	snapshot       *ReviewSnapshot
-	maxSteps       int
-	model          string
-	logger         *slog.Logger
-	projectContext bool
-	trace          *Trace
-	evidence       []*Evidence
-	tools          *ToolRuntime
-	mu             sync.Mutex
-	started        bool
-	finished       bool
-	closed         bool
+	llm                      LLMClient
+	repo                     string
+	snapshot                 *ReviewSnapshot
+	maxToolCalls             int
+	maxTurns                 int
+	maxTotalTokens           int
+	model                    string
+	logger                   *slog.Logger
+	contextCompactionEnabled bool
+	modelContextBudget       int
+	memoryEntries            []MemoryEntry
+	trace                    *Trace
+	evidence                 []*Evidence
+	tools                    *ToolRuntime
+	mu                       sync.Mutex
+	started                  bool
+	finished                 bool
+	closed                   bool
 }
 
 var ErrReviewRunAlreadyStarted = errors.New("review run already started")
@@ -76,7 +80,9 @@ func NewReviewRun(llm LLMClient, repo string) (*ReviewRun, error) {
 			model = configured
 		}
 	}
-	return &ReviewRun{llm: llm, repo: repo, maxSteps: 8, model: model, logger: slog.Default()}, nil
+	// These are safety valves, not review-completion criteria. A model finishes
+	// normally only by submitting a structurally valid final review.
+	return &ReviewRun{llm: llm, repo: repo, maxToolCalls: 32, maxTurns: 64, model: model, logger: slog.Default(), modelContextBudget: defaultActiveContextBudget, contextCompactionEnabled: true}, nil
 }
 
 func (w *ReviewRun) SetLogger(logger *slog.Logger) {
@@ -90,15 +96,43 @@ func (w *ReviewRun) SetLogger(logger *slog.Logger) {
 	}
 }
 
-// 设置调查工具调用上限。
+// SetMaxSteps is retained for callers of the old API. It now configures only
+// the optional tool-call safety valve; it never means a review is complete.
 func (w *ReviewRun) SetMaxSteps(n int) {
+	w.SetMaxToolCalls(n)
+}
+
+// SetMaxToolCalls sets an optional hard safety valve for tool execution.
+// Reaching it produces partial unless the model can submit a final review with
+// evidence already collected.
+func (w *ReviewRun) SetMaxToolCalls(n int) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if w.started || w.closed {
 		return
 	}
 	if n > 0 {
-		w.maxSteps = n
+		w.maxToolCalls = n
+	}
+}
+
+// SetMaxTurns limits model decisions independently from tool calls. It is a
+// circuit breaker for malformed/revision loops, not a task-completion rule.
+func (w *ReviewRun) SetMaxTurns(n int) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if !w.started && !w.closed && n > 0 {
+		w.maxTurns = n
+	}
+}
+
+// SetMaxTotalTokens optionally limits cumulative provider-reported token use.
+// Zero (the default) leaves token cost to the caller/provider.
+func (w *ReviewRun) SetMaxTotalTokens(n int) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if !w.started && !w.closed && n >= 0 {
+		w.maxTotalTokens = n
 	}
 }
 
@@ -114,15 +148,37 @@ func (w *ReviewRun) SetAgentModel(model string) {
 	}
 }
 
-// SetContextProjection enables deterministic removal of redundant tool-result
-// content from model requests. The complete conversation is still kept in Trace.
-func (w *ReviewRun) SetContextProjection(enabled bool) {
+// SetContextCheckpointing switches the checkpoint-based active-context
+// manager. Durable Trace is never compacted.
+func (w *ReviewRun) SetContextCheckpointing(enabled bool) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if w.started || w.closed {
 		return
 	}
-	w.projectContext = enabled
+	w.contextCompactionEnabled = enabled
+}
+
+// SetModelContextBudget changes the byte budget used by the session's active
+// context manager. It exists for deterministic tests and controlled evals;
+// ordinary reviews use the conservative default.
+func (w *ReviewRun) SetModelContextBudget(bytes int) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if !w.started && !w.closed && bytes > 0 {
+		w.modelContextBudget = bytes
+	}
+}
+
+// SetProjectMemory supplies human-confirmed, repository-local conventions.
+// Selection happens only after the diff has established the changed paths.
+func (w *ReviewRun) SetProjectMemory(entries []MemoryEntry) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.started || w.closed {
+		return
+	}
+	w.memoryEntries = append([]MemoryEntry(nil), entries...)
 }
 
 type Result struct{ Trace *Trace }
@@ -307,6 +363,7 @@ func (w *ReviewRun) Run(ctx context.Context, req Request) (result *Result, runEr
 		validationRepo = w.snapshot.executionRepo()
 	}
 	w.tools = newToolRuntime(w.repo, validationRepo, changes, req.AllowExecution, toolSurfaceAgent)
+	tr.RetrievedMemory = selectProjectMemory(w.memoryEntries, tr.Scope.TargetFiles)
 	obs.setStage("agent")
 	session := newReviewSession(w, tr, w.tools)
 	claims, verdicts, err := session.Run(ctx)
@@ -368,18 +425,34 @@ func maxEvidenceLine(e *Evidence) int {
 	return e.Line
 }
 
-const agentSystemPrompt = `You are a Go code review agent. Investigate the change with the provided tools. Relevant code is not by itself proof of a bug. Call exactly one tool per turn. When the review is complete, call submit_claims; submit an empty claims array if there are no supported issues.`
+const agentSystemPrompt = `You are a Go code review agent. Review the fixed diff with the provided tools. Choose one useful function call per turn; never answer in plain text. When the investigation is complete, call submit_claims (an empty array is valid). Report only concrete defects whose trigger and impact are supported by cited Evidence. Relevant code, a static diagnostic, or a successful validation alone is not proof of a bug. Do not invent issues. Every submitted claim must label certainty: certain means the cited code proves the trigger; schedule_dependent means the cited code proves an explicit scheduling/input precondition; contract_dependent is allowed only when cited code establishes the required API or test contract. If the contract or trigger is not evidenced, do not submit the claim.`
 
-func buildAgentPrompt(tr *Trace, changes []diff.Change, allowExecution bool) string {
-	diffContext := encodeChangedContext(tr, changes)
-	execution := "compile only; test and race execution are disabled"
-	if allowExecution {
-		execution = "compile, test and race validation are enabled"
+func buildAgentPrompt(tr *Trace, changes []diff.Change) string {
+	return buildAgentPromptWithDiffContext(tr, encodeChangedContext(tr, changes))
+}
+
+// buildCompactedAgentPrompt preserves the task and complete hunk manifest but
+// deliberately leaves out all inline hunk bodies. It is used only after the
+// active conversation has overflowed; the durable trace still retains every
+// original result and read_diff can rehydrate any listed hunk.
+func buildCompactedAgentPrompt(tr *Trace, changes []diff.Change) string {
+	return buildAgentPromptWithDiffContext(tr, encodeChangedContextWithBudget(tr, changes, 0))
+}
+
+func buildAgentPromptWithDiffContext(tr *Trace, diffContext string) string {
+	memory := "[]"
+	if len(tr.RetrievedMemory) > 0 {
+		encoded, _ := json.Marshal(tr.RetrievedMemory)
+		memory = string(encoded)
 	}
-	return fmt.Sprintf("%s\n目标文件：%s\n目标符号：%s\nDiff hunk（每个 included hunk 都是完整的；omitted hunks 必须用 read_diff 读取后才能声称已审查）：%s\nGo validation policy: %s.\n你负责理解代码、提出假设、选择工具并判断何时提交。read_code 可按行段或 symbol 读取；inspect_symbol 提供编译器语义 references 与带精度说明的 call hierarchy。Claim 必须描述单一根因、触发条件和实际后果，并引用足以支撑结论的 Evidence ID。", tr.Scope.Concern, strings.Join(tr.Scope.TargetFiles, ", "), strings.Join(tr.Scope.Symbols, ", "), diffContext, execution)
+	return fmt.Sprintf("%s\n目标文件：%s\n目标符号：%s\nDiff hunk（每个 included hunk 都是完整的；omitted hunks 必须用 read_diff 读取后才能声称已审查）：%s\n已检索项目记忆（仅当调用方显式传入；仅人工确认的路径范围规则；它是调查提示，不是问题证据）：%s\n你负责理解代码、提出假设、选择工具并判断何时提交。read_code 可按行段或 symbol 读取。Claim 必须描述单一根因、触发条件和实际后果，并引用足以支撑结论的 Evidence ID。若结论依赖调度、输入或 API 契约，必须在消息中写清前提，并在 certainty 里如实标为 schedule_dependent 或 contract_dependent；缺少来源契约时不要把一般测试质量建议升级为缺陷。", tr.Scope.Concern, strings.Join(tr.Scope.TargetFiles, ", "), strings.Join(tr.Scope.Symbols, ", "), diffContext, memory)
 }
 
 func encodeChangedContext(tr *Trace, changes []diff.Change) string {
+	return encodeChangedContextWithBudget(tr, changes, 32<<10)
+}
+
+func encodeChangedContextWithBudget(tr *Trace, changes []diff.Change, contentBudget int) string {
 	type hunkManifest struct {
 		File     string `json:"file"`
 		HunkID   string `json:"hunk_id"`
@@ -393,7 +466,9 @@ func encodeChangedContext(tr *Trace, changes []diff.Change) string {
 		HunkID  string `json:"hunk_id"`
 		Content string `json:"content"`
 	}
-	const contentBudget = 64 << 10
+	// Leave enough of the active context for at least one complete tool
+	// exchange. A Kernel that consumes the whole window makes a checkpoint
+	// summarize a review it cannot see.
 	used := 0
 	manifest := make([]hunkManifest, 0)
 	included := make([]includedHunk, 0)
@@ -456,6 +531,11 @@ func verifyClaims(repo string, claims []review.CandidateClaim, evidence []*Evide
 	for i := range claims {
 		claim := &claims[i]
 		claim.ID = fmt.Sprintf("c%d", i+1)
+		// New provider output is constrained by the strict submit_claims schema.
+		// Defaulting only keeps pre-field traces and direct Go callers replayable.
+		if claim.Certainty == "" {
+			claim.Certainty = "certain"
+		}
 		var invalid []string
 		var missing []string
 
@@ -467,6 +547,9 @@ func verifyClaims(repo string, claims []review.CandidateClaim, evidence []*Evide
 		}
 		if claim.Severity != "error" && claim.Severity != "warning" && claim.Severity != "info" {
 			invalid = append(invalid, "severity 必须是 error、warning 或 info")
+		}
+		if claim.Certainty != "certain" && claim.Certainty != "schedule_dependent" && claim.Certainty != "contract_dependent" {
+			invalid = append(invalid, "certainty 必须是 certain、schedule_dependent 或 contract_dependent")
 		}
 		if normalized, err := repoRelativePath(repo, claim.File); err != nil || claim.File == "" {
 			invalid = append(invalid, "文件路径无效或超出仓库")

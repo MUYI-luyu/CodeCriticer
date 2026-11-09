@@ -31,7 +31,8 @@ type caseResult struct {
 }
 
 type runOptions struct {
-	contextProjection bool
+	contextCheckpointing bool
+	contextBudget        int
 }
 
 func Run(ctx context.Context, llm *review.LLM, datasetDir string, verbose bool) error {
@@ -50,38 +51,48 @@ func RunConcurrentWithJudge(ctx context.Context, llm, judgeLLM *review.LLM, judg
 	return err
 }
 
-// RunConcurrentProjected runs the unchanged evaluator with deterministic
-// model-context projection enabled.
-func RunConcurrentProjected(ctx context.Context, llm *review.LLM, datasetDir string, verbose bool, concurrency int, traceDir string) error {
-	_, err := runConcurrent(ctx, llm, nil, datasetDir, verbose, concurrency, traceDir, runOptions{contextProjection: true})
+// RunConcurrentCheckpointed enables checkpoint-based active context.
+func RunConcurrentCheckpointed(ctx context.Context, llm *review.LLM, datasetDir string, verbose bool, concurrency int, traceDir string) error {
+	_, err := runConcurrent(ctx, llm, nil, datasetDir, verbose, concurrency, traceDir, runOptions{contextCheckpointing: true})
 	return err
 }
 
-func RunConcurrentProjectedWithJudge(ctx context.Context, llm, judgeLLM *review.LLM, judgeModel, datasetDir string, verbose bool, concurrency int, traceDir string) error {
-	_, err := runConcurrent(ctx, llm, newSemanticJudge(judgeLLM, judgeModel), datasetDir, verbose, concurrency, traceDir, runOptions{contextProjection: true})
+// RunConcurrentCheckpointedWithBudget is an eval-only pressure-test entry
+// point. Production continues to use the conservative default budget.
+func RunConcurrentCheckpointedWithBudget(ctx context.Context, llm *review.LLM, datasetDir string, verbose bool, concurrency int, traceDir string, contextBudget int) error {
+	_, err := runConcurrent(ctx, llm, nil, datasetDir, verbose, concurrency, traceDir, runOptions{contextCheckpointing: true, contextBudget: contextBudget})
 	return err
 }
 
-// RunContextProjectionAB performs one paired experiment. Both arms use the
+func RunConcurrentCheckpointedWithJudge(ctx context.Context, llm, judgeLLM *review.LLM, judgeModel, datasetDir string, verbose bool, concurrency int, traceDir string) error {
+	_, err := runConcurrent(ctx, llm, newSemanticJudge(judgeLLM, judgeModel), datasetDir, verbose, concurrency, traceDir, runOptions{contextCheckpointing: true})
+	return err
+}
+
+// RunContextCheckpointAB performs one paired experiment. Both arms use the
 // same configured model, prompt, tools, verifier and budgets. Model sampling
 // and analyzer iteration are not seeded, so deltas remain descriptive.
-func RunContextProjectionAB(ctx context.Context, llm *review.LLM, datasetDir string, verbose bool, concurrency int, traceDir string) error {
-	baselineDir, projectedDir := "", ""
+func RunContextCheckpointAB(ctx context.Context, llm *review.LLM, datasetDir string, verbose bool, concurrency int, traceDir string) error {
+	return RunContextCheckpointABWithBudget(ctx, llm, datasetDir, verbose, concurrency, traceDir, 0)
+}
+
+func RunContextCheckpointABWithBudget(ctx context.Context, llm *review.LLM, datasetDir string, verbose bool, concurrency int, traceDir string, contextBudget int) error {
+	baselineDir, checkpointDir := "", ""
 	if traceDir != "" {
 		baselineDir = filepath.Join(traceDir, "baseline")
-		projectedDir = filepath.Join(traceDir, "projection")
+		checkpointDir = filepath.Join(traceDir, "checkpoint")
 	}
 	fmt.Fprintln(os.Stdout, "\n========== A: Full context ==========")
-	baseline, err := runConcurrent(ctx, llm, nil, datasetDir, verbose, concurrency, baselineDir, runOptions{})
+	baseline, err := runConcurrent(ctx, llm, nil, datasetDir, verbose, concurrency, baselineDir, runOptions{contextBudget: contextBudget})
 	if err != nil {
 		return err
 	}
-	fmt.Fprintln(os.Stdout, "\n========== B: Deterministic projection ==========")
-	projected, err := runConcurrent(ctx, llm, nil, datasetDir, verbose, concurrency, projectedDir, runOptions{contextProjection: true})
+	fmt.Fprintln(os.Stdout, "\n========== B: Context checkpoint ==========")
+	checkpointed, err := runConcurrent(ctx, llm, nil, datasetDir, verbose, concurrency, checkpointDir, runOptions{contextCheckpointing: true, contextBudget: contextBudget})
 	if err != nil {
 		return err
 	}
-	printABComparison(os.Stdout, baseline, projected)
+	printABComparison(os.Stdout, baseline, checkpointed)
 	return nil
 }
 
@@ -178,6 +189,8 @@ func runConcurrent(ctx context.Context, llm *review.LLM, judge *semanticJudge, d
 	printMetrics(os.Stdout, "行级 GT / Accepted", total.AcceptedLine)
 	printMetrics(os.Stdout, "文件级 GT / Raw", total.RawFile)
 	printMetrics(os.Stdout, "文件级 GT / Accepted", total.AcceptedFile)
+	printConventionMetrics(os.Stdout, "规范项 / Raw", total.RawConvention)
+	printConventionMetrics(os.Stdout, "规范项 / Accepted", total.AcceptedConvention)
 	if len(failures) > 0 {
 		fmt.Fprintln(os.Stdout, "\n=== Workflow 失败阶段 ===")
 		for _, stage := range []string{"input", "normalize", "agent", "verifier", "trace", "unknown"} {
@@ -212,7 +225,10 @@ func runCase(ctx context.Context, llm *review.LLM, judge *semanticJudge, c *Case
 	if err != nil {
 		return failedCase(c, nil, "normalize", err, traceDir)
 	}
-	run.SetContextProjection(options.contextProjection)
+	run.SetContextCheckpointing(options.contextCheckpointing)
+	if options.contextBudget > 0 {
+		run.SetModelContextBudget(options.contextBudget)
+	}
 	res, err := run.Run(ctx, workflow.Request{Repo: repo, Diff: c.Diff})
 	if err != nil || res == nil || res.Trace == nil {
 		var trace *workflow.Trace
@@ -229,13 +245,16 @@ func runCase(ctx context.Context, llm *review.LLM, judge *semanticJudge, c *Case
 	dim := ComputeDimension(c)
 	axes := ComputeAxes(trace, true)
 	var semantic *SemanticEvaluation
-	if judge != nil {
+	if judge != nil && c.Category == CategorySemanticPositive {
 		graded := judge.Grade(ctx, c, trace)
 		semantic = &graded
 	}
 	if traceDir != "" {
 		if err := SaveTrace(traceDir, EvalTrace{
 			Name:         c.Name,
+			Category:     c.Category,
+			GoVersion:    c.GoVersion,
+			PolicyID:     c.PolicyID,
 			Bugs:         c.Bugs(),
 			GroundTruth:  c.GT,
 			Workflow:     trace,
@@ -264,8 +283,13 @@ func runCase(ctx context.Context, llm *review.LLM, judge *semanticJudge, c *Case
 			scope = "file"
 			m = metrics.AcceptedFile
 		}
-		fmt.Fprintf(&output, "%-20s scope=%s raw=%d accepted=%d hit=%d fp=%d cost=%dtok\n",
-			c.Name, scope, len(trace.FinalReport.Claims), m.Claims, m.Found, m.False, cost.TotalTokens)
+		if c.Category == CategoryConvention {
+			fmt.Fprintf(&output, "%-20s category=%s policy=%s raw_claims=%d accepted_claims=%d policy_hit=%d cost=%dtok\n",
+				c.Name, c.Category, c.PolicyID, metrics.RawConvention.Claims, metrics.AcceptedConvention.Claims, metrics.AcceptedConvention.Hits, cost.TotalTokens)
+		} else {
+			fmt.Fprintf(&output, "%-20s category=%s scope=%s raw=%d accepted=%d hit=%d fp=%d cost=%dtok\n",
+				c.Name, c.Category, scope, len(trace.FinalReport.Claims), m.Claims, m.Found, m.False, cost.TotalTokens)
+		}
 	}
 	return caseResult{name: c.Name, metrics: metrics, attrs: attrs, axes: axes, semantic: semantic, trace: trace, completed: true, output: output.String()}
 }
@@ -290,6 +314,9 @@ func failedCase(c *Case, trace *workflow.Trace, stage string, err error, traceDi
 		dim := ComputeDimension(c)
 		if saveErr := SaveTrace(traceDir, EvalTrace{
 			Name:         c.Name,
+			Category:     c.Category,
+			GoVersion:    c.GoVersion,
+			PolicyID:     c.PolicyID,
 			Bugs:         c.Bugs(),
 			GroundTruth:  c.GT,
 			Workflow:     trace,
@@ -331,8 +358,8 @@ func printABComparison(w io.Writer, baseline, projected []caseResult) {
 	}
 	sort.Strings(names)
 	fmt.Fprintln(w, "\n========== A/B comparison (B - A) ==========")
-	fmt.Fprintln(w, "Descriptive only: model sampling is unseeded; do not attribute single-run deltas to projection when no compaction occurred.")
-	fmt.Fprintf(w, "%-24s %10s %10s %10s %12s %12s %10s\n", "case", "outcome", "claims", "tokens", "tool_calls", "context_B", "compacted")
+	fmt.Fprintln(w, "Descriptive only: model sampling is unseeded; do not attribute a single-run delta to checkpointing when no checkpoint occurred.")
+	fmt.Fprintf(w, "%-24s %10s %10s %10s %12s %12s %10s\n", "case", "outcome", "claims", "tokens", "tool_calls", "context_B", "checkpoints")
 	for _, name := range names {
 		a := baseByName[name]
 		b, ok := byName[name]
@@ -342,16 +369,16 @@ func printABComparison(w io.Writer, baseline, projected []caseResult) {
 		}
 		aHit, bHit := acceptedHit(a.metrics), acceptedHit(b.metrics)
 		outcome := fmt.Sprintf("%d->%d", aHit, bHit)
-		contextDelta, compacted := 0, 0
+		contextDelta, checkpoints := 0, 0
 		if b.trace != nil {
-			contextDelta = b.trace.Projection.ProjectedBytes - b.trace.Projection.FullBytes
-			compacted = b.trace.Projection.DuplicateResultsCompacted + b.trace.Projection.DominatedReadCodeCompacted
+			contextDelta = b.trace.Compaction.ActiveBytes - b.trace.Compaction.FullBytes
+			checkpoints = b.trace.Compaction.Checkpoints
 		}
 		fmt.Fprintf(w, "%-24s %10s %+10d %+10d %+12d %+12d %10d\n", name, outcome,
 			b.axes.Outcome.AcceptedClaims-a.axes.Outcome.AcceptedClaims,
 			b.axes.Efficiency.TotalTokens-a.axes.Efficiency.TotalTokens,
 			b.axes.Investigation.SuccessfulTools-a.axes.Investigation.SuccessfulTools,
-			contextDelta, compacted)
+			contextDelta, checkpoints)
 	}
 }
 
@@ -398,6 +425,14 @@ func printMetrics(w io.Writer, label string, metrics Metrics) {
 		metrics.TP, metrics.FP, metrics.FN)
 }
 
+func printConventionMetrics(w io.Writer, label string, metrics ConventionMetrics) {
+	if metrics.Cases == 0 {
+		return
+	}
+	fmt.Fprintf(w, "\n%-24s HitRate=%6.0f%% Cases=%d Hits=%d Claims=%d\n",
+		label, pct(metrics.HitRate()), metrics.Cases, metrics.Hits, metrics.Claims)
+}
+
 func materialize(c *Case) (dir string, err error) {
 	if c == nil {
 		return "", fmt.Errorf("nil eval case")
@@ -414,7 +449,11 @@ func materialize(c *Case) (dir string, err error) {
 			err = fmt.Errorf("%w; cleanup materialized case: %v", err, cleanupErr)
 		}
 	}()
-	if err := os.WriteFile(filepath.Join(dir, "go.mod"), []byte("module example.com/eval\n\ngo 1.22\n"), 0644); err != nil {
+	goVersion := strings.TrimSpace(c.GoVersion)
+	if goVersion == "" {
+		goVersion = "1.22"
+	}
+	if err := os.WriteFile(filepath.Join(dir, "go.mod"), []byte("module example.com/eval\n\ngo "+goVersion+"\n"), 0644); err != nil {
 		return "", err
 	}
 	for name, content := range c.Repo {

@@ -84,13 +84,28 @@ func TestMaterializeRejectsRepositoryPathEscape(t *testing.T) {
 	}
 }
 
+func TestMaterializeUsesCaseGoVersion(t *testing.T) {
+	repo, err := materialize(&Case{GoVersion: "1.21", Repo: map[string]string{"main.go": "package main\n"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(repo)
+	data, err := os.ReadFile(filepath.Join(repo, "go.mod"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), "go 1.21") {
+		t.Fatalf("go.mod=%s", data)
+	}
+}
+
 func TestPrintABComparisonSeparatesOutcomeCostAndInfra(t *testing.T) {
 	baseline := []caseResult{
 		{name: "ok", completed: true, metrics: TraceMetrics{AcceptedLine: Metrics{Bugs: 1, Found: 1}}, axes: EvaluationAxes{Outcome: OutcomeAxis{AcceptedClaims: 1}, Efficiency: EfficiencyAxis{TotalTokens: 100}, Investigation: InvestigationAxis{SuccessfulTools: 2}}},
 		{name: "failed", completed: false},
 	}
 	projected := []caseResult{
-		{name: "ok", completed: true, metrics: TraceMetrics{AcceptedLine: Metrics{Bugs: 1, Found: 1}}, axes: EvaluationAxes{Outcome: OutcomeAxis{AcceptedClaims: 1}, Efficiency: EfficiencyAxis{TotalTokens: 80}, Investigation: InvestigationAxis{SuccessfulTools: 1}}, trace: &workflow.Trace{Projection: workflow.ContextProjectionStats{FullBytes: 200, ProjectedBytes: 150, DominatedReadCodeCompacted: 1}}},
+		{name: "ok", completed: true, metrics: TraceMetrics{AcceptedLine: Metrics{Bugs: 1, Found: 1}}, axes: EvaluationAxes{Outcome: OutcomeAxis{AcceptedClaims: 1}, Efficiency: EfficiencyAxis{TotalTokens: 80}, Investigation: InvestigationAxis{SuccessfulTools: 1}}, trace: &workflow.Trace{Compaction: workflow.ContextCompactionStats{FullBytes: 200, ActiveBytes: 150, Checkpoints: 1}}},
 		{name: "failed", completed: true},
 	}
 	var output bytes.Buffer
